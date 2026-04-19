@@ -1,0 +1,3 @@
+# data/.gitkeep
+# Runtime data files (arivu.db, training_buffer.csv) are gitignored.
+# Only the directory structure and models/ subdirectory are tracked.

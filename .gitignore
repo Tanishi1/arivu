@@ -1,0 +1,38 @@
+# Environment — NEVER commit credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Data — runtime artifacts, not source
+data/arivu.db
+data/training_buffer.csv
+data/models/*.joblib
+
+# Logs
+logs/arivu.log
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evaluation output
+evaluation/plots/

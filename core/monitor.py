@@ -1,0 +1,112 @@
+"""shared/monitor.py
+60-second assumption monitoring loop.
+
+Runs as an asyncio coroutine alongside market_feed_loop and decision_cycle_loop.
+Every 60 seconds it reads the active DecisionObject from the ledger and checks
+each assumption against the live CausalState.
+
+If a breach is detected:
+  1. Logs breach to the ledger entry (timestamp + which assumption)
+  2. Puts an event on the decision_queue to trigger the simulator
+
+Safety: pauses if the market feed is stale (last_tick_timestamp > 10s ago).
+This prevents false breach alerts from stale data.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+
+from core.causal_state import CausalStateManager, STALE_THRESHOLD_S
+from core.schemas import Assumption, DecisionObject
+
+logger = logging.getLogger(__name__)
+
+MONITOR_INTERVAL_S = 60
+
+
+def _is_feed_stale(manager: CausalStateManager) -> bool:
+    """Return True if the market feed has not sent a tick in > STALE_THRESHOLD_S."""
+    state = manager.snapshot()
+    if state.last_tick_timestamp is None:
+        return True
+    now = datetime.now(timezone.utc)
+    age = (now - state.last_tick_timestamp).total_seconds()
+    return age > STALE_THRESHOLD_S
+
+
+def _check_assumption(assumption: Assumption, state) -> bool:
+    """Return True if the assumption is breached given current state.
+
+    Updates assumption.proximity as a side-effect for logging.
+    """
+    current_value: float = getattr(state, assumption.variable, 0.0)
+
+    # Compute proximity: current_value / threshold
+    if assumption.threshold != 0:
+        proximity = current_value / assumption.threshold
+    else:
+        proximity = 1.0
+
+    assumption.proximity = proximity
+
+    if assumption.operator == "lt":
+        return current_value >= assumption.threshold
+    elif assumption.operator == "gt":
+        return current_value <= assumption.threshold
+    return False
+
+
+async def assumption_monitor_loop(
+    state_manager: CausalStateManager,
+    ledger_writer,                # ledger.writer.LedgerWriter instance
+    decision_queue: asyncio.Queue,
+) -> None:
+    """Main monitoring coroutine. Runs every 60 seconds indefinitely.
+
+    Pauses safely when the feed is stale.
+    """
+    logger.info("Assumption monitor started | interval=%ds", MONITOR_INTERVAL_S)
+
+    while True:
+        await asyncio.sleep(MONITOR_INTERVAL_S)
+
+        if _is_feed_stale(state_manager):
+            logger.warning("Monitor paused | feed stale > %ds", STALE_THRESHOLD_S)
+            continue
+
+        active: DecisionObject | None = ledger_writer.get_active()
+        if active is None:
+            logger.debug("Monitor | no active DecisionObject")
+            continue
+
+        state = state_manager.snapshot()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for assumption in active.assumptions:
+            breached = _check_assumption(assumption, state)
+            if breached:
+                logger.warning(
+                    "Assumption breached | name=%s variable=%s threshold=%.4f actual=%.4f",
+                    assumption.name,
+                    assumption.variable,
+                    assumption.threshold,
+                    getattr(state, assumption.variable, 0.0),
+                )
+                ledger_writer.log_breach(
+                    decision_object_id=str(active.id),
+                    assumption_name=assumption.name,
+                    breach_timestamp=now_iso,
+                )
+                await decision_queue.put({
+                    "type": "assumption_breach",
+                    "assumption": assumption.name,
+                    "decision_object_id": str(active.id),
+                })
+            else:
+                logger.debug(
+                    "Assumption holds | name=%s proximity=%.3f",
+                    assumption.name, assumption.proximity,
+                )
