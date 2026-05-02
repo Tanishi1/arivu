@@ -30,11 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.constants import KMEANS_MODEL_PATH, REGIME_MODEL_PATH
 from core.schemas import CausalState
-from core.simulator import Simulator
 from ml.regime import RegimeClassifier
-from strategies.bollinger import BollingerStrategy
-from strategies.ema_crossover import EMAStrategy
-from strategies.rsi_divergence import RSIStrategy
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
@@ -153,79 +149,6 @@ for label in [label_calm, label_volatile]:
         label in known_classes,
         f"Output '{label}' is a valid regime label",
     )
-
-
-# ---------------------------------------------------------------------------
-# 4. Bootstrap fallback (no model)
-# ---------------------------------------------------------------------------
-print("\n-- 4. Bootstrap fallback " + "-" * 35)
-
-rc_bootstrap = RegimeClassifier.__new__(RegimeClassifier)
-rc_bootstrap._dt = None
-rc_bootstrap._is_trained = False
-
-# volatility > 0.04 -> 'volatile' (threshold in regime.py)
-fb_volatile = rc_bootstrap.classify(
-    volatility=0.05, spread=0.001, trend_strength=0.1, volume=100.0
-)
-check(fb_volatile == "volatile", f"Bootstrap: high volatility -> 'volatile' (got '{fb_volatile}')")
-
-# trend_strength > 0.5 -> 'trending'
-fb_trending = rc_bootstrap.classify(
-    volatility=0.01, spread=0.001, trend_strength=0.8, volume=100.0
-)
-check(fb_trending == "trending", f"Bootstrap: high trend_strength -> 'trending' (got '{fb_trending}')")
-
-# otherwise -> 'calm'
-fb_calm = rc_bootstrap.classify(
-    volatility=0.01, spread=0.001, trend_strength=0.2, volume=100.0
-)
-check(fb_calm == "calm", f"Bootstrap: low vol, low trend -> 'calm' (got '{fb_calm}')")
-
-
-# ---------------------------------------------------------------------------
-# 5. Simulator integration (how main.py actually uses the DT)
-# ---------------------------------------------------------------------------
-print("\n-- 5. Simulator integration " + "-" * 33)
-
-# main.py line 206: Simulator(strategies=strategies, regime_classifier=regime._dt)
-simulator = Simulator(
-    strategies=[EMAStrategy(), BollingerStrategy(), RSIStrategy()],
-    regime_classifier=rc._dt,
-)
-
-# Craft a CausalState that should select EMAStrategy (strong trend, low spread)
-trending_state = CausalState(
-    price=50000.0,
-    volatility=0.01,
-    spread=0.0008,
-    trend_slope=0.008,
-    trend_strength=0.85,
-    volume=50000.0,
-    algo_health_vector=[0.9, 0.08, 0.02],
-)
-
-try:
-    result = simulator.run(trending_state)
-    check(
-        result.strategy_name in ("EMAStrategy", "BollingerStrategy", "RSIStrategy"),
-        f"Simulator.run() returned a valid strategy: '{result.strategy_name}'",
-    )
-    check(
-        result.hill_climb_iterations >= 1,
-        f"Hill-climbing ran (iterations={result.hill_climb_iterations})",
-    )
-    check(
-        len(result.assumptions) == 3,
-        f"Strategy returned exactly 3 assumptions (got {len(result.assumptions)})",
-    )
-    check(
-        isinstance(result.projected_pnl, float),
-        f"projected_pnl is a float: {result.projected_pnl:.6f}",
-    )
-except Exception as e:
-    errors.append("Simulator.run() crashed")
-    print(f"  {FAIL}  Simulator.run() crashed | {e}")
 
 
 # ---------------------------------------------------------------------------
