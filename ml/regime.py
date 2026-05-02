@@ -41,10 +41,12 @@ from sklearn.tree import DecisionTreeClassifier
 
 logger = logging.getLogger(__name__)
 
-REGIME_MODEL_PATH = Path("data/models/regime_dt.joblib")
-KMEANS_MODEL_PATH = Path("data/models/kmeans.joblib")
-MIN_ENTRIES_FOR_KMEANS = 40
-K_CANDIDATES = [2, 3]  # K=2 may be more honest with limited data
+from core.constants import (
+    REGIME_MODEL_PATH,
+    KMEANS_MODEL_PATH,
+    MIN_ENTRIES_FOR_KMEANS,
+    K_CANDIDATES,
+)
 
 # Bootstrap regime thresholds
 VOLATILE_THRESHOLD = 0.04
