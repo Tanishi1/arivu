@@ -1,0 +1,39 @@
+============================================================
+ARIVU — Regime Training Report
+Generated: 2026-05-03 00:44:12
+============================================================
+
+Input data
+  Rows processed      : 129,580
+  Volatility window   : 20 candles
+  Trend window        : 20 candles
+  Volume window       : 20 candles
+  Slope normaliser    : 0.01
+
+Features used for training (3)
+  ['volatility', 'trend_strength', 'volume']
+  NOTE: spread excluded — no bid/ask in historical kline data.
+  The live RegimeClassifier uses these same 3 features only.
+
+K-Means results
+  Best K              : 2
+  Silhouette score    : 0.8845
+  Model saved to      : data\models\kmeans.joblib
+
+Cluster centroids
+  [calm]
+    rows            : 125,921  (97.2%)
+    mean volatility : 0.000604
+    mean trend_str  : 0.999428
+  [volatile]
+    rows            : 3,659  (2.8%)
+    mean volatility : 0.001337
+    mean trend_str  : 0.999920
+
+Decision Tree results
+  max_depth           : 5
+  class_weight        : balanced
+  Train/test split    : 80/20 chronological (no shuffle)
+  Test accuracy       : 1.0000
+  Model saved to      : data\models\regime_dt.joblib
+============================================================

@@ -74,7 +74,12 @@ class RegimeClassifier:
         if not self._is_trained:
             return self._bootstrap_classify(volatility, trend_strength)
 
-        features = np.array([[volatility, spread, trend_strength, volume]])
+        # Detect if model expects 3 features (historical bootstrap) or 4 (live retrained)
+        if hasattr(self._dt, "n_features_in_") and self._dt.n_features_in_ == 3:
+            features = np.array([[volatility, trend_strength, volume]])
+        else:
+            features = np.array([[volatility, spread, trend_strength, volume]])
+
         return str(self._dt.predict(features)[0])
 
     def run_kmeans_and_retrain(self, closed_entries: list[dict]) -> bool:
