@@ -1,10 +1,10 @@
 ============================================================
 ARIVU — Regime Training Report
-Generated: 2026-05-03 19:04:28
+Generated: 2026-05-03 19:27:26
 ============================================================
 
 Input data
-  Rows processed      : 388,740
+  Rows processed      : 129,580
   Volatility window   : 20 candles
   Trend window        : 20 candles
   Volume window       : 20 candles
@@ -17,30 +17,30 @@ Features used for training (3)
 
 K-Means results
   Best K              : 3
-  Silhouette score    : 0.6273
+  Silhouette score    : 0.4890
   Model saved to      : data\models\kmeans.joblib
 
 Cluster centroids
   [calm]
-    rows            : 53,155  (13.7%)
-    mean volatility : 0.000603
-    mean trend_str  : 0.307008
-    symbols         : SOLUSDT:50531 | ETHUSDT:2531 | BTCUSDT:93
+    rows            : 49,700  (38.4%)
+    mean volatility : 0.000594
+    mean trend_str  : 0.301983
+    symbols         : SOLUSDT:49700
   [trending]
-    rows            : 297,192  (76.5%)
-    mean volatility : 0.000629
-    mean trend_str  : 0.988214
-    symbols         : BTCUSDT:124281 | ETHUSDT:114854 | SOLUSDT:58057
+    rows            : 70,258  (54.2%)
+    mean volatility : 0.000849
+    mean trend_str  : 0.943944
+    symbols         : SOLUSDT:70258
   [volatile]
-    rows            : 38,393  (9.9%)
-    mean volatility : 0.001886
-    mean trend_str  : 0.976934
-    symbols         : SOLUSDT:20992 | ETHUSDT:12195 | BTCUSDT:5206
+    rows            : 9,622  (7.4%)
+    mean volatility : 0.002199
+    mean trend_str  : 0.943159
+    symbols         : SOLUSDT:9622
 
 Decision Tree results
   max_depth           : 5
   class_weight        : balanced
   Train/test split    : 80/20 chronological (no shuffle)
-  Test accuracy       : 0.9719
+  Test accuracy       : 0.9881
   Model saved to      : data\models\regime_dt.joblib
 ============================================================
