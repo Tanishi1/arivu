@@ -19,6 +19,7 @@ Usage:
     python data/train_regime.py
 """
 
+import argparse
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -28,6 +29,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 # Add project root to path so core.constants resolves
@@ -37,6 +39,7 @@ from ml.regime import (
     K_CANDIDATES,
     KMEANS_MODEL_PATH,
     REGIME_MODEL_PATH,
+    SCALER_MODEL_PATH,
 )
 from core.causal_state import (
     TREND_WINDOW,
@@ -46,7 +49,6 @@ from core.causal_state import (
 
 SLOPE_NORMALISER = 0.01
 
-RAW_CSV = Path(__file__).parent / "btcusdt_1m_raw.csv"
 REPORT_PATH = Path(__file__).parent / "regime_training_report.txt"
 
 # Exactly the 3 features the Decision Tree is trained on.
@@ -115,6 +117,7 @@ def name_clusters(
             "vol":   df.loc[mask, "volatility"].mean(),
             "trend": df.loc[mask, "trend_strength"].mean(),
             "count": int(mask.sum()),
+            "symbols": df.loc[mask, "symbol"].value_counts().to_dict() if "symbol" in df else {},
         }
 
     sorted_by_vol = sorted(
@@ -210,11 +213,13 @@ def write_report(
 
     for regime, info in sorted(centroid_info.items()):
         pct = info["count"] / n_rows * 100
+        sym_str = " | ".join(f"{s}:{c}" for s, c in info.get("symbols", {}).items())
         lines += [
             f"  [{regime}]",
             f"    rows            : {info['count']:,}  ({pct:.1f}%)",
             f"    mean volatility : {info['vol']:.6f}",
             f"    mean trend_str  : {info['trend']:.6f}",
+            f"    symbols         : {sym_str}",
         ]
 
     lines += [
@@ -258,23 +263,50 @@ def run_sanity_check() -> None:
 # ── Main ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    df = load_raw(RAW_CSV)
-    df = compute_features(df)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default="SOLUSDT", help="Specific symbol (e.g., SOLUSDT)")
+    args = parser.parse_args()
 
-    X = df[FEATURE_COLS].values
+    symbols_to_run = [args.symbol.upper()]
+
+    dfs = []
+    for symbol in symbols_to_run:
+        path = Path(__file__).parent / f"{symbol.lower()}_1m_raw.csv"
+        if not path.exists():
+            print(f"Warning: {path} not found. Skipping.")
+            continue
+        df = load_raw(path)
+        df["symbol"] = symbol
+        df = compute_features(df)
+        dfs.append(df)
+
+    if not dfs:
+        print("Error: No data files found.")
+        sys.exit(1)
+
+    df_all = pd.concat(dfs, ignore_index=True)
+    X_raw = df_all[FEATURE_COLS].values
+
+    print("\nScaling features...")
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw)
+
+    SCALER_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(scaler, SCALER_MODEL_PATH)
+    print(f"Scaler saved to {SCALER_MODEL_PATH}")
 
     print("\nRunning K-Means...")
     best_k, best_silhouette, best_km, labels = run_kmeans(X)
 
     print("\nNaming clusters...")
-    named_labels, centroid_info = name_clusters(labels, df)
+    named_labels, centroid_info = name_clusters(labels, df_all)
 
     print("\nTraining Decision Tree...")
     dt, dt_accuracy = train_dt(X, named_labels)
 
     print("\nWriting training report...")
     write_report(
-        n_rows=len(df),
+        n_rows=len(df_all),
         best_k=best_k,
         best_silhouette=best_silhouette,
         centroid_info=centroid_info,

@@ -17,6 +17,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 REGIME_MODEL_PATH = Path("data/models/regime_dt.joblib")
 KMEANS_MODEL_PATH = Path("data/models/kmeans.joblib")
+SCALER_MODEL_PATH = Path("data/models/scaler.joblib")
 
 # ---------------------------------------------------------------------------
 # Rolling window sizes — used by causal_state.py and regime_trainer.py

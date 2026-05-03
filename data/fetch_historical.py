@@ -9,6 +9,7 @@ Usage:
     python data/fetch_historical.py
 """
 
+import argparse
 import csv
 import time
 from datetime import datetime, timezone
@@ -17,11 +18,9 @@ from pathlib import Path
 import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SYMBOL = "BTCUSDT"
 INTERVAL = "1m"
 LIMIT = 1000          # max rows per request Binance allows
 MONTHS_BACK = 3
-OUTPUT_FILE = Path(__file__).parent / "btcusdt_1m_raw.csv"
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -35,14 +34,14 @@ def _months_ago_ms(months: int) -> int:
     return _now_ms() - months * 30 * 24 * 60 * 60 * 1000
 
 
-def fetch_klines(start_ms: int, end_ms: int) -> list[list]:
+def fetch_klines(symbol: str, start_ms: int, end_ms: int) -> list[list]:
     """Fetch all 1-minute klines between start_ms and end_ms, paginated."""
     all_rows = []
     current_start = start_ms
 
     while current_start < end_ms:
         params = {
-            "symbol": SYMBOL,
+            "symbol": symbol,
             "interval": INTERVAL,
             "startTime": current_start,
             "endTime": end_ms,
@@ -91,13 +90,20 @@ def save_csv(rows: list[list], path: Path) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default="SOLUSDT", help="Symbol to fetch")
+    args = parser.parse_args()
+
+    symbol = args.symbol.upper()
+    output_file = Path(__file__).parent / f"{symbol.lower()}_1m_raw.csv"
+
     start_ms = _months_ago_ms(MONTHS_BACK)
     end_ms = _now_ms()
 
     start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    print(f"Pulling {SYMBOL} {INTERVAL} klines from {start_dt} to {end_dt} ...")
+    print(f"Pulling {symbol} {INTERVAL} klines from {start_dt} to {end_dt} ...")
 
-    rows = fetch_klines(start_ms, end_ms)
-    save_csv(rows, OUTPUT_FILE)
-    print("Done. Hand off btcusdt_1m_raw.csv to Member 2.")
+    rows = fetch_klines(symbol, start_ms, end_ms)
+    save_csv(rows, output_file)
+    print(f"Done. Hand off {output_file.name} to Member 2.")

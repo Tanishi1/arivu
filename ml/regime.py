@@ -37,6 +37,7 @@ import joblib
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ from core.constants import (
     KMEANS_MODEL_PATH,
     MIN_ENTRIES_FOR_KMEANS,
     K_CANDIDATES,
+    SCALER_MODEL_PATH,
 )
 
 # Bootstrap regime thresholds
@@ -62,6 +64,7 @@ class RegimeClassifier:
 
     def __init__(self) -> None:
         self._dt: DecisionTreeClassifier | None = None
+        self._scaler: StandardScaler | None = None
         self._is_trained = False
         self._load_models_if_exist()
 
@@ -79,6 +82,9 @@ class RegimeClassifier:
             features = np.array([[volatility, trend_strength, volume]])
         else:
             features = np.array([[volatility, spread, trend_strength, volume]])
+
+        if self._scaler is not None:
+            features = self._scaler.transform(features)
 
         return str(self._dt.predict(features)[0])
 
@@ -100,7 +106,10 @@ class RegimeClassifier:
             return False
 
         features = ["volatility", "spread", "trend_strength", "volume"]
-        X = np.array([[e[f] for f in features] for e in closed_entries])
+        X_raw = np.array([[e[f] for f in features] for e in closed_entries])
+
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X_raw)
 
         best_k, best_labels = self._select_k(X)
         logger.info("K-Means complete | best_k=%d", best_k)
@@ -112,10 +121,12 @@ class RegimeClassifier:
         dt = DecisionTreeClassifier(max_depth=5, random_state=42)
         dt.fit(X, named_labels)
         self._dt = dt
+        self._scaler = scaler
         self._is_trained = True
 
         joblib.dump(dt, REGIME_MODEL_PATH)
-        logger.info("Decision Tree retrained | classes=%s", list(dt.classes_))
+        joblib.dump(scaler, SCALER_MODEL_PATH)
+        logger.info("Decision Tree and Scaler retrained | classes=%s", list(dt.classes_))
         return True
 
     # ------------------------------------------------------------------
@@ -198,10 +209,19 @@ class RegimeClassifier:
         return "calm"
 
     def _load_models_if_exist(self) -> None:
-        if REGIME_MODEL_PATH.exists():
+        if REGIME_MODEL_PATH.exists() and SCALER_MODEL_PATH.exists():
             try:
                 self._dt = joblib.load(REGIME_MODEL_PATH)
+                self._scaler = joblib.load(SCALER_MODEL_PATH)
                 self._is_trained = True
-                logger.info("Regime DT loaded from disk")
+                logger.info("Regime DT and Scaler loaded from disk")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Models load failed | bootstrap mode | %s", exc)
+        elif REGIME_MODEL_PATH.exists():
+            try:
+                self._dt = joblib.load(REGIME_MODEL_PATH)
+                self._scaler = None
+                self._is_trained = True
+                logger.info("Regime DT loaded from disk (no scaler)")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Regime DT load failed | bootstrap mode | %s", exc)
