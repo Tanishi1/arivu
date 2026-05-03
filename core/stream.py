@@ -1,5 +1,5 @@
 """shared/stream.py
-Binance WebSocket market data feed for BTC/USDT.
+Binance WebSocket market data feed for SOL/USDT.
 
 Connects to three simultaneous streams:
   - kline_1m    — 1-minute candlestick data
@@ -27,7 +27,7 @@ from core.schemas import MarketTick
 logger = logging.getLogger(__name__)
 
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream"
-SYMBOL = "btcusdt"
+SYMBOL = "solusdt"
 RECONNECT_DELAY_S = 2
 STALE_THRESHOLD_S = 10
 

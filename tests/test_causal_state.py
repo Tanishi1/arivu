@@ -21,9 +21,9 @@ from core.causal_state import CausalStateManager, STALE_THRESHOLD_S
 from core.schemas import MarketTick
 
 
-def _make_tick(price=50000.0, volume=10.0, bid=49999.0, ask=50001.0) -> MarketTick:
+def _make_tick(price=150.0, volume=10.0, bid=149.9, ask=150.1) -> MarketTick:
     return MarketTick(
-        symbol="BTCUSDT",
+        symbol="SOLUSDT",
         timestamp=datetime.now(timezone.utc),
         price=price,
         volume=volume,
@@ -90,12 +90,12 @@ async def test_trend_reversal_trigger(queue_and_manager):
     """A sign flip in trend_slope should put an event on the decision queue."""
     q, mgr = queue_and_manager
 
-    # First: uptrend (prices increasing)
-    for p in [50000, 50050, 50100, 50150, 50200, 50250, 50300, 50350, 50400, 50450]:
+    # First: uptrend (prices increasing) to fill the window
+    for p in [50000 + (i * 50) for i in range(20)]:
         await mgr.update(_make_tick(price=p, bid=p - 1, ask=p + 1))
 
-    # Then: downtrend (prices decreasing sharply — causes trend_slope sign flip)
-    for p in [50400, 50300, 50200, 50100, 50000, 49900, 49800, 49700, 49600, 49500]:
+    # Then: downtrend (prices decreasing sharply) long enough to flip the 20-tick slope
+    for p in [51000 - (i * 50) for i in range(20)]:
         await mgr.update(_make_tick(price=p, bid=p - 1, ask=p + 1))
 
     # Check if any trigger event was fired

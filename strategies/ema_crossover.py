@@ -28,7 +28,7 @@ import pandas as pd
 import pandas_ta as ta  # noqa: F401 — used via pd.Series.ta
 
 from core.schemas import Assumption, CausalState
-from strategies.base import BaseStrategy
+from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ _PRICE_HISTORY: list[float] = []
 MAX_HISTORY = 60  # keep last 60 prices
 
 
-class EMAStrategy(BaseStrategy):
+class EMAStrategy(Strategy):
     """Dynamic EMA Crossover momentum strategy."""
 
     def generate_signal(self, state: CausalState, params: dict) -> str:

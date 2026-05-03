@@ -32,7 +32,7 @@ import pandas as pd
 import pandas_ta as ta  # noqa: F401
 
 from core.schemas import Assumption, CausalState
-from strategies.base import BaseStrategy
+from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def _find_local_highs(prices: list[float]) -> list[tuple[int, float]]:
     return highs
 
 
-class RSIStrategy(BaseStrategy):
+class RSIStrategy(Strategy):
     """RSI Momentum Divergence strategy — conservative, uncertainty regime."""
 
     def generate_signal(self, state: CausalState, params: dict) -> str:

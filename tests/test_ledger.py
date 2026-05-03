@@ -32,6 +32,10 @@ def fresh_db(tmp_path, monkeypatch):
     from sqlalchemy.orm import sessionmaker
     lm.SessionLocal = sessionmaker(bind=lm.engine, autoflush=False, autocommit=False)
     lm.Base.metadata.create_all(lm.engine)
+    
+    # Crucial: patch writer's imported SessionLocal to point to the test db
+    import ledger.writer as lw
+    lw.SessionLocal = lm.SessionLocal
     yield
 
 
@@ -48,6 +52,7 @@ def _make_decision_object(phase="bootstrap") -> DecisionObject:
         ],
         projected_pnl=0.014,
         confidence=0.81,
+        hill_climb_iterations=7,
         phase=phase,
     )
 
@@ -62,7 +67,8 @@ def test_commit_success():
     do = _make_decision_object()
     committed_id = writer.commit(do)
 
-    with SessionLocal() as session:
+    import ledger.models as lm
+    with lm.SessionLocal() as session:
         row = session.get(DecisionObjectRow, committed_id)
         assert row is not None
         assert row.strategy_name == "EMAStrategy"
@@ -115,10 +121,13 @@ def test_close_creates_outcome():
         assumptions_breached=["spread_constraint"],
         breach_timestamps={"spread_constraint": datetime.now(timezone.utc).isoformat()},
         hill_climb_iterations=7,
+        phase="bootstrap",
+        close_reason="test_close",
     )
     writer.close(do.id, record)
 
-    with SessionLocal() as session:
+    import ledger.models as lm
+    with lm.SessionLocal() as session:
         outcome = session.query(OutcomeRecordRow).filter_by(
             decision_object_id=str(do.id)
         ).first()
@@ -165,3 +174,30 @@ def test_indexes_exist():
     assert "idx_do_strategy" in do_indexes, "Missing idx_do_strategy"
     assert "idx_or_doid" in or_indexes, "Missing idx_or_doid"
     assert "idx_mc_phase" in cp_indexes, "Missing idx_mc_phase"
+
+
+# ---------------------------------------------------------------------------
+# 6. Model Checkpoints (Week 1 requirement: all 3 tables tested)
+# ---------------------------------------------------------------------------
+
+def test_save_checkpoint():
+    """save_checkpoint() should create a ModelCheckpointRow and we can read it back."""
+    from ledger.models import ModelCheckpointRow
+
+    writer = LedgerWriter()
+    writer.save_checkpoint(
+        checkpoint_number=1,
+        phase="bootstrap",
+        ml2_brier_score=0.15,
+        training_sample_count=100,
+        ml1_macro_f1=0.92,
+    )
+
+    import ledger.models as lm
+    with lm.SessionLocal() as session:
+        row = session.query(ModelCheckpointRow).filter_by(checkpoint_number=1).first()
+        assert row is not None
+        assert row.phase == "bootstrap"
+        assert row.ml2_brier_score == 0.15
+        assert row.training_sample_count == 100
+        assert row.ml1_macro_f1 == 0.92

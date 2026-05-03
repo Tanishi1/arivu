@@ -1,7 +1,7 @@
 """data/train_regime.py
 Feature engineering + K-Means + Decision Tree.
 
-Reads:  data/btcusdt_1m_raw.csv
+Reads:  data/solusdt_1m_raw.csv
 Writes: data/models/regime_dt.joblib
         data/models/kmeans.joblib
         data/regime_training_report.txt

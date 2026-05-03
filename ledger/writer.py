@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Fields that are IMMUTABLE after initial commit — only 'status' may change
 _IMMUTABLE_FIELDS = {
-    "id", "timestamp_committed", "strategy_name", "tuned_params",
+    "id", "timestamp_committed", "strategy_name", "symbol", "tuned_params",
     "market_state_snapshot", "algo_health_vector", "assumptions",
-    "projected_pnl", "confidence", "phase",
+    "projected_pnl", "confidence", "phase", "schema_version",
 }
 
 
@@ -74,6 +74,7 @@ class LedgerWriter:
                 id=str(do.id),
                 timestamp_committed=do.timestamp_committed.isoformat(),
                 strategy_name=do.strategy_name,
+                symbol=do.symbol,
                 tuned_params=json.dumps(do.tuned_params),
                 market_state_snapshot=json.dumps(do.market_state_snapshot),
                 algo_health_vector=json.dumps(do.algo_health_vector),
@@ -82,6 +83,8 @@ class LedgerWriter:
                 confidence=do.confidence,
                 status="COMMITTED",
                 phase=do.phase,
+                hill_climb_iterations=do.hill_climb_iterations,
+                schema_version=do.schema_version,
                 breach_log="{}",
             )
 
@@ -168,40 +171,61 @@ class LedgerWriter:
                 return None
             return self._row_to_schema(row)
 
+    def get_decision_object(self, decision_object_id: str) -> DecisionObject | None:
+        """Return a DecisionObject by ID, regardless of status."""
+        with SessionLocal() as session:
+            row = session.get(DecisionObjectRow, decision_object_id)
+            if row is None:
+                return None
+            return self._row_to_schema(row)
+
     # ------------------------------------------------------------------
     # Close
     # ------------------------------------------------------------------
 
     def close(self, decision_object_id, record: OutcomeRecord) -> None:
-        """Write the OutcomeRecord and mark the DecisionObject as CLOSED."""
-        try:
-            outcome_row = OutcomeRecordRow(
-                id=str(record.id),
-                decision_object_id=str(decision_object_id),
-                timestamp_closed=record.timestamp_closed.isoformat(),
-                actual_pnl=record.actual_pnl,
-                outcome_delta=record.outcome_delta,
-                assumptions_held=json.dumps(record.assumptions_held),
-                assumptions_breached=json.dumps(record.assumptions_breached),
-                breach_timestamps=json.dumps(record.breach_timestamps),
-                hill_climb_iterations=record.hill_climb_iterations,
-            )
+        """Write the OutcomeRecord and mark the DecisionObject as CLOSED.
 
+        phase is pulled from the existing DecisionObjectRow so the OutcomeRecord
+        always mirrors its parent — no JOIN needed in ML2 training queries.
+        """
+        try:
             with SessionLocal() as session:
-                session.add(outcome_row)
                 do_row = session.get(DecisionObjectRow, str(decision_object_id))
-                if do_row:
-                    do_row.status = "CLOSED"
+                if do_row is None:
+                    raise LedgerWriteError(
+                        f"DecisionObject {decision_object_id} not found during close"
+                    )
+                phase = do_row.phase
+
+                outcome_row = OutcomeRecordRow(
+                    id=str(record.id),
+                    decision_object_id=str(decision_object_id),
+                    timestamp_closed=record.timestamp_closed.isoformat(),
+                    symbol=record.symbol,
+                    actual_pnl=record.actual_pnl,
+                    outcome_delta=record.outcome_delta,
+                    assumptions_held=json.dumps(record.assumptions_held),
+                    assumptions_breached=json.dumps(record.assumptions_breached),
+                    breach_timestamps=json.dumps(record.breach_timestamps),
+                    hill_climb_iterations=record.hill_climb_iterations,
+                    phase=phase,
+                    close_reason=record.close_reason,
+                )
+                session.add(outcome_row)
+                do_row.status = "CLOSED"
                 session.commit()
 
             if self._active_id == str(decision_object_id):
                 self._active_id = None
 
             logger.info(
-                "Ledger closed | id=%s delta=%.4f",
-                decision_object_id, record.outcome_delta,
+                "Ledger closed | id=%s delta=%.4f phase=%s",
+                decision_object_id, record.outcome_delta, phase,
             )
 
+        except LedgerWriteError:
+            raise
         except Exception as exc:
             raise LedgerWriteError(f"Ledger close failed: {exc}") from exc
 
@@ -250,12 +274,15 @@ class LedgerWriter:
             id=row.id,
             timestamp_committed=datetime.fromisoformat(row.timestamp_committed),
             strategy_name=row.strategy_name,
+            symbol=row.symbol,
             tuned_params=json.loads(row.tuned_params),
             market_state_snapshot=json.loads(row.market_state_snapshot),
             algo_health_vector=json.loads(row.algo_health_vector),
             assumptions=assumptions,
             projected_pnl=row.projected_pnl,
             confidence=row.confidence,
+            hill_climb_iterations=row.hill_climb_iterations,
             status=row.status,
             phase=row.phase,
+            schema_version=row.schema_version,
         )

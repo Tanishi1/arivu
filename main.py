@@ -63,6 +63,7 @@ from ml.regime import RegimeClassifier
 from strategies.ema_crossover import EMAStrategy
 from strategies.bollinger import BollingerStrategy
 from strategies.rsi_divergence import RSIStrategy
+from core.comparator import OutcomeComparator
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,19 @@ _shutdown = asyncio.Event()
 def _handle_sigint(*_):
     logger.info("Shutdown signal received")
     _shutdown.set()
+
+
+# ---------------------------------------------------------------------------
+# Time Horizon Watcher
+# ---------------------------------------------------------------------------
+
+async def time_horizon_watcher(decision_id: str, horizon_minutes: int, queue: asyncio.Queue) -> None:
+    """Sleeps for horizon_minutes, then triggers a horizon_expired event."""
+    await asyncio.sleep(horizon_minutes * 60)
+    await queue.put({
+        "type": "horizon_expired",
+        "decision_object_id": decision_id,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +117,7 @@ async def decision_cycle_loop(
     ml2: ML2BreachPredictor,
     ledger: LedgerWriter,
     executor: Executor,
+    comparator: OutcomeComparator,
     current_phase: list[str],  # mutable container: ['bootstrap'] or ['trained']
 ) -> None:
     """Read events from decision_queue, run the full simulator → ledger → Alpaca cycle.
@@ -110,6 +125,7 @@ async def decision_cycle_loop(
     Phase is controlled by the outer loop after checking ML2 training results.
     """
     last_hill_climb_iterations = 1
+    active_watcher_task: asyncio.Task | None = None
 
     while not _shutdown.is_set():
         try:
@@ -121,6 +137,15 @@ async def decision_cycle_loop(
             "Decision cycle started | trigger=%s phase=%s",
             event.get("type"), current_phase[0],
         )
+
+        # 1. Close any active DecisionObject before starting a new one
+        active = ledger.get_active()
+        if active:
+            if active_watcher_task and not active_watcher_task.done():
+                active_watcher_task.cancel()
+            
+            close_reason = event.get("type", "unknown")
+            comparator.close_cycle(active, last_hill_climb_iterations, close_reason)
 
         state = state_manager.snapshot()
 
@@ -142,11 +167,12 @@ async def decision_cycle_loop(
         do = DecisionObject(
             strategy_name=sim_result.strategy_name,
             tuned_params=sim_result.tuned_params,
-            market_state_snapshot=state.model_dump(exclude={"algo_health_vector", "last_tick_timestamp"}),
+            market_state_snapshot=state.model_dump(mode="json", exclude={"algo_health_vector", "last_tick_timestamp"}),
             algo_health_vector=ml1_vector,
             assumptions=sim_result.assumptions,
             projected_pnl=sim_result.projected_pnl,
             confidence=sim_result.confidence,
+            hill_climb_iterations=sim_result.hill_climb_iterations,
             phase=current_phase[0],
         )
 
@@ -180,6 +206,11 @@ async def decision_cycle_loop(
         if ml1.maybe_retrain():
             logger.info("ML1 retrained successfully")
 
+        # Spawn time horizon watcher for this new decision
+        active_watcher_task = asyncio.create_task(
+            time_horizon_watcher(str(do.id), 240, decision_queue)
+        )
+
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -201,6 +232,7 @@ async def main() -> None:
     ml1 = ML1BehaviourClassifier()
     ml2 = ML2BreachPredictor()
     regime = RegimeClassifier()
+    comparator = OutcomeComparator(ledger, executor._api)
 
     strategies = [EMAStrategy(), BollingerStrategy(), RSIStrategy()]
     simulator = Simulator(strategies=strategies, regime_classifier=regime._dt)
@@ -222,7 +254,7 @@ async def main() -> None:
             assumption_monitor_loop(state_manager, ledger, decision_queue),
             decision_cycle_loop(
                 decision_queue, state_manager,
-                simulator, ml1, ml2, ledger, executor, current_phase,
+                simulator, ml1, ml2, ledger, executor, comparator, current_phase,
             ),
             _shutdown_watcher(feed),
         )

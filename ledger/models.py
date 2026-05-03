@@ -17,7 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    Column, Float, Index, Integer, String, Text, create_engine,
+    Column, Float, Index, Integer, String, Text, create_engine, event
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -29,7 +29,16 @@ SQLITE_PATH = os.getenv("SQLITE_PATH", "data/arivu.db")
 def _get_engine():
     db_path = Path(SQLITE_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(f"sqlite:///{db_path}", echo=False)
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"timeout": 5, "check_same_thread": False},
+    )
+
+    @event.listens_for(engine, "connect")
+    def set_wal_mode(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA journal_mode=WAL")
+
+    return engine
 
 
 engine = _get_engine()
@@ -55,6 +64,7 @@ class DecisionObjectRow(Base):
     id = Column(String, primary_key=True)
     timestamp_committed = Column(String, nullable=False)
     strategy_name = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
     tuned_params = Column(Text, nullable=False)          # JSON
     market_state_snapshot = Column(Text, nullable=False) # JSON
     algo_health_vector = Column(Text, nullable=False)    # JSON [p_normal, p_stressed, p_degraded]
@@ -63,6 +73,8 @@ class DecisionObjectRow(Base):
     confidence = Column(Float, nullable=False)
     status = Column(String, nullable=False, default="COMMITTED")
     phase = Column(String, nullable=False, default="bootstrap")
+    hill_climb_iterations = Column(Integer, nullable=False, default=0)
+    schema_version = Column(Integer, nullable=False, default=1)
 
     # Breach log — JSON dict {assumption_name: iso_timestamp}
     breach_log = Column(Text, nullable=True, default="{}")
@@ -79,12 +91,15 @@ class OutcomeRecordRow(Base):
     id = Column(String, primary_key=True)
     decision_object_id = Column(String, nullable=False)
     timestamp_closed = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
     actual_pnl = Column(Float, nullable=False)
     outcome_delta = Column(Float, nullable=False)
     assumptions_held = Column(Text, nullable=False)    # JSON list
     assumptions_breached = Column(Text, nullable=False) # JSON list
     breach_timestamps = Column(Text, nullable=True)    # JSON dict
     hill_climb_iterations = Column(Integer, nullable=False)
+    phase = Column(String, nullable=False, default="bootstrap")  # mirrors DecisionObject.phase
+    close_reason = Column(String, nullable=False, default="unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +129,10 @@ class ModelCheckpointRow(Base):
 
 Index("idx_do_status", DecisionObjectRow.status)
 Index("idx_do_strategy", DecisionObjectRow.strategy_name)
+Index("idx_do_symbol", DecisionObjectRow.symbol)
+Index("idx_do_phase", DecisionObjectRow.phase)
 Index("idx_or_doid", OutcomeRecordRow.decision_object_id)
+Index("idx_or_phase", OutcomeRecordRow.phase)
 Index("idx_mc_phase", ModelCheckpointRow.phase)
 
 

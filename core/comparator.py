@@ -35,7 +35,7 @@ BUFFER_COLUMNS = [
     "proximity", "time_horizon",
     "p_normal", "p_stressed", "p_degraded",
     "assumption_type", "breached",
-    "phase",
+    "phase", "close_reason",
 ]
 
 
@@ -51,6 +51,7 @@ class OutcomeComparator:
         self,
         decision_object: DecisionObject,
         hill_climb_iterations: int,
+        close_reason: str,
     ) -> OutcomeRecord | None:
         """Close the decision cycle.
 
@@ -59,8 +60,12 @@ class OutcomeComparator:
         3. Commit OutcomeRecord to ledger.
         4. Append rows to training_buffer.csv.
 
-        Returns the OutcomeRecord, or None if Alpaca read fails.
+        Returns the OutcomeRecord, or None if Alpaca read fails or cycle is already closed.
         """
+        existing = self._ledger.get_decision_object(str(decision_object.id))
+        if existing and existing.status == "CLOSED":
+            logger.info("Comparator | Decision %s already CLOSED. Skipping.", decision_object.id)
+            return None
         actual_pnl = self._read_actual_pnl()
         if actual_pnl is None:
             logger.error("Comparator | could not read P&L from Alpaca — cycle not closed")
@@ -85,6 +90,8 @@ class OutcomeComparator:
             assumptions_breached=breached_names,
             breach_timestamps=breach_log,
             hill_climb_iterations=hill_climb_iterations,
+            phase=decision_object.phase,
+            close_reason=close_reason,
         )
 
         self._ledger.close(decision_object.id, record)
@@ -131,6 +138,7 @@ class OutcomeComparator:
                 "assumption_type": assumption.name,
                 "breached": breached_flag,
                 "phase": do.phase,
+                "close_reason": record.close_reason,
             })
 
         with open(TRAINING_BUFFER_PATH, "a", newline="") as f:

@@ -42,6 +42,7 @@ VOLUME_WINDOW = 20       # ticks
 VOLATILITY_THRESHOLD = 0.04
 SPREAD_THRESHOLD = 0.002
 TREND_SLOPE_FLIP_TOLERANCE = 0.0  # sign change triggers
+STALE_THRESHOLD_S = 10            # seconds before feed is considered stale
 
 
 class CausalStateManager:
@@ -176,7 +177,7 @@ class CausalStateManager:
             })
             logger.info("Trigger fired | reason=volatility value=%.4f", volatility)
 
-        elif spread > SPREAD_THRESHOLD:
+        if spread > SPREAD_THRESHOLD:
             await self._decision_queue.put({
                 "type": "threshold_crossed",
                 "reason": "spread",
@@ -184,7 +185,7 @@ class CausalStateManager:
             })
             logger.info("Trigger fired | reason=spread value=%.4f", spread)
 
-        elif trend_reversed:
+        if trend_reversed:
             await self._decision_queue.put({
                 "type": "threshold_crossed",
                 "reason": "trend_reversal",

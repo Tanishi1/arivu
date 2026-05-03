@@ -30,7 +30,7 @@ import pandas as pd
 import pandas_ta as ta  # noqa: F401
 
 from core.schemas import Assumption, CausalState
-from strategies.base import BaseStrategy
+from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ MAX_HISTORY = 60
 _candles_since_buy: int = 0
 
 
-class BollingerStrategy(BaseStrategy):
+class BollingerStrategy(Strategy):
     """Volatility-Banded Mean Reversion using Bollinger Bands."""
 
     def generate_signal(self, state: CausalState, params: dict) -> str:

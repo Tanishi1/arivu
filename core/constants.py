@@ -18,6 +18,12 @@ from pathlib import Path
 REGIME_MODEL_PATH = Path("data/models/regime_dt.joblib")
 KMEANS_MODEL_PATH = Path("data/models/kmeans.joblib")
 SCALER_MODEL_PATH = Path("data/models/scaler.joblib")
+ML1_MODEL_PATH    = Path("data/models/ml1.joblib")
+ML2_MODEL_PATH    = Path("data/models/ml2.joblib")
+
+# SQLite
+SQLITE_PATH = Path("data/arivu.db")
+TRAINING_BUFFER_PATH = Path("data/training_buffer.csv")
 
 # ---------------------------------------------------------------------------
 # Rolling window sizes — used by causal_state.py and regime_trainer.py
@@ -44,4 +50,35 @@ SPREAD_PROPAGATION_FACTOR = 5
 # ---------------------------------------------------------------------------
 K_CANDIDATES = [2, 3, 4]
 MIN_ENTRIES_FOR_KMEANS = 40
+
+# Strategy window
+STRATEGY_HORIZON_MINUTES = 30
+
+# ML retraining triggers
+ML1_RETRAIN_AFTER = 100   # ExecutionTelemetry samples
+ML2_RETRAIN_AFTER = 20    # closed OutcomeRecord entries
+
+# Per-instrument assumption thresholds
+INSTRUMENTS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+THRESHOLDS = {
+    "BTCUSDT": {
+        "volatility_limit":   0.04,
+        "spread_limit":       0.002,
+        "trend_slope_min":    0.0,
+        "trend_strength_max": 0.4,
+    },
+    "ETHUSDT": {
+        "volatility_limit":   0.05,
+        "spread_limit":       0.003,
+        "trend_slope_min":    0.0,
+        "trend_strength_max": 0.5,
+    },
+    "SOLUSDT": {
+        "volatility_limit":   0.07,
+        "spread_limit":       0.005,
+        "trend_slope_min":    0.0,
+        "trend_strength_max": 0.6,
+    },
+}
 

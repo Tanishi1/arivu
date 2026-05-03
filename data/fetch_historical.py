@@ -1,9 +1,9 @@
 """data/fetch_historical.py
-Member 1 script — Pull 3 months of BTC/USDT 1-minute kline data from Binance.
+Pull 3 months of SOL/USDT 1-minute kline data from Binance.
 
 No API key required. Public endpoint.
 
-Output: data/btcusdt_1m_raw.csv
+Output: data/solusdt_1m_raw.csv
 
 Usage:
     python data/fetch_historical.py

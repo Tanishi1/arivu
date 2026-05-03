@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from core.schemas import Assumption, CausalState
 
 
-class BaseStrategy(ABC):
+class Strategy(ABC):
     """Abstract base class for Arivu trading strategies.
 
     All strategies must implement exactly these 5 methods. No more, no less.
