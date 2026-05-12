@@ -88,6 +88,22 @@ class RegimeClassifier:
 
         return str(self._dt.predict(features)[0])
 
+    def predict_proba(self, volatility: float, spread: float, trend_strength: float, volume: float) -> list[float]:
+        """Return regime probabilities. Handles feature scaling and dimensionality (N25 Fix)."""
+        if not self._is_trained:
+            # Bootstrap fallback: 100% confidence in the bootstrap classification
+            return [1.0]
+
+        if hasattr(self._dt, "n_features_in_") and self._dt.n_features_in_ == 3:
+            features = np.array([[volatility, trend_strength, volume]])
+        else:
+            features = np.array([[volatility, spread, trend_strength, volume]])
+
+        if self._scaler is not None:
+            features = self._scaler.transform(features)
+
+        return self._dt.predict_proba(features)[0].tolist()
+
     def run_kmeans_and_retrain(self, closed_entries: list[dict]) -> bool:
         """Run K-Means offline to discover regimes, then retrain Decision Tree.
 

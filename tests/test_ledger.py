@@ -122,7 +122,7 @@ def test_close_creates_outcome():
         breach_timestamps={"spread_constraint": datetime.now(timezone.utc).isoformat()},
         hill_climb_iterations=7,
         phase="bootstrap",
-        close_reason="test_close",
+        close_reason="manual",
     )
     writer.close(do.id, record)
 

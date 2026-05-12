@@ -24,10 +24,7 @@ from pathlib import Path
 from uuid import UUID
 
 from core.schemas import DecisionObject, OutcomeRecord
-
-logger = logging.getLogger(__name__)
-
-TRAINING_BUFFER_PATH = Path("data/training_buffer.csv")
+from core.constants import TRAINING_BUFFER_PATH, STRATEGY_HORIZON_MINUTES
 
 # CSV columns for ML training buffer (E10)
 BUFFER_COLUMNS = [
@@ -50,7 +47,6 @@ class OutcomeComparator:
     def close_cycle(
         self,
         decision_object: DecisionObject,
-        hill_climb_iterations: int,
         close_reason: str,
     ) -> OutcomeRecord | None:
         """Close the decision cycle.
@@ -89,7 +85,7 @@ class OutcomeComparator:
             assumptions_held=held_names,
             assumptions_breached=breached_names,
             breach_timestamps=breach_log,
-            hill_climb_iterations=hill_climb_iterations,
+            hill_climb_iterations=decision_object.hill_climb_iterations,
             phase=decision_object.phase,
             close_reason=close_reason,
         )
@@ -105,12 +101,19 @@ class OutcomeComparator:
         return record
 
     def _read_actual_pnl(self) -> float | None:
-        """Read cumulative P&L from Alpaca paper account."""
+        """Close Alpaca position and return its PNL."""
         try:
-            account = self._alpaca.get_account()
-            return float(account.equity) - float(account.last_equity)
+            # N10 & N11 FIX: Close the actual position and get the PNL instead of daily account equity.
+            # Alpaca API expects the crypto pair symbol (e.g., SOLUSD)
+            position = self._alpaca.get_position("SOLUSD")
+            unrealized_pl = float(position.unrealized_pl)
+            self._alpaca.close_position("SOLUSD")
+            return unrealized_pl
         except Exception as exc:  # noqa: BLE001
-            logger.error("Alpaca P&L read failed | %s", exc)
+            if "position does not exist" in str(exc).lower():
+                logger.info("Comparator | No open position to close for SOLUSD")
+                return 0.0
+            logger.error("Alpaca P&L read/close failed | %s", exc)
             return None
 
     def _append_to_buffer(
@@ -131,7 +134,7 @@ class OutcomeComparator:
                 "trend_strength": market.get("trend_strength", 0.0),
                 "volume": market.get("volume", 0.0),
                 "proximity": assumption.proximity,
-                "time_horizon": 240,  # default strategy window in minutes
+                "time_horizon": STRATEGY_HORIZON_MINUTES,
                 "p_normal": p_normal,
                 "p_stressed": p_stressed,
                 "p_degraded": p_degraded,

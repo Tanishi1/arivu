@@ -100,6 +100,10 @@ class ML2BreachPredictor:
         Returns (retrained: bool, brier_score: float | None).
         Also logs a checkpoint to the ledger.
         """
+        # N23 FIX: Initialize checkpoint count from DB if not yet loaded (across restarts)
+        if self._checkpoint_count == 0:
+            self._checkpoint_count = ledger_writer.get_max_checkpoint()
+
         self._new_entries_since_retrain += 1
         if self._new_entries_since_retrain < RETRAIN_THRESHOLD:
             return False, None
@@ -120,6 +124,11 @@ class ML2BreachPredictor:
         split = int(len(X) * 0.8)
         X_train, X_val = X[:split], X[split:]
         y_train, y_val = y[:split], y[split:]
+
+        # N9 FIX: Ensure training set has at least 2 classes after the time split
+        if len(set(y_train)) < 2:
+            logger.warning("ML2 retrain skipped | less than 2 classes in y_train due to time split")
+            return False, None
 
         model = LogisticRegression(
             class_weight="balanced",
@@ -145,6 +154,14 @@ class ML2BreachPredictor:
             self._is_trained = True
             self._checkpoint_count += 1
             joblib.dump(model, ML2_MODEL_PATH)
+            
+            # N8 FIX: Write the checkpoint to the database so Research Metric 2 exists!
+            ledger_writer.save_checkpoint(
+                checkpoint_number=self._checkpoint_count,
+                phase="bootstrap" if self._checkpoint_count == 1 else "trained",
+                ml2_brier_score=brier,
+                training_sample_count=len(X),
+            )
         else:
             logger.warning("ML2 does not beat baseline — keeping previous model")
 

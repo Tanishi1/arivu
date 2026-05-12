@@ -21,8 +21,11 @@ SCALER_MODEL_PATH = Path("data/models/scaler.joblib")
 ML1_MODEL_PATH    = Path("data/models/ml1.joblib")
 ML2_MODEL_PATH    = Path("data/models/ml2.joblib")
 
-# SQLite
-SQLITE_PATH = Path("data/arivu.db")
+# SQLite — reads SQLITE_PATH env var if set (e.g. SQLITE_PATH=data/prod.db)
+# N4 FIX: single source of truth — models.py imports this instead of redefining it
+import os as _os
+SQLITE_PATH = Path(_os.getenv("SQLITE_PATH", "data/arivu.db"))
+del _os  # don't pollute the constants namespace
 TRAINING_BUFFER_PATH = Path("data/training_buffer.csv")
 
 # ---------------------------------------------------------------------------

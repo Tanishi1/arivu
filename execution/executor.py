@@ -73,9 +73,15 @@ class Executor:
         if signal == "HOLD":
             return self._no_op_telemetry()
 
+        # N27 FIX: Alpaca crypto paper trading does not support short selling.
+        # Since Arivu starts every cycle flat, a SELL signal is an illicit short attempt.
+        if signal == "SELL":
+            logger.warning("Alpaca crypto does not support short selling. Converting SELL to HOLD.")
+            return self._no_op_telemetry()
+
         intended_price = state.price
         side = "buy" if signal == "BUY" else "sell"
-        qty = self._compute_quantity(params, state)
+        qty = await self._compute_quantity(params, state)
 
         start_time = time.monotonic()
         fill_price, filled = await self._place_limit_with_fallback(
@@ -93,7 +99,9 @@ class Executor:
         actual_qty = qty if filled else 0
         pos_size_dev = (actual_qty / intended_qty - 1) if intended_qty > 0 else 0.0
 
+        # N26 FIX: Add missing symbol to prevent Pydantic ValidationError crash
         telemetry = ExecutionTelemetry(
+            symbol=SYMBOL,
             fill_rate=fill_rate,
             order_latency_ms=latency_ms,
             slippage=slippage,
@@ -116,7 +124,8 @@ class Executor:
         """Try limit order. Fall back to market order after LIMIT_TIMEOUT_S."""
         for attempt in range(MAX_RETRIES):
             try:
-                order = self._api.submit_order(
+                order = await asyncio.to_thread(
+                    self._api.submit_order,
                     symbol=SYMBOL,
                     qty=qty,
                     side=side,
@@ -129,13 +138,13 @@ class Executor:
                 deadline = time.monotonic() + LIMIT_TIMEOUT_S
                 while time.monotonic() < deadline:
                     await asyncio.sleep(2)
-                    o = self._api.get_order(order.id)
+                    o = await asyncio.to_thread(self._api.get_order, order.id)
                     if o.status == "filled":
                         fill_price = float(o.filled_avg_price or limit_price)
                         return fill_price, True
 
                 # Timeout — cancel and fall back to market
-                self._api.cancel_order(order.id)
+                await asyncio.to_thread(self._api.cancel_order, order.id)
                 logger.warning("Limit order timed out | falling back to market order")
                 return await self._place_market_order(side, qty)
 
@@ -150,7 +159,8 @@ class Executor:
     async def _place_market_order(self, side: str, qty: float) -> tuple[float, bool]:
         """Market order fallback — higher slippage but ensures execution."""
         try:
-            order = self._api.submit_order(
+            order = await asyncio.to_thread(
+                self._api.submit_order,
                 symbol=SYMBOL,
                 qty=qty,
                 side=side,
@@ -158,7 +168,7 @@ class Executor:
                 time_in_force="gtc",
             )
             await asyncio.sleep(3)
-            o = self._api.get_order(order.id)
+            o = await asyncio.to_thread(self._api.get_order, order.id)
             fill_price = float(o.filled_avg_price or 0.0)
             logger.warning("Market order fallback filled | price=%.2f", fill_price)
             return fill_price, True
@@ -166,10 +176,10 @@ class Executor:
             logger.error("Market fallback failed | %s", exc)
             return 0.0, False
 
-    def _compute_quantity(self, params: dict, state: CausalState) -> float:
+    async def _compute_quantity(self, params: dict, state: CausalState) -> float:
         """Compute order quantity respecting the 20% position cap."""
         try:
-            account = self._api.get_account()
+            account = await asyncio.to_thread(self._api.get_account)
             equity = float(account.equity)
         except Exception:  # noqa: BLE001
             equity = 10_000.0  # fallback for testing
@@ -184,7 +194,9 @@ class Executor:
 
     def _no_op_telemetry(self) -> ExecutionTelemetry:
         """Return neutral telemetry for HOLD signals."""
+        # N26 FIX: Add missing symbol
         return ExecutionTelemetry(
+            symbol=SYMBOL,
             fill_rate=1.0,
             order_latency_ms=0.0,
             slippage=0.0,

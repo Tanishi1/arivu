@@ -35,8 +35,6 @@ CausalStateField = Literal[
     "trend_slope",
     "trend_strength",
     "volume",
-    "rsi_current",
-    "divergence_candle_span",
 ]
 
 
@@ -96,6 +94,7 @@ class CausalState(BaseModel):
       It is NOT a one-time snapshot — ML1 runs continuously in the background
       and the latest vector is captured at the moment of each ledger commit.
     """
+    model_config = ConfigDict(frozen=True)
 
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -144,7 +143,7 @@ class SimulatorResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     strategy_name: str
-    symbol: str = "SOLUSD"
+    symbol: str = "SOLUSDT"
     tuned_params: dict
     heuristic_score: float
     hill_climb_iterations: int      # Research Metric 3: must be > 0
@@ -182,7 +181,7 @@ class DecisionObject(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc)
     )
     strategy_name: str
-    symbol: str = "SOLUSD"
+    symbol: str = "SOLUSDT"
     tuned_params: dict
     market_state_snapshot: dict     # snapshot of CausalState at commit time
     algo_health_vector: list[float] # ML1 vector captured at commit time
@@ -231,7 +230,7 @@ class OutcomeRecord(BaseModel):
     timestamp_closed: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
-    symbol: str = "SOLUSD"
+    symbol: str = "SOLUSDT"
     actual_pnl: float
     outcome_delta: float                    # projected − actual
     assumptions_held: list[str]             # assumption names that held

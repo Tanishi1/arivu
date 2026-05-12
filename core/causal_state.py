@@ -1,4 +1,4 @@
-"""shared/causal_state.py
+"""core/causal_state.py
 CausalState singleton + 4 propagation rules.
 
 The causal model is the heart of the digital twin. It tracks WHY variables
@@ -21,26 +21,22 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
 
 import numpy as np
 
+from core.constants import (
+    VOLATILITY_WINDOW, TREND_WINDOW, VOLUME_WINDOW,
+    SLOPE_NORMALISER, SPREAD_PROPAGATION_THRESHOLD,
+    SPREAD_PROPAGATION_FACTOR, THRESHOLDS,
+)
 from core.schemas import CausalState, MarketTick
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Rolling window sizes
-# ---------------------------------------------------------------------------
-VOLATILITY_WINDOW = 20   # ticks
-TREND_WINDOW = 20        # ticks
-VOLUME_WINDOW = 20       # ticks
-
-# ---------------------------------------------------------------------------
-# Trigger thresholds — crossing these fires the decision_queue
-# ---------------------------------------------------------------------------
-VOLATILITY_THRESHOLD = 0.04
-SPREAD_THRESHOLD = 0.002
+# Trigger thresholds — from per-instrument config in core.constants
+_SOL_THRESHOLDS = THRESHOLDS["SOLUSDT"]
+VOLATILITY_THRESHOLD = _SOL_THRESHOLDS["volatility_limit"]
+SPREAD_THRESHOLD = _SOL_THRESHOLDS["spread_limit"]
 TREND_SLOPE_FLIP_TOLERANCE = 0.0  # sign change triggers
 STALE_THRESHOLD_S = 10            # seconds before feed is considered stale
 
@@ -59,10 +55,15 @@ class CausalStateManager:
         self._lock = asyncio.Lock()
         self._decision_queue = decision_queue
 
-        # Rolling price buffer for rolling calculations
-        self._prices: deque[float] = deque(maxlen=VOLATILITY_WINDOW)
-        self._volumes: deque[float] = deque(maxlen=VOLUME_WINDOW)
+        # Rolling price buffer — maxlen=50 gives trend slope wider context
+        # while volatility/volume slice to their respective window sizes
+        self._prices: deque[float] = deque(maxlen=50)
+        self._volumes: deque[float] = deque(maxlen=50)
         self._prev_trend_slope: float = 0.0
+
+        # Edge detection — only fire triggers on threshold CROSSING, not sustained exceedance
+        self._prev_above_vol: bool = False
+        self._prev_above_spread: bool = False
 
     async def update(self, tick: MarketTick) -> None:
         """Process an incoming MarketTick: update state + propagate causally.
@@ -70,20 +71,24 @@ class CausalStateManager:
         Called by market_feed_loop on every WebSocket message.
         Acquires the asyncio.Lock for the duration of the write.
         """
+        # Capture trigger values inside the lock, then release BEFORE firing
+        # queue events. Holding the lock during queue.put() causes deadlock
+        # when the decision cycle calls update_algo_health() while the feed
+        # loop is suspended waiting for queue space.
         async with self._lock:
             self._prices.append(tick.price)
             self._volumes.append(tick.volume)
 
             volatility = self._compute_rolling_volatility()
             trend_slope = self._compute_trend_slope()
-            trend_strength = min(1.0, abs(trend_slope) / 0.01)  # normalise
+            trend_strength = min(1.0, abs(trend_slope) / SLOPE_NORMALISER)
             volume = float(np.mean(self._volumes)) if self._volumes else 0.0
 
             # --- Propagation Rule 1: volatility → spread -----------------
-            # High volatility causes market makers to widen quotes.
-            # The spread in the causal model is not just the raw bid-ask;
-            # it reflects the volatility-adjusted pressure on spreads.
-            propagated_spread = tick.spread * (1 + max(0.0, volatility - 0.02) * 5)
+            propagated_spread = tick.spread * (
+                1 + max(0.0, volatility - SPREAD_PROPAGATION_THRESHOLD)
+                * SPREAD_PROPAGATION_FACTOR
+            )
 
             # --- Propagation Rule 2: spread → assumption proximity --------
             # Handled downstream in monitor.py when checking each assumption.
@@ -99,7 +104,6 @@ class CausalStateManager:
 
             # --- Propagation Rule 4: ML1 vector → algo health ------------
             # algo_health_vector is updated separately via update_algo_health().
-            # That value is already in self._state.
 
             self._state = CausalState(
                 timestamp=tick.timestamp,
@@ -121,9 +125,14 @@ class CausalStateManager:
                 tick.price, volatility, propagated_spread, trend_slope,
             )
 
-            # Threshold check — fires trigger if any boundary is crossed
+            # Capture for use outside lock — do NOT await inside the lock
             self._prev_trend_slope = trend_slope
-            await self._check_thresholds(volatility, propagated_spread, trend_reversed)
+            _vol = volatility
+            _spread = propagated_spread
+            _trend_reversed = trend_reversed
+
+        # K1 FIX: lock is now released before any queue interaction
+        await self._check_thresholds(_vol, _spread, _trend_reversed)
 
     async def update_algo_health(self, vector: list[float]) -> None:
         """Update the algo_health_vector from the latest ML1 predict_proba().
@@ -137,6 +146,13 @@ class CausalStateManager:
                 update={"algo_health_vector": vector}
             )
 
+    async def update_position(self, qty: float, capital: float) -> None:
+        """Update live position exposure after an execution."""
+        async with self._lock:
+            self._state = self._state.model_copy(
+                update={"position_size": qty, "capital_deployed": capital}
+            )
+
     def snapshot(self) -> CausalState:
         """Return an immutable snapshot of the current state (no lock needed for reads)."""
         return self._state.model_copy(deep=True)
@@ -147,18 +163,18 @@ class CausalStateManager:
 
     def _compute_rolling_volatility(self) -> float:
         """Rolling standard deviation of log returns over VOLATILITY_WINDOW ticks."""
-        if len(self._prices) < 2:
+        if len(self._prices) < VOLATILITY_WINDOW:
             return 0.0
-        prices = np.array(self._prices)
+        prices = np.array(list(self._prices)[-VOLATILITY_WINDOW:])
         log_returns = np.diff(np.log(prices + 1e-10))
         return float(np.std(log_returns))
 
     def _compute_trend_slope(self) -> float:
         """Least-squares slope of price over TREND_WINDOW ticks."""
-        if len(self._prices) < 2:
+        if len(self._prices) < TREND_WINDOW:
             return 0.0
-        prices = np.array(self._prices)
-        x = np.arange(len(prices))
+        prices = np.array(list(self._prices)[-TREND_WINDOW:])
+        x = np.arange(TREND_WINDOW)
         slope = float(np.polyfit(x, prices, 1)[0])
         return slope
 
@@ -168,27 +184,45 @@ class CausalStateManager:
         spread: float,
         trend_reversed: bool,
     ) -> None:
-        """Fire decision_queue event if any market threshold is crossed."""
-        if volatility > VOLATILITY_THRESHOLD:
-            await self._decision_queue.put({
-                "type": "threshold_crossed",
-                "reason": "volatility",
-                "value": volatility,
-            })
-            logger.info("Trigger fired | reason=volatility value=%.4f", volatility)
+        """Fire decision_queue event if any market threshold is CROSSED.
 
-        if spread > SPREAD_THRESHOLD:
-            await self._decision_queue.put({
-                "type": "threshold_crossed",
-                "reason": "spread",
-                "value": spread,
-            })
-            logger.info("Trigger fired | reason=spread value=%.4f", spread)
+        Uses edge detection: only fires on threshold crossing, not sustained
+        exceedance. Uses put_nowait() so a full queue never suspends this
+        coroutine — stale triggers are discarded with a warning (K2 fix).
+        """
+        above_vol = volatility > VOLATILITY_THRESHOLD
+        if above_vol and not self._prev_above_vol:
+            try:
+                self._decision_queue.put_nowait({
+                    "type": "threshold_crossed",
+                    "reason": "volatility",
+                    "value": volatility,
+                })
+                logger.info("Trigger fired | reason=volatility value=%.4f", volatility)
+            except asyncio.QueueFull:
+                logger.warning("Decision queue full — volatility trigger discarded")
+        self._prev_above_vol = above_vol
+
+        above_spread = spread > SPREAD_THRESHOLD
+        if above_spread and not self._prev_above_spread:
+            try:
+                self._decision_queue.put_nowait({
+                    "type": "threshold_crossed",
+                    "reason": "spread",
+                    "value": spread,
+                })
+                logger.info("Trigger fired | reason=spread value=%.4f", spread)
+            except asyncio.QueueFull:
+                logger.warning("Decision queue full — spread trigger discarded")
+        self._prev_above_spread = above_spread
 
         if trend_reversed:
-            await self._decision_queue.put({
-                "type": "threshold_crossed",
-                "reason": "trend_reversal",
-                "value": volatility,
-            })
-            logger.info("Trigger fired | reason=trend_reversal")
+            try:
+                self._decision_queue.put_nowait({
+                    "type": "threshold_crossed",
+                    "reason": "trend_reversal",
+                    "value": volatility,
+                })
+                logger.info("Trigger fired | reason=trend_reversal")
+            except asyncio.QueueFull:
+                logger.warning("Decision queue full — trend_reversal trigger discarded")

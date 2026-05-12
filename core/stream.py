@@ -1,4 +1,4 @@
-"""shared/stream.py
+"""core/stream.py
 Binance WebSocket market data feed for SOL/USDT.
 
 Connects to three simultaneous streams:
@@ -93,15 +93,21 @@ class BinanceFeed:
             stream_name: str = envelope.get("stream", "")
             data: dict = envelope.get("data", {})
 
+            should_update = False
             if "kline" in stream_name:
                 self._parse_kline(data)
+                should_update = True
             elif "bookTicker" in stream_name:
                 self._parse_book_ticker(data)
+                should_update = True  # spread changes matter for propagation
             elif "aggTrade" in stream_name:
                 self._parse_agg_trade(data)
+                # Don't trigger full state recompute for individual trades —
+                # aggTrade fires ~10x more frequently than kline.
+                # Price/volume are updated for the next kline-triggered recompute.
 
-            # Only update causal state when we have a valid price
-            if self._latest_price > 0 and self._latest_bid > 0:
+            # Only update causal state on kline/bookTicker (not every aggTrade)
+            if should_update and self._latest_price > 0 and self._latest_bid > 0:
                 tick = MarketTick(
                     symbol=SYMBOL.upper(),
                     timestamp=datetime.now(timezone.utc),
@@ -127,4 +133,5 @@ class BinanceFeed:
 
     def _parse_agg_trade(self, data: dict) -> None:
         self._latest_price = float(data.get("p", self._latest_price))
-        self._latest_volume = float(data.get("q", self._latest_volume))
+        # N20 FIX: Do not overwrite 1-minute cumulative volume with single trade quantity
+        # self._latest_volume = float(data.get("q", self._latest_volume))

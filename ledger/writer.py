@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session  # noqa: F401 — kept for type hinting by callers
 
 from ledger.models import DecisionObjectRow, ModelCheckpointRow, OutcomeRecordRow, SessionLocal
 from core.schemas import DecisionObject, OutcomeRecord
@@ -49,7 +50,11 @@ class LedgerWriter:
     def __init__(self) -> None:
         self._active_id: str | None = None
         self._breach_logs: dict[str, dict] = {}  # {decision_object_id: {assumption: ts}}
-        self._hill_climb_iterations: dict[str, int] = {}
+        # N1 FIX: threading.Lock guards _active_id and _breach_logs.
+        # asyncio.to_thread() runs these methods in a thread pool, so multiple
+        # threads can now access shared state simultaneously. Always acquire
+        # this lock before touching _active_id or _breach_logs.
+        self._state_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Commit — THE most critical operation
@@ -92,8 +97,10 @@ class LedgerWriter:
                 session.add(row)
                 session.commit()
 
-            self._active_id = str(do.id)
-            self._breach_logs[str(do.id)] = {}
+            # N1 FIX: acquire state lock before modifying shared in-memory state
+            with self._state_lock:
+                self._active_id = str(do.id)
+                self._breach_logs[str(do.id)] = {}
 
             logger.info(
                 "Ledger committed | id=%s strategy=%s phase=%s projected_pnl=%.4f",
@@ -121,6 +128,11 @@ class LedgerWriter:
             row.status = new_status
             session.commit()
 
+        # N17 FIX: Prevent infinite memory leak by popping from cache on terminal status
+        if new_status in ("EXECUTION_FAILED", "INTERRUPTED", "CLOSED"):
+            with self._state_lock:
+                self._breach_logs.pop(decision_object_id, None)
+
         logger.info("Ledger status updated | id=%s status=%s", decision_object_id, new_status)
 
     def guard_immutable(self, field_name: str) -> None:
@@ -142,9 +154,12 @@ class LedgerWriter:
         breach_timestamp: str,
     ) -> None:
         """Record a breach event. Called by the assumption monitor."""
-        self._breach_logs.setdefault(decision_object_id, {})[assumption_name] = breach_timestamp
+        # N1 FIX: acquire lock before touching _breach_logs — log_breach runs
+        # in a thread via asyncio.to_thread and can race with commit/close.
+        with self._state_lock:
+            self._breach_logs.setdefault(decision_object_id, {})[assumption_name] = breach_timestamp
 
-        # Persist to database
+        # DB write happens outside the lock — no need to hold it during I/O
         with SessionLocal() as session:
             row = session.get(DecisionObjectRow, decision_object_id)
             if row:
@@ -154,8 +169,27 @@ class LedgerWriter:
                 session.commit()
 
     def get_breach_log(self, decision_object_id: str) -> dict:
-        """Return the current breach log for a decision object."""
-        return self._breach_logs.get(decision_object_id, {})
+        """Return the current breach log for a decision object.
+
+        Checks in-memory cache first, falls back to database.
+        This ensures breaches survive process crashes (N28 Fix).
+        """
+        with self._state_lock:
+            cached = self._breach_logs.get(decision_object_id, {})
+            if cached:
+                return dict(cached)  # return copy — caller must not mutate
+
+        # N28 FIX: Fallback to database (e.g. after mid-cycle crash recovery)
+        with SessionLocal() as session:
+            row = session.get(DecisionObjectRow, decision_object_id)
+            if row and row.breach_log:
+                log = json.loads(row.breach_log)
+                if log:
+                    with self._state_lock:
+                        self._breach_logs[decision_object_id] = log
+                    return dict(log)
+
+        return {}
 
     # ------------------------------------------------------------------
     # Read helpers
@@ -163,10 +197,15 @@ class LedgerWriter:
 
     def get_active(self) -> DecisionObject | None:
         """Return the currently active DecisionObject, or None."""
-        if self._active_id is None:
+        # N1 FIX: snapshot _active_id under lock, then do DB read without holding lock.
+        # The two-step (None check → use value) must be atomic to prevent a race
+        # where close() sets _active_id=None between the check and the DB lookup.
+        with self._state_lock:
+            active_id = self._active_id
+        if active_id is None:
             return None
         with SessionLocal() as session:
-            row = session.get(DecisionObjectRow, self._active_id)
+            row = session.get(DecisionObjectRow, active_id)
             if row is None or row.status in ("CLOSED", "INTERRUPTED"):
                 return None
             return self._row_to_schema(row)
@@ -178,6 +217,13 @@ class LedgerWriter:
             if row is None:
                 return None
             return self._row_to_schema(row)
+
+    def get_max_checkpoint(self) -> int:
+        """Return the highest checkpoint_number from the model_checkpoints table."""
+        from sqlalchemy.sql import func
+        with SessionLocal() as session:
+            max_cp = session.query(func.max(ModelCheckpointRow.checkpoint_number)).scalar()
+            return max_cp if max_cp is not None else 0
 
     # ------------------------------------------------------------------
     # Close
@@ -211,13 +257,18 @@ class LedgerWriter:
                     hill_climb_iterations=record.hill_climb_iterations,
                     phase=phase,
                     close_reason=record.close_reason,
+                    schema_version=record.schema_version,
                 )
                 session.add(outcome_row)
                 do_row.status = "CLOSED"
                 session.commit()
 
-            if self._active_id == str(decision_object_id):
-                self._active_id = None
+            # N1 FIX: acquire state lock for compound clear + evict operation
+            with self._state_lock:
+                if self._active_id == str(decision_object_id):
+                    self._active_id = None
+                # K4 FIX: evict from in-memory cache after close
+                self._breach_logs.pop(str(decision_object_id), None)
 
             logger.info(
                 "Ledger closed | id=%s delta=%.4f phase=%s",

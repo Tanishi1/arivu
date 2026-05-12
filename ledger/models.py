@@ -6,7 +6,7 @@ Three tables:
   2. outcome_records     — actual results after each strategy window closes
   3. model_checkpoints   — ML2 Brier score at each retraining checkpoint
 
-All indexes defined here. Schema must match shared/schemas.py exactly.
+All indexes defined here. Schema must match core/schemas.py exactly.
 See DECISIONS.md ADR-001 for why SQLite was chosen.
 """
 
@@ -17,13 +17,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    Column, Float, Index, Integer, String, Text, create_engine, event
+    Column, Float, ForeignKey, Index, Integer, String, Text, create_engine, event
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-load_dotenv()
+from core.constants import SQLITE_PATH  # N4 FIX: single source of truth
 
-SQLITE_PATH = os.getenv("SQLITE_PATH", "data/arivu.db")
+load_dotenv()
 
 
 def _get_engine():
@@ -89,7 +89,7 @@ class OutcomeRecordRow(Base):
     __tablename__ = "outcome_records"
 
     id = Column(String, primary_key=True)
-    decision_object_id = Column(String, nullable=False)
+    decision_object_id = Column(String, ForeignKey("decision_objects.id"), nullable=False)
     timestamp_closed = Column(String, nullable=False)
     symbol = Column(String, nullable=False)
     actual_pnl = Column(Float, nullable=False)
@@ -100,6 +100,7 @@ class OutcomeRecordRow(Base):
     hill_climb_iterations = Column(Integer, nullable=False)
     phase = Column(String, nullable=False, default="bootstrap")  # mirrors DecisionObject.phase
     close_reason = Column(String, nullable=False, default="unknown")
+    schema_version = Column(Integer, nullable=False, default=1)
 
 
 # ---------------------------------------------------------------------------

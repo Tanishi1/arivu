@@ -145,7 +145,7 @@ class Simulator:
     def __init__(
         self,
         strategies: list["BaseStrategy"],
-        regime_classifier=None,  # sklearn DecisionTreeClassifier or None (bootstrap)
+        regime_classifier=None,  # ml.regime.RegimeClassifier or None
     ) -> None:
         self._strategies = {s.__class__.__name__: s for s in strategies}
         self._regime_classifier = regime_classifier
@@ -155,22 +155,31 @@ class Simulator:
 
         # Stage 1 — best-first search
         scores: dict[str, float] = {}
+        # N31 FIX: Get the dominant regime string explicitly to map to strategies
+        dominant_regime = "bootstrap"
+        if self._regime_classifier is not None:
+            try:
+                # predict returns the string label ("trending", "volatile", "calm")
+                dominant_regime = self._regime_classifier.predict(
+                    state.volatility, state.spread, state.trend_strength, state.volume
+                )
+            except Exception:
+                pass
+
+        # Map regime to the strategy best suited for it
+        regime_boost_map = {
+            "trending": "EMAStrategy",
+            "volatile": "RSIStrategy",
+            "calm": "BollingerStrategy"
+        }
+
         for name, strategy in self._strategies.items():
             h_fn = HEURISTICS.get(name)
             base_score = h_fn(state) if h_fn else 0.5
 
-            # Decision Tree optionally re-weights heuristics by regime
-            if self._regime_classifier is not None:
-                try:
-                    features = [[
-                        state.volatility, state.spread,
-                        state.trend_strength, state.volume,
-                    ]]
-                    regime_proba = self._regime_classifier.predict_proba(features)[0]
-                    # Weight applied per regime — expand as needed
-                    base_score *= float(max(regime_proba))
-                except Exception:  # noqa: BLE001
-                    pass  # fall back to raw heuristic
+            # N31 FIX: Boost the strategy that aligns with the ML-detected regime
+            if dominant_regime in regime_boost_map and regime_boost_map[dominant_regime] == name:
+                base_score *= 1.5  # 50% heuristic boost for regime alignment
 
             scores[name] = base_score
 

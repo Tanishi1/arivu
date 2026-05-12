@@ -1,4 +1,4 @@
-"""shared/monitor.py
+"""core/monitor.py
 60-second assumption monitoring loop.
 
 Runs as an asyncio coroutine alongside market_feed_loop and decision_cycle_loop.
@@ -24,7 +24,7 @@ from core.schemas import Assumption, DecisionObject
 
 logger = logging.getLogger(__name__)
 
-MONITOR_INTERVAL_S = 60
+MONITOR_INTERVAL_S = 5  # N21 FIX: Reduced from 60s to prevent missing breaches right before horizon expiration
 
 
 def _is_feed_stale(manager: CausalStateManager) -> bool:
@@ -37,10 +37,13 @@ def _is_feed_stale(manager: CausalStateManager) -> bool:
     return age > STALE_THRESHOLD_S
 
 
-def _check_assumption(assumption: Assumption, state) -> bool:
-    """Return True if the assumption is breached given current state.
+def _check_assumption(assumption: Assumption, state) -> tuple[bool, float]:
+    """Check if an assumption is breached given current state.
 
-    Updates assumption.proximity as a side-effect for logging.
+    Returns:
+        (breached: bool, proximity: float) — proximity is current_value / threshold.
+
+    NOTE: Assumption is frozen (pydantic). Do NOT mutate it.
     """
     current_value: float = getattr(state, assumption.variable, 0.0)
 
@@ -50,13 +53,14 @@ def _check_assumption(assumption: Assumption, state) -> bool:
     else:
         proximity = 1.0
 
-    assumption.proximity = proximity
-
     if assumption.operator == "lt":
-        return current_value >= assumption.threshold
+        breached = current_value >= assumption.threshold
     elif assumption.operator == "gt":
-        return current_value <= assumption.threshold
-    return False
+        breached = current_value <= assumption.threshold
+    else:
+        breached = False
+
+    return breached, proximity
 
 
 async def assumption_monitor_loop(
@@ -82,11 +86,21 @@ async def assumption_monitor_loop(
             logger.debug("Monitor | no active DecisionObject")
             continue
 
+        # N22 FIX: Prevent monitoring before Alpaca limit order finishes filling
+        if active.status == "COMMITTED":
+            logger.debug("Monitor | object still COMMITTED, waiting for execution")
+            continue
+
         state = state_manager.snapshot()
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        # Collect ALL breaches in a single pass, then fire ONE consolidated event.
+        # Firing one event per assumption would cause N redundant decision cycles
+        # when N assumptions breach simultaneously (common during volatility spikes).
+        breached_this_cycle: list[str] = []
+
         for assumption in active.assumptions:
-            breached = _check_assumption(assumption, state)
+            breached, proximity = _check_assumption(assumption, state)
             if breached:
                 logger.warning(
                     "Assumption breached | name=%s variable=%s threshold=%.4f actual=%.4f",
@@ -95,18 +109,32 @@ async def assumption_monitor_loop(
                     assumption.threshold,
                     getattr(state, assumption.variable, 0.0),
                 )
-                ledger_writer.log_breach(
-                    decision_object_id=str(active.id),
-                    assumption_name=assumption.name,
-                    breach_timestamp=now_iso,
-                )
-                await decision_queue.put({
-                    "type": "assumption_breach",
-                    "assumption": assumption.name,
-                    "decision_object_id": str(active.id),
-                })
+                # thread so the async monitor loop is not blocked during disk I/O.
+                try:
+                    await asyncio.to_thread(
+                        ledger_writer.log_breach,
+                        decision_object_id=str(active.id),
+                        assumption_name=assumption.name,
+                        breach_timestamp=now_iso,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Monitor failed to log breach to ledger | %s", exc)
+                breached_this_cycle.append(assumption.name)
             else:
                 logger.debug(
                     "Assumption holds | name=%s proximity=%.3f",
-                    assumption.name, assumption.proximity,
+                    assumption.name, proximity,
+                )
+
+        if breached_this_cycle:
+            try:
+                decision_queue.put_nowait({
+                    "type": "assumption_breach",
+                    "assumptions": breached_this_cycle,
+                    "decision_object_id": str(active.id),
+                })
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Decision queue full — assumption_breach trigger discarded "
+                    "(will retry next monitor cycle)"
                 )
