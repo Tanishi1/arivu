@@ -37,8 +37,16 @@ logger = logging.getLogger(__name__)
 _SOL_THRESHOLDS = THRESHOLDS["SOLUSDT"]
 VOLATILITY_THRESHOLD = _SOL_THRESHOLDS["volatility_limit"]
 SPREAD_THRESHOLD = _SOL_THRESHOLDS["spread_limit"]
-TREND_SLOPE_FLIP_TOLERANCE = 0.0  # sign change triggers
+TREND_SLOPE_FLIP_TOLERANCE = 0.001  # minimum slope magnitude to qualify as a real reversal
+                                    # 0.0 fired on ANY sign change, including ±ε numerical noise
+                                    # 0.001 = 10% of SLOPE_NORMALISER — requires a meaningful trend
 STALE_THRESHOLD_S = 10            # seconds before feed is considered stale
+
+# Warmup period: rolling windows (volatility, trend, volume) all use VOLATILITY_WINDOW
+# ticks minimum. Until all windows are warm, computed values jump from 0.0 to their
+# true value in a single tick, firing spurious threshold crossings. Suppress triggers
+# until the rolling windows are fully saturated.
+_WARMUP_TICKS = max(VOLATILITY_WINDOW, TREND_WINDOW, VOLUME_WINDOW)
 
 
 class CausalStateManager:
@@ -64,6 +72,11 @@ class CausalStateManager:
         # Edge detection — only fire triggers on threshold CROSSING, not sustained exceedance
         self._prev_above_vol: bool = False
         self._prev_above_spread: bool = False
+
+        # Warmup counter — rolling windows need _WARMUP_TICKS ticks before their
+        # outputs are meaningful. Triggers are suppressed during this period to
+        # prevent the cold-start artifact (all windows go 0.0 → real value together).
+        self._tick_count: int = 0
 
     async def update(self, tick: MarketTick) -> None:
         """Process an incoming MarketTick: update state + propagate causally.
@@ -105,6 +118,9 @@ class CausalStateManager:
             # --- Propagation Rule 4: ML1 vector → algo health ------------
             # algo_health_vector is updated separately via update_algo_health().
 
+            rsi = self._compute_rsi()
+            divergence_span = self._compute_divergence_span()
+
             self._state = CausalState(
                 timestamp=tick.timestamp,
                 price=tick.price,
@@ -113,6 +129,8 @@ class CausalStateManager:
                 trend_slope=trend_slope,
                 trend_strength=trend_strength,
                 volume=volume,
+                rsi_current=rsi,
+                divergence_candle_span=divergence_span,
                 algo_health_vector=self._state.algo_health_vector,
                 active_strategy=self._state.active_strategy,
                 position_size=self._state.position_size,
@@ -127,12 +145,20 @@ class CausalStateManager:
 
             # Capture for use outside lock — do NOT await inside the lock
             self._prev_trend_slope = trend_slope
+            self._tick_count += 1
             _vol = volatility
             _spread = propagated_spread
             _trend_reversed = trend_reversed
+            _warm = self._tick_count >= _WARMUP_TICKS
 
         # K1 FIX: lock is now released before any queue interaction
-        await self._check_thresholds(_vol, _spread, _trend_reversed)
+        if _warm:
+            await self._check_thresholds(_vol, _spread, _trend_reversed)
+        else:
+            logger.debug(
+                "Warmup | tick %d/%d — threshold triggers suppressed",
+                self._tick_count, _WARMUP_TICKS,
+            )
 
     async def update_algo_health(self, vector: list[float]) -> None:
         """Update the algo_health_vector from the latest ML1 predict_proba().
@@ -154,8 +180,13 @@ class CausalStateManager:
             )
 
     def snapshot(self) -> CausalState:
-        """Return an immutable snapshot of the current state (no lock needed for reads)."""
-        return self._state.model_copy(deep=True)
+        """Return an immutable snapshot of the current state (no lock needed for reads).
+
+        CausalState is frozen=True — no deep copy needed. model_copy() creates a
+        new wrapper but shares the underlying field values, which is safe since
+        the frozen constraint prevents reassignment and all updates use model_copy(update=...).
+        """
+        return self._state.model_copy()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -177,6 +208,85 @@ class CausalStateManager:
         x = np.arange(TREND_WINDOW)
         slope = float(np.polyfit(x, prices, 1)[0])
         return slope
+
+    def _compute_rsi(self, period: int = 14) -> float:
+        """Compute RSI using Wilder's exponential smoothing method.
+
+        CRIT-2 FIX: Replaces the previous SMA-RSI (simple-average) implementation
+        which was incorrectly documented as "Wilder's method". Wilder's method uses
+        exponential smoothing: avg_gain = (prev_avg * (period-1) + current) / period.
+        SMA-RSI and Wilder RSI produce different values from the same price series.
+
+        RSIStrategy.generate_signal() uses ta.rsi() which is Wilder's method. Without
+        this fix, the monitor checked a different RSI than the strategy used to fire
+        BUY/SELL signals, making every rsi_not_extreme breach record scientifically
+        incorrect.
+
+        Returns 50.0 (neutral) when fewer than period+1 prices are available.
+        Range: [0, 100]. Above 80 = overbought (assumption breach threshold).
+        """
+        prices = list(self._prices)
+        if len(prices) < period + 1:
+            return 50.0
+
+        changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+        gains  = [max(0.0,  c) for c in changes]
+        losses = [max(0.0, -c) for c in changes]
+
+        # Wilder initial average over first `period` changes
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+
+        # Wilder smoothing for all subsequent periods
+        for i in range(period, len(changes)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0.0:
+            return 100.0
+        return round(100.0 - (100.0 / (1.0 + avg_gain / avg_loss)), 2)
+
+    def _compute_divergence_span(self) -> float:
+        """Compute candles-since-most-recent-local-extreme (low OR high).
+
+        HIGH-5 FIX: Previously only scanned local LOWS. RSI bearish divergence is
+        detected from local HIGHS in generate_signal(). When a SELL signal fired,
+        the span measured "bars since last LOW" which could be very old while the
+        actual bearish pattern spanned only 2-3 recent highs. The assumption was
+        incorrectly passing for all bearish signals.
+
+        Now scans BOTH local lows and local highs. Returns the MINIMUM span (most
+        recent price extreme). This ensures:
+          - Bullish divergence (uses lows): low_span is directly relevant.
+          - Bearish divergence (uses highs): high_span is directly relevant.
+          - minimum = "how recently did ANY significant swing occur"
+            if the most recent swing was < 3 bars ago, the pattern is noisy
+            for EITHER signal direction.
+
+        Returns 0.0 if fewer than 5 prices available or no extreme found.
+        """
+        prices = list(self._prices)
+        if len(prices) < 5:
+            return 0.0
+
+        last = len(prices) - 1
+        low_span: float | None = None
+        high_span: float | None = None
+
+        # Most recent local minimum
+        for i in range(last - 1, 0, -1):
+            if prices[i] < prices[i - 1] and prices[i] < prices[i + 1]:
+                low_span = float(last - i)
+                break
+
+        # Most recent local maximum
+        for i in range(last - 1, 0, -1):
+            if prices[i] > prices[i - 1] and prices[i] > prices[i + 1]:
+                high_span = float(last - i)
+                break
+
+        spans = [s for s in (low_span, high_span) if s is not None]
+        return min(spans) if spans else 0.0
 
     async def _check_thresholds(
         self,

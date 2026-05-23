@@ -19,7 +19,7 @@ import logging
 from datetime import datetime, timezone
 
 import websockets
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import ConnectionClosed
 
 from core.causal_state import CausalStateManager
 from core.schemas import MarketTick
@@ -67,11 +67,19 @@ class BinanceFeed:
                     async for raw_message in ws:
                         await self._handle_message(raw_message)
 
-            except ConnectionClosedError as exc:
-                logger.warning(
-                    "Market feed disconnected | reason=%s | reconnecting in %ds",
-                    exc, RECONNECT_DELAY_S,
-                )
+            except ConnectionClosed as exc:
+                # Differentiate clean shutdown (code 1000) from unexpected drops
+                # so that monitoring logs are not polluted with false error alerts.
+                if getattr(exc.rcvd, "code", None) == 1000:
+                    logger.info(
+                        "Market feed closed cleanly (1000) | reconnecting in %ds",
+                        RECONNECT_DELAY_S,
+                    )
+                else:
+                    logger.warning(
+                        "Market feed disconnected | reason=%s | reconnecting in %ds",
+                        exc, RECONNECT_DELAY_S,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Feed unexpected error | %s | reconnecting in %ds", exc, RECONNECT_DELAY_S)
 

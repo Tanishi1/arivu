@@ -58,6 +58,7 @@ class Executor:
         params: dict,
         state: CausalState,
         decision_object_id: str,
+        precomputed_qty: float | None = None,
     ) -> ExecutionTelemetry:
         """Execute a trading signal and emit telemetry.
 
@@ -66,6 +67,9 @@ class Executor:
             params: tuned parameters from Hill-climbing (includes position_fraction)
             state: current CausalState snapshot
             decision_object_id: for logging context
+            precomputed_qty: if provided, skip the internal _compute_quantity() REST
+                call. Pass this when the caller has already fetched the qty to avoid
+                a redundant Alpaca get_account() call per cycle.
 
         Returns:
             ExecutionTelemetry for ML1 to consume.
@@ -81,7 +85,7 @@ class Executor:
 
         intended_price = state.price
         side = "buy" if signal == "BUY" else "sell"
-        qty = await self._compute_quantity(params, state)
+        qty = precomputed_qty if precomputed_qty is not None else await self._compute_quantity(params, state)
 
         start_time = time.monotonic()
         fill_price, filled = await self._place_limit_with_fallback(
@@ -165,13 +169,27 @@ class Executor:
                 qty=qty,
                 side=side,
                 type="market",
-                time_in_force="gtc",
+                time_in_force="day",
             )
-            await asyncio.sleep(3)
-            o = await asyncio.to_thread(self._api.get_order, order.id)
-            fill_price = float(o.filled_avg_price or 0.0)
+            # H_NEW_3 FIX: Poll until filled or 10-second timeout.
+            # Previously: sleep(3) then read once. If fill takes > 3s,
+            # filled_avg_price is None → fill_price=0.0 → slippage=intended_price
+            # (e.g. 150.0) → ML1 classifies as severely degraded. Silent corruption.
+            fill_price = 0.0
+            for _ in range(10):
+                await asyncio.sleep(1)
+                o = await asyncio.to_thread(self._api.get_order, order.id)
+                if o.status == "filled":
+                    fill_price = float(o.filled_avg_price or 0.0)
+                    break
+            else:
+                logger.error(
+                    "Market order not filled after 10s poll | "
+                    "fill_price=0.0 — ExecutionTelemetry slippage will be unreliable"
+                )
             logger.warning("Market order fallback filled | price=%.2f", fill_price)
             return fill_price, True
+
         except Exception as exc:  # noqa: BLE001
             logger.error("Market fallback failed | %s", exc)
             return 0.0, False
@@ -181,8 +199,12 @@ class Executor:
         try:
             account = await asyncio.to_thread(self._api.get_account)
             equity = float(account.equity)
-        except Exception:  # noqa: BLE001
-            equity = 10_000.0  # fallback for testing
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not fetch Alpaca account equity | falling back to $10,000 | "
+                "ORDER MAY BE OVERSIZED if real equity is lower | %s", exc
+            )
+            equity = 10_000.0  # fallback for testing only — never silently use in live session
 
         fraction = min(
             params.get("position_fraction", 0.10),

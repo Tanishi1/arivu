@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 
 from core.causal_state import CausalStateManager, STALE_THRESHOLD_S
+from core.constants import SLOPE_NORMALISER
 from core.schemas import Assumption, DecisionObject
 
 logger = logging.getLogger(__name__)
@@ -47,11 +48,17 @@ def _check_assumption(assumption: Assumption, state) -> tuple[bool, float]:
     """
     current_value: float = getattr(state, assumption.variable, 0.0)
 
-    # Compute proximity: current_value / threshold
+    # Compute proximity: how close current_value is to breaching the threshold.
     if assumption.threshold != 0:
         proximity = current_value / assumption.threshold
+    elif assumption.operator == "gt":
+        # HIGH-4 FIX: threshold=0.0 + operator='gt' (EMA trend_persistence).
+        # proximity = how close the slope is to 0 (the breach point).
+        # SLOPE_NORMALISER scales so strong slope→0.0 (safe), weak slope→1.0 (at risk).
+        # Previously returned 1.0 unconditionally — always appeared maximum breach risk.
+        proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / SLOPE_NORMALISER))
     else:
-        proximity = 1.0
+        proximity = 0.0
 
     if assumption.operator == "lt":
         breached = current_value >= assumption.threshold
@@ -81,7 +88,7 @@ async def assumption_monitor_loop(
             logger.warning("Monitor paused | feed stale > %ds", STALE_THRESHOLD_S)
             continue
 
-        active: DecisionObject | None = ledger_writer.get_active()
+        active: DecisionObject | None = await asyncio.to_thread(ledger_writer.get_active)
         if active is None:
             logger.debug("Monitor | no active DecisionObject")
             continue

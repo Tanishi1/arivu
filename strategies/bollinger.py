@@ -9,13 +9,22 @@ Signal logic:
 Three causal assumptions:
   1. no_active_trend       — trend_strength < 0.4  (mean reversion fails in strong trends)
   2. volatility_normal     — volatility < 0.035    (too much volatility widens bands unreliably)
-  3. reversion_within_window — time-based: candles since BUY < 6
+  3. spread_within_tolerance — spread < 0.003      (tight spread needed for profitable reversion)
+
+  NOTE: Assumption 3 was previously "reversion_within_window" tracking _candles_since_buy
+  via trend_strength as a proxy — this was scientifically invalid (trend_strength does not
+  measure time since entry). Replaced with a spread assumption that genuinely constrains
+  execution quality, consistent with the other two strategies' causal model.
 
 Evaluate scoring:
   if trend_strength > 0.5: return -0.01  (strong penalty — strategy should not run)
-  if HOLD: return 0.0
+  if trend_strength > 0.3: return 0.0    (mild trend — signal would be HOLD)
   score = (1 - trend_strength) × penalty_for_vol_deviation × 0.012
   proximity > 0.8: multiply score × 0.4  (strictest proximity penalty)
+
+  IMPORTANT: evaluate() is a PURE function — it does NOT call generate_signal().
+  generate_signal() has side effects (_price_history, _candles_since_buy). Calling it
+  inside evaluate() during hill-climbing corrupts these counters across 100+ calls.
 
 Assigned to: Person 2
 Done when: Simulator selects Bollinger in a ranging CausalState and penalties
@@ -30,30 +39,35 @@ import pandas as pd
 import pandas_ta as ta  # noqa: F401
 
 from core.schemas import Assumption, CausalState
+from core.constants import THRESHOLDS
 from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
-_PRICE_HISTORY: list[float] = []
 MAX_HISTORY = 60
-_candles_since_buy: int = 0
+# SOL is the only active instrument — all thresholds are SOLUSDT.
+_T = THRESHOLDS["SOLUSDT"]
 
 
 class BollingerStrategy(Strategy):
     """Volatility-Banded Mean Reversion using Bollinger Bands."""
 
-    def generate_signal(self, state: CausalState, params: dict) -> str:
-        global _candles_since_buy
+    def __init__(self) -> None:
+        # Instance-level state — NOT module-level.
+        # Module-level lists are shared and corrupted by evaluate() during hill-climbing.
+        self._price_history: list[float] = []
+        self._candles_since_buy: int = 0
 
-        _PRICE_HISTORY.append(state.price)
-        if len(_PRICE_HISTORY) > MAX_HISTORY:
-            _PRICE_HISTORY.pop(0)
+    def generate_signal(self, state: CausalState, params: dict) -> str:
+        self._price_history.append(state.price)
+        if len(self._price_history) > MAX_HISTORY:
+            self._price_history.pop(0)
 
         period = params.get("baseline_period", 20)
-        if len(_PRICE_HISTORY) < period + 1:
+        if len(self._price_history) < period + 1:
             return "HOLD"
 
-        closes = pd.Series(_PRICE_HISTORY)
+        closes = pd.Series(self._price_history)
         middle = ta.sma(closes, length=period)
         std = closes.rolling(period).std()
         mult = params.get("std_dev_multiplier", 2.0)
@@ -62,10 +76,10 @@ class BollingerStrategy(Strategy):
             return "HOLD"
 
         lower = middle - mult * std
-        _candles_since_buy += 1
+        self._candles_since_buy += 1
 
         if closes.iloc[-1] < lower.iloc[-1]:
-            _candles_since_buy = 0
+            self._candles_since_buy = 0
             return "BUY"
 
         if (
@@ -77,26 +91,31 @@ class BollingerStrategy(Strategy):
         return "HOLD"
 
     def get_assumptions(self, state: CausalState, params: dict) -> list[Assumption]:
-        """Return exactly 3 assumptions for the Bollinger strategy."""
+        """Return exactly 3 assumptions for the Bollinger strategy.
+
+        S3-3: current_value and proximity are intentionally 0.0 (Pydantic defaults).
+        core/decision_utils.annotate_proximity() is the single source of truth.
+        """
+        vol_thresh = _T["volatility_limit"] * 0.875   # 87.5% of vol limit (tighter than EMA)
         return [
             Assumption(
                 name="no_active_trend",
                 variable="trend_strength",
                 operator="lt",
-                threshold=0.4,
+                threshold=_T["trend_strength_max"],
             ),
             Assumption(
                 name="volatility_normal",
                 variable="volatility",
                 operator="lt",
-                threshold=0.035,
+                threshold=vol_thresh,
             ),
             Assumption(
-                # Time-based assumption — tracked via candle count
-                name="reversion_within_window",
-                variable="trend_strength",  # proxy: use trend as the check variable
+                # Spread constraint: tight spread needed for profitable mean reversion.
+                name="spread_within_tolerance",
+                variable="spread",
                 operator="lt",
-                threshold=0.6,             # overridden by monitor logic for time check
+                threshold=_T["spread_limit"],
             ),
         ]
 
@@ -115,12 +134,17 @@ class BollingerStrategy(Strategy):
         }
 
     def evaluate(self, state: CausalState, params: dict) -> float:
-        """Score this configuration. Heavy penalty in trending markets."""
-        # Hard penalty: mean reversion in a strong trend is a bad trade
-        if state.trend_strength > 0.5:
+        """Score this configuration. Heavy penalty in trending markets.
+
+        PURE FUNCTION — does NOT call generate_signal() and does NOT modify
+        self._price_history or self._candles_since_buy.
+        All thresholds use SOLUSDT constants.
+        """
+        if state.trend_strength > _T["trend_strength_max"]:
             return -0.01
 
-        if self.generate_signal(state, params) == "HOLD":
+        # Mild trend — Bollinger signal would likely be HOLD
+        if state.trend_strength > _T["trend_strength_max"] * 0.5:
             return 0.0
 
         # Optimal volatility for Bollinger is moderate (~0.02)

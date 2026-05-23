@@ -35,6 +35,10 @@ CausalStateField = Literal[
     "trend_slope",
     "trend_strength",
     "volume",
+    "rsi_current",          # Wilder RSI-14 computed from rolling prices. Default 50.0 (neutral).
+    "divergence_candle_span", # Candles since last local price extreme (low OR high). Default 3.5.
+                              # C_NEW_1 FIX: 3.5 > threshold 3.0 prevents startup false breach.
+                              # Replaced by _compute_divergence_span() after 5 price ticks.
 ]
 
 
@@ -109,6 +113,20 @@ class CausalState(BaseModel):
     # ML1 output — updated continuously in background, captured at commit time
     # [p_normal, p_stressed, p_degraded] — all three values, not a single label
     algo_health_vector: list[float] = Field(default_factory=lambda: [1.0, 0.0, 0.0])
+
+    # RSI current value — computed by causal_state.py from rolling price history.
+    # Range [0, 100]. Default 50.0 (neutral) until >= 15 ticks are available.
+    # Used by RSIStrategy's rsi_not_extreme assumption (operator='lt', threshold=80.0)
+    # to detect overbought conditions. The monitor checks getattr(state, 'rsi_current').
+    rsi_current: float = 50.0
+
+    # Candles since last local price low/high — computed by causal_state.py.
+    # C_NEW_1 FIX: Default is 3.5 (above threshold=3.0) so startup state does NOT
+    # immediately breach the divergence_span assumption before enough price history
+    # accumulates. The real value takes over once _compute_divergence_span() has
+    # at least 5 prices to scan. Without this, every RSI cycle closes within 5s.
+    divergence_candle_span: float = 3.5
+
 
     active_strategy: str = "none"
     position_size: float = 0.0
@@ -213,6 +231,24 @@ class DecisionObject(BaseModel):
             raise ValueError(
                 f"algo_health_vector must sum to ~1.0 (tolerance ±0.02), "
                 f"got {total:.4f}. Values: {v}"
+            )
+        return v
+
+    @field_validator("assumptions")
+    @classmethod
+    def validate_assumption_count(cls, v: list) -> list:
+        """Enforce exactly 3 assumptions per DecisionObject.
+
+        The monitor, ML2 annotator, and training_buffer.csv all depend on
+        exactly 3 assumptions per cycle. A strategy returning fewer causes:
+          - Uneven CSV rows (breaks ML2's len(data)//3 cycle count estimate)
+          - Monitor checking fewer conditions than designed
+          - Silent scientific integrity violation (underdefined causal model)
+        """
+        if len(v) != 3:
+            raise ValueError(
+                f"Each strategy must return exactly 3 Assumption objects, got {len(v)}. "
+                f"See strategies/base.py get_assumptions() docstring."
             )
         return v
 

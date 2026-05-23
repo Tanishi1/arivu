@@ -55,15 +55,29 @@ class ML1BehaviourClassifier:
         self._checkpoint_count = 0
         self._load_model_if_exists()
 
-    def predict_proba(self, telemetry: ExecutionTelemetry) -> list[float]:
+    def predict_proba(
+        self,
+        telemetry: ExecutionTelemetry,
+        is_real_order: bool = True,
+    ) -> list[float]:
         """Return [p_normal, p_stressed, p_degraded] for the given telemetry.
+
+        Args:
+            telemetry: ExecutionTelemetry from the executor.
+            is_real_order: Pass False for HOLD/SELL no-op telemetry.
+                HOLD telemetry is synthetic (fill_rate=1.0, latency=0.0, slippage=0.0)
+                and always classifies as 'normal'. Appending it to _sample_buffer
+                prevents ML1 from ever seeing degraded samples, blocking retraining
+                and keeping algo_health_vector permanently at [1.0, 0.0, 0.0].
 
         In bootstrap mode: threshold rules.
         In trained mode: RandomForest predict_proba().
 
         Always returns a valid probability vector summing to 1.0.
         """
-        self._sample_buffer.append(self._to_features(telemetry))
+        # Only real BUY orders produce meaningful telemetry for ML1 training.
+        if is_real_order:
+            self._sample_buffer.append(self._to_features(telemetry))
 
         if not self._is_trained:
             return self._bootstrap_predict(telemetry)
@@ -84,6 +98,10 @@ class ML1BehaviourClassifier:
         labels = [self._bootstrap_label(s) for s in self._sample_buffer]
         if len(set(labels)) < 2:
             logger.warning("ML1 retrain skipped | fewer than 2 classes in buffer")
+            # Clear buffer to prevent unbounded growth and stale data contamination.
+            # Without this, the buffer grows past RETRAIN_THRESHOLD and is re-evaluated
+            # every single cycle without ever successfully retraining.
+            self._sample_buffer.clear()
             return False
 
         X = np.array([[v for v in s.values()] for s in self._sample_buffer])

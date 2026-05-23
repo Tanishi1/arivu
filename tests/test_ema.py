@@ -14,16 +14,12 @@ from __future__ import annotations
 import pytest
 
 from core.schemas import CausalState
-from strategies.ema_crossover import EMAStrategy, _PRICE_HISTORY
+from strategies.ema_crossover import EMAStrategy
 
 
-@pytest.fixture(autouse=True)
-def clear_price_history():
-    """Clear the module-level price buffer before each test."""
-    _PRICE_HISTORY.clear()
-    yield
-    _PRICE_HISTORY.clear()
-
+# NOTE: No module-level _PRICE_HISTORY fixture needed.
+# EMAStrategy.__init__() creates a fresh self._price_history per instance.
+# Each test that needs clean state should call EMAStrategy() directly.
 
 @pytest.fixture
 def strategy():

@@ -52,9 +52,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 from core.causal_state import CausalStateManager
 from core.constants import STRATEGY_HORIZON_MINUTES
+from core.decision_utils import annotate_proximity
 from core.stream import BinanceFeed
 from core.monitor import assumption_monitor_loop
 from core.simulator import Simulator
+from core.schemas import DecisionObject
 from execution.executor import Executor
 from ledger.models import init_db
 from ledger.writer import LedgerWriter, LedgerWriteError
@@ -97,12 +99,23 @@ async def time_horizon_watcher(decision_id: str, horizon_minutes: int, queue: as
         "type": "horizon_expired",
         "decision_object_id": decision_id,
     }
-    while True:
+    # Retry until the queue has space — but stop cooperatively if shutdown is
+    # requested. Without this check the loop runs forever if the decision
+    # cycle is stuck, making shutdown non-cooperative.
+    while not _shutdown.is_set():
         try:
             queue.put_nowait(event)
-            break
+            return
         except asyncio.QueueFull:
             await asyncio.sleep(1.0)
+    # Best-effort final attempt after shutdown so the event is not silently lost.
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        logger.warning(
+            "time_horizon_watcher: queue full at shutdown — horizon_expired dropped | id=%s",
+            decision_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +147,7 @@ async def decision_cycle_loop(
     executor: Executor,
     comparator: OutcomeComparator,
     current_phase: list[str],  # mutable container: ['bootstrap'] or ['trained']
+    regime_classifier: RegimeClassifier,  # H1: needed for K-Means live re-run trigger
 ) -> None:
     """Read events from decision_queue, run the full simulator → ledger → Alpaca cycle.
 
@@ -216,8 +230,37 @@ async def decision_cycle_loop(
                     logger.warning("close_cycle failed to close %s, marking INTERRUPTED to prevent zombies", active.id)
                     await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
                 else:
-                    # N7 FIX: ML2 retrains on outcomes, so check after closing the cycle
-                    await asyncio.to_thread(ml2.maybe_retrain, ledger)
+                    # C2 FIX: Capture return value — True only when ML2 beat the baseline.
+                    # Previously the return was discarded and current_phase never updated,
+                    # causing every DecisionObject to be stamped phase='bootstrap' forever.
+                    # All 4 research analyses depend on the phase transition happening.
+                    improved, brier = await asyncio.to_thread(ml2.maybe_retrain, ledger)
+                    if improved and current_phase[0] == "bootstrap":
+                        current_phase[0] = "trained"
+                        logger.info(
+                            "PHASE TRANSITION: bootstrap → trained | ML2 Brier=%.4f",
+                            brier,
+                        )
+
+                    # H1 FIX: K-Means re-run trigger on live data.
+                    # Fires at 40+ closed entries, every 10 entries thereafter.
+                    # MUST-HAVE: without this, Stage 1 regime heuristics never improve
+                    # beyond the pre-trained historical model.
+                    closed_count = await asyncio.to_thread(ledger.count_closed)
+                    if closed_count >= 40 and closed_count % 10 == 0:
+                        logger.info(
+                            "K-Means re-run triggered | closed_count=%d", closed_count
+                        )
+                        entries = await asyncio.to_thread(
+                            ledger.get_closed_entries_for_regime
+                        )
+                        await asyncio.to_thread(
+                            regime_classifier.run_kmeans_and_retrain, entries
+                        )
+                        logger.info(
+                            "K-Means re-run complete — Stage 1 updated | entries=%d",
+                            len(entries),
+                        )
             except Exception as exc:  # noqa: BLE001
                 # N24 FIX: Prevent zombie DOs on exception
                 logger.error("Decision cycle crash prevented | close failed | %s", exc)
@@ -228,7 +271,19 @@ async def decision_cycle_loop(
         # Stage 1 + Stage 2
         sim_result = simulator.run(state)
 
-        # ML2 annotates assumptions with breach probabilities
+        # Step 1: Populate current_value and proximity from live state FIRST.
+        # CRITICAL ORDER: ML2 bootstrap mode uses assumption.proximity as the breach_risk
+        # score. If proximity is still 0.0 (the Pydantic default), every bootstrap
+        # annotation returns breach_risk=0.0 — corrupting all bootstrap training data.
+        # Proximity MUST be set before ml2.annotate() is called.
+        #
+        # S3-3: annotate_proximity() is imported from core/decision_utils.py — the
+        # single source of truth. The H4 SLOPE_NORMALISER special case for
+        # threshold=0.0 + operator='gt' lives there, not in each strategy.
+        proximity_annotated = annotate_proximity(sim_result.assumptions, state)
+        sim_result = sim_result.model_copy(update={"assumptions": proximity_annotated})
+
+        # Step 2: ML2 annotates with breach_risk (now sees correct proximity values).
         ml1_vector = state.algo_health_vector
         annotated_assumptions = ml2.annotate(
             sim_result.assumptions,
@@ -236,28 +291,24 @@ async def decision_cycle_loop(
             time_horizon=STRATEGY_HORIZON_MINUTES,
             ml1_vector=ml1_vector,
         )
-        # SimulatorResult is frozen — use model_copy to update
+        # annotate() returns a new list (Assumption is frozen) — replace via model_copy
         sim_result = sim_result.model_copy(update={"assumptions": annotated_assumptions})
 
-        # Populate current_value and proximity on each assumption from live state.
-        # Assumption is frozen — use model_copy. proximity is the primary ML2 feature;
-        # if left at 0.0 (the default), ML2 training data is blind to threshold proximity.
-        proximity_annotated = []
-        for a in sim_result.assumptions:
-            current_val = getattr(state, a.variable, 0.0)
-            prox = current_val / a.threshold if a.threshold != 0 else 1.0
-            proximity_annotated.append(a.model_copy(update={
-                "current_value": current_val,
-                "proximity": prox,
-            }))
-        sim_result = sim_result.model_copy(update={"assumptions": proximity_annotated})
-
         # Build and COMMIT the DecisionObject — BEFORE any actuation
-        from core.schemas import DecisionObject
         do = DecisionObject(
             strategy_name=sim_result.strategy_name,
             tuned_params=sim_result.tuned_params,
-            market_state_snapshot=state.model_dump(mode="json", exclude={"algo_health_vector", "last_tick_timestamp"}),
+            market_state_snapshot=state.model_dump(
+                    mode="json",
+                    exclude={
+                        "algo_health_vector",   # stored separately in the DO
+                        "last_tick_timestamp",  # not a market signal
+                        "active_strategy",      # operational field — string breaks numeric feature iteration
+                        "position_size",        # operational field
+                        "capital_deployed",     # operational field
+                        "timestamp",            # ISO string — breaks float() iteration in Week 9 feature matrix
+                    },
+                ),
             algo_health_vector=ml1_vector,
             assumptions=sim_result.assumptions,
             projected_pnl=sim_result.projected_pnl,
@@ -265,6 +316,16 @@ async def decision_cycle_loop(
             hill_climb_iterations=sim_result.hill_climb_iterations,
             phase=current_phase[0],
         )
+        # S3-5: Warn when projected_pnl <= 0.0 — extreme market or no viable signal.
+        # Cycle is valid (records that the system observed the state) but generate_signal()
+        # will likely return HOLD. Identifiable in Week 9 analysis by this WARNING tag.
+        if sim_result.projected_pnl <= 0.0:
+            logger.warning(
+                "Committing DO with projected_pnl=%.4f | strategy=%s "
+                "— extreme market condition or no viable signal. HOLD expected.",
+                sim_result.projected_pnl, sim_result.strategy_name,
+            )
+
 
         try:
             # K3 FIX: commit is synchronous SQLite I/O — run in thread
@@ -282,12 +343,17 @@ async def decision_cycle_loop(
             continue
         signal = strategy.generate_signal(state, sim_result.tuned_params)
 
+        # D6 FIX: compute qty once here so execute() re-uses it, avoiding
+        # a redundant Alpaca get_account() REST call per BUY cycle.
+        intended_qty = await executor._compute_quantity(sim_result.tuned_params, state) if signal == "BUY" else 0.0
+
         try:
             telemetry = await executor.execute(
                 signal=signal,
                 params=sim_result.tuned_params,
                 state=state,
                 decision_object_id=str(do.id),
+                precomputed_qty=intended_qty if signal == "BUY" else None,
             )
         except Exception as exc:  # noqa: BLE001
             # N5 FIX: executor failure after a successful commit leaves the DO in
@@ -302,13 +368,14 @@ async def decision_cycle_loop(
             )
             continue
 
-        # N19 FIX: Compute and record actual exposure back into CausalState
-        intended_qty = await executor._compute_quantity(sim_result.tuned_params, state)
+        # N19 FIX: Record actual exposure into CausalState.
+        # intended_qty already computed above — no second REST call needed.
         actual_qty = intended_qty * (1 + telemetry.position_size_deviation)
         await state_manager.update_position(actual_qty, actual_qty * state.price)
 
-        # Update ML1 behavioural vector with fresh telemetry
-        new_vector = ml1.predict_proba(telemetry)
+        # Update ML1 with fresh telemetry — only real orders carry meaningful signal.
+        # HOLD/SELL telemetry is synthetic and would poison the sample buffer.
+        new_vector = ml1.predict_proba(telemetry, is_real_order=(signal == "BUY"))
         await state_manager.update_algo_health(new_vector)
 
         # N22 FIX: Mark the object as ACTIVE only after the Alpaca order has successfully filled
@@ -367,7 +434,8 @@ async def main() -> None:
             assumption_monitor_loop(state_manager, ledger, decision_queue),
             decision_cycle_loop(
                 decision_queue, state_manager,
-                simulator, ml1, ml2, ledger, executor, comparator, current_phase,
+                simulator, ml1, ml2, ledger, executor, comparator,
+                current_phase, regime,
             ),
             _shutdown_watcher(feed),
             return_exceptions=True,
@@ -396,9 +464,11 @@ async def _shutdown_watcher(feed: BinanceFeed) -> None:
 
 async def _graceful_shutdown(feed: BinanceFeed, ledger: LedgerWriter, executor: Executor) -> None:
     """Mark any active DecisionObject as INTERRUPTED on exit and close Alpaca position."""
-    active = ledger.get_active()
+    # K3 consistency: use asyncio.to_thread for SQLite calls even during shutdown
+    # so the event loop is not blocked while other coroutines finalize.
+    active = await asyncio.to_thread(ledger.get_active)
     if active:
-        ledger.update_status(str(active.id), "INTERRUPTED")
+        await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
         logger.info("Active entry marked INTERRUPTED | id=%s", active.id)
 
         # N18 FIX: Close Alpaca position to prevent orphaned real-money exposure

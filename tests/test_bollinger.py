@@ -14,15 +14,11 @@ from __future__ import annotations
 import pytest
 
 from core.schemas import CausalState
-from strategies.bollinger import BollingerStrategy, _PRICE_HISTORY
+from strategies.bollinger import BollingerStrategy
 
 
-@pytest.fixture(autouse=True)
-def clear_price_history():
-    _PRICE_HISTORY.clear()
-    yield
-    _PRICE_HISTORY.clear()
-
+# NOTE: No module-level _PRICE_HISTORY fixture needed.
+# BollingerStrategy.__init__() creates a fresh self._price_history per instance.
 
 @pytest.fixture
 def strategy():

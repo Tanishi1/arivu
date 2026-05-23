@@ -14,10 +14,15 @@ Three causal assumptions:
   3. rsi_not_extreme     — RSI between 20 and 80        (avoid overbought/oversold extremes)
 
 Evaluate scoring:
-  if HOLD: return 0.0
+  if insufficient history: return 0.0
   divergence_confidence = min(1.0, divergence_span / 5)
   score = 0.008 × (1 - volatility/0.05) × divergence_confidence
   proximity > 0.8: multiply score × 0.3  (strictest of the three strategies)
+
+  IMPORTANT: evaluate() is a PURE function — it does NOT call generate_signal().
+  generate_signal() appends to self._price_history as a side effect. Calling it
+  inside evaluate() during hill-climbing would corrupt the history with 100+ duplicate
+  prices, destroying divergence pattern detection permanently.
 
 Assigned to: Person 3
 Done when: Simulator selects RSI in an uncertain CausalState and evaluate()
@@ -36,7 +41,6 @@ from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
-_PRICE_HISTORY: list[float] = []
 MAX_HISTORY = 60
 
 
@@ -61,21 +65,26 @@ def _find_local_highs(prices: list[float]) -> list[tuple[int, float]]:
 class RSIStrategy(Strategy):
     """RSI Momentum Divergence strategy — conservative, uncertainty regime."""
 
+    def __init__(self) -> None:
+        # Instance-level price history — NOT module-level.
+        # Module-level lists are corrupted by evaluate() during hill-climbing.
+        self._price_history: list[float] = []
+
     def generate_signal(self, state: CausalState, params: dict) -> str:
-        _PRICE_HISTORY.append(state.price)
-        if len(_PRICE_HISTORY) > MAX_HISTORY:
-            _PRICE_HISTORY.pop(0)
+        self._price_history.append(state.price)
+        if len(self._price_history) > MAX_HISTORY:
+            self._price_history.pop(0)
 
         period = params.get("rsi_lookback_period", 14)
-        if len(_PRICE_HISTORY) < period + 5:
+        if len(self._price_history) < period + 5:
             return "HOLD"
 
-        closes = pd.Series(_PRICE_HISTORY)
+        closes = pd.Series(self._price_history)
         rsi = ta.rsi(closes, length=period)
         if rsi is None:
             return "HOLD"
 
-        prices = _PRICE_HISTORY
+        prices = self._price_history
         threshold = params.get("divergence_threshold", 5)
 
         lows = _find_local_lows(prices)
@@ -101,13 +110,17 @@ class RSIStrategy(Strategy):
         return "HOLD"
 
     def get_assumptions(self, state: CausalState, params: dict) -> list[Assumption]:
-        """Return exactly 3 assumptions for the RSI Divergence strategy."""
+        """Return exactly 3 assumptions for the RSI Divergence strategy.
+
+        S3-3: current_value and proximity are intentionally 0.0 (Pydantic defaults).
+        core/decision_utils.annotate_proximity() is the single source of truth.
+        """
         return [
             Assumption(
                 name="divergence_span",
-                variable="trend_strength",  # proxy variable
+                variable="divergence_candle_span",
                 operator="gt",
-                threshold=0.05,  # divergence_candle_span > 3 (normalised proxy)
+                threshold=3.0,
             ),
             Assumption(
                 name="volatility_acceptable",
@@ -117,9 +130,9 @@ class RSIStrategy(Strategy):
             ),
             Assumption(
                 name="rsi_not_extreme",
-                variable="volatility",   # proxy: low vol correlates with stable RSI
+                variable="rsi_current",
                 operator="lt",
-                threshold=0.08,
+                threshold=80.0,
             ),
         ]
 
@@ -138,13 +151,23 @@ class RSIStrategy(Strategy):
         }
 
     def evaluate(self, state: CausalState, params: dict) -> float:
-        """Score conservatively. Strictest proximity penalty (×0.3)."""
-        if self.generate_signal(state, params) == "HOLD":
+        """Score conservatively. Strictest proximity penalty (×0.3).
+
+        PURE FUNCTION — does NOT call generate_signal() and does NOT modify
+        self._price_history. Score computed from CausalState fields (read-only).
+
+        HIGH-1 FIX: Uses state.divergence_candle_span (the real observable from
+        causal_state._compute_divergence_span()) instead of len(_price_history)//10.
+        Previously hill-climbing evaluated against a proxy that disagreed with what
+        the divergence_span assumption actually checks.
+        """
+        # RSI divergence needs some price history to detect patterns
+        if len(self._price_history) < 10:
             return 0.0
 
-        # Divergence confidence based on span (approximated from price history length)
-        divergence_span = max(1, len(_PRICE_HISTORY) // 10)
-        divergence_confidence = min(1.0, divergence_span / 5)
+        # HIGH-1 FIX: use the real divergence span from CausalState
+        div_span = getattr(state, "divergence_candle_span", 3.5)
+        divergence_confidence = min(1.0, div_span / 5.0)
 
         score = (
             0.008

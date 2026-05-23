@@ -16,6 +16,7 @@ Stage 2 — Hill-Climbing (Unit II)
 from __future__ import annotations
 
 import logging
+import random
 from typing import TYPE_CHECKING
 
 from core.schemas import CausalState, SimulatorResult
@@ -26,6 +27,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_HILL_CLIMB_ITERATIONS = 20
+# Random restart: if the default-params score is below this, try alternative
+# starting points to escape poor regions of the parameter space.
+# Without restarts, a flat objective landscape always produces iterations=1,
+# making Research Metric 3 uninformative.
+HILL_CLIMB_RESTART_THRESHOLD = 0.15
+HILL_CLIMB_RANDOM_RESTARTS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -35,23 +42,33 @@ MAX_HILL_CLIMB_ITERATIONS = 20
 def _h_ema_crossover(state: CausalState) -> float:
     """Heuristic for EMA Crossover (momentum) strategy.
 
-    Scores high when: strong trend, low volatility, decent volume.
+    Scores high when: strong trend, low volatility, tight spread.
+
+    HIGH-2 FIX: 3rd factor changed from volume to (1-spread_norm).
+    EMA's 3rd assumption is spread_constraint (spread < 0.005). The heuristic
+    must penalise the same signal the assumption monitors.
+
+    HIGH-3 FIX: vol_norm threshold changed from 0.1 to 0.07 (SOLUSDT limit).
+    Previously EMA was 30% less penalised than RSI at SOLUSDT's actual vol limit.
     """
-    vol_norm = min(1.0, state.volatility / 0.1)
-    vol_pct = min(1.0, state.volume / 100_000)
+    vol_norm    = min(1.0, state.volatility / 0.07)   # HIGH-3: was 0.1
+    spread_norm = min(1.0, state.spread / 0.005)       # HIGH-2: aligned with spread_constraint
     return (
         state.trend_strength * 0.5
         + (1 - vol_norm) * 0.3
-        + vol_pct * 0.2
+        + (1 - spread_norm) * 0.2                      # HIGH-2: was vol_pct (volume/100_000)
     )
 
 
 def _h_bollinger(state: CausalState) -> float:
     """Heuristic for Bollinger Band Reversion (mean-reversion) strategy.
 
-    Scores high when: weak trend, moderate volatility, normal spread.
+    Scores high when: weak trend, elevated volatility (wider bands = better entry),
+    normal spread.
+
+    HIGH-3 FIX: vol_norm threshold changed from 0.1 to 0.07 (SOLUSDT limit).
     """
-    vol_norm = min(1.0, state.volatility / 0.1)
+    vol_norm    = min(1.0, state.volatility / 0.07)   # HIGH-3: was 0.1
     spread_norm = min(1.0, state.spread / 0.005)
     return (
         (1 - state.trend_strength) * 0.5
@@ -61,12 +78,26 @@ def _h_bollinger(state: CausalState) -> float:
 
 
 def _h_rsi_divergence(state: CausalState) -> float:
-    """Heuristic for RSI Divergence strategy.
+    """Heuristic for RSI Divergence strategy — the uncertainty hedge.
 
-    Conservative — always viable but weighted lower in strong trending/volatile conditions.
+    RSI divergence is most valuable when the market is neither clearly
+    trending (EMA's domain) nor clearly ranging/calm (Bollinger's domain).
+    Score peaks in ambiguous conditions: moderate trend + above-normal volatility.
+
+    Formula: RSI scores as (1 - average of EMA-comfort and Bollinger-comfort).
+    When both momentum and mean-reversion strategies are uncomfortable, RSI wins.
+    Uses SOLUSDT vol scale (0.07) — not the legacy BTC threshold (0.05).
     """
-    vol_penalty = min(1.0, state.volatility / 0.05)
-    return max(0.1, 0.5 - vol_penalty * 0.2 - state.trend_strength * 0.1)
+    vol_norm   = min(1.0, state.volatility / 0.07)   # SOLUSDT volatility_limit
+    trend_norm = state.trend_strength
+
+    ema_comfort = trend_norm * 0.5 + (1.0 - vol_norm) * 0.3
+    bol_comfort = (1.0 - trend_norm) * 0.5 + vol_norm * 0.3
+
+    uncertainty = 1.0 - (ema_comfort + bol_comfort) / 2.0
+    # vol bonus: RSI divergence patterns are more structurally significant
+    # in elevated-volatility markets (wider swings → cleaner extremes)
+    return max(0.1, min(1.0, uncertainty + vol_norm * 0.2))
 
 
 HEURISTICS = {
@@ -79,6 +110,28 @@ HEURISTICS = {
 # ---------------------------------------------------------------------------
 # Stage 2 — Custom Hill-Climbing (~30 lines, see ADR-002)
 # ---------------------------------------------------------------------------
+
+def _random_params(bounds: dict) -> dict:
+    """Generate a random parameter dict within all strategy bounds.
+
+    Snaps each sampled value to the nearest legal step so the resulting dict
+    is always valid input for strategy.evaluate().
+    """
+    params = {}
+    for name, bound in bounds.items():
+        # S1 FIX: Guard against step=0 to prevent ZeroDivisionError.
+        # No current strategy has step=0, but there is no contract preventing it.
+        # A team member adding a new strategy with a continuous parameter could
+        # accidentally trigger this and crash the decision cycle.
+        if bound.get("step", 0) <= 0:
+            params[name] = bound["min"]
+            continue
+        steps = int(round((bound["max"] - bound["min"]) / bound["step"]))
+        step_idx = random.randint(0, steps) if steps > 0 else 0
+        params[name] = round(bound["min"] + step_idx * bound["step"], 8)
+        params[name] = max(bound["min"], min(bound["max"], params[name]))
+    return params
+
 
 def _hill_climb(
     strategy: "BaseStrategy",
@@ -94,6 +147,23 @@ def _hill_climb(
     bounds = strategy.get_parameter_bounds()
     current_params = strategy.get_default_params()
     current_score = strategy.evaluate(state, current_params)
+
+    # Random restarts — if defaults score poorly, sample alternative starting
+    # points before committing to the hill-climb scan. This prevents the search
+    # from getting stuck in a flat or suboptimal region of the parameter space
+    # and ensures Research Metric 3 reflects real convergence dynamics.
+    if current_score < HILL_CLIMB_RESTART_THRESHOLD:
+        for attempt in range(HILL_CLIMB_RANDOM_RESTARTS):
+            candidate = _random_params(bounds)
+            score = strategy.evaluate(state, candidate)
+            if score > current_score:
+                old_score = current_score  # S2 FIX: capture BEFORE overwriting
+                current_params = candidate
+                current_score = score
+                logger.debug(
+                    "Hill-climb random restart %d improved score | %.4f → %.4f",
+                    attempt + 1, old_score, current_score,
+                )
 
     iterations = 0
     improved = True
@@ -160,7 +230,7 @@ class Simulator:
         if self._regime_classifier is not None:
             try:
                 # predict returns the string label ("trending", "volatile", "calm")
-                dominant_regime = self._regime_classifier.predict(
+                dominant_regime = self._regime_classifier.classify(
                     state.volatility, state.spread, state.trend_strength, state.volume
                 )
             except Exception:
@@ -177,9 +247,13 @@ class Simulator:
             h_fn = HEURISTICS.get(name)
             base_score = h_fn(state) if h_fn else 0.5
 
-            # N31 FIX: Boost the strategy that aligns with the ML-detected regime
+            # N31 FIX: Additive regime nudge (+0.2, capped at 1.0) instead of
+            # multiplicative 1.5×. A multiplicative boost on an already-high base
+            # score makes the regime-aligned strategy win unconditionally, overriding
+            # strong heuristic differentiation. Additive ensures a clear heuristic
+            # winner still beats a regime-aligned but poor-fit strategy.
             if dominant_regime in regime_boost_map and regime_boost_map[dominant_regime] == name:
-                base_score *= 1.5  # 50% heuristic boost for regime alignment
+                base_score = min(1.0, base_score + 0.2)  # additive nudge, capped
 
             scores[name] = base_score
 

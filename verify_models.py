@@ -4,11 +4,15 @@ work end-to-end exactly as the live system (main.py) uses them.
 
 What this checks:
   1. Both .joblib files exist and load without errors
-  2. DT metadata — correct feature count (3) and known classes
-  3. RegimeClassifier wrapper — correct feature routing (3-feature path)
-  4. Prediction sanity — both 'calm' and 'volatile' are reachable
+  2. DT metadata — feature count (3 or 4) and valid regime class labels
+  3. RegimeClassifier wrapper — correct feature routing
+  4. Prediction sanity — known regime labels are reachable
   5. Bootstrap fallback — RegimeClassifier still works if no model is loaded
   6. Simulator integration — DT plugs into Simulator.run() via predict_proba()
+
+  NOTE (S3 fix): Checks 2 are forward-compatible. After Week 7 K-Means retraining
+  on 80+ live cycles, the DT may use 4 features instead of 3, and a third regime
+  label ('trending') may emerge. Hardcoded checks would FAIL on a correct model.
 
 Usage:
     python verify_models.py
@@ -28,7 +32,7 @@ import numpy as np
 # Make sure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.constants import KMEANS_MODEL_PATH, REGIME_MODEL_PATH
+from core.constants import KMEANS_MODEL_PATH, REGIME_MODEL_PATH, K_CANDIDATES
 from core.schemas import CausalState
 from ml.regime import RegimeClassifier
 
@@ -80,28 +84,34 @@ if not (km_loaded and dt_loaded):
 # ---------------------------------------------------------------------------
 # 2. DT metadata
 # ---------------------------------------------------------------------------
-print("\n-- 2. Decision Tree metadata " + "-" * 32)
+# S3 FIX: All three checks are now forward-compatible.
+# After Week 7 K-Means retraining on 80+ live SOL cycles:
+#   - DT may be retrained on 4 features (volatility, spread, trend_strength, volume)
+#   - A third regime label 'trending' may emerge from the new clusters
+#   - K-Means may select K=3 if silhouette scores favour it
+# Hardcoded == checks would FAIL on a correct, improved model after retraining.
 
 check(
-    dt.n_features_in_ == 3,
-    f"DT trained on 3 features (got {dt.n_features_in_})",
-    "Expected [volatility, trend_strength, volume]",
+    dt.n_features_in_ in (3, 4),
+    f"DT feature count is 3 or 4 (got {dt.n_features_in_})",
+    "Expected 3 (historical model) or 4 (post-live-retrain model)",
 )
-known_classes = {"calm", "volatile"}
+
+_VALID_REGIME_CLASSES = {"calm", "volatile", "trending"}
 actual_classes = set(dt.classes_)
 check(
-    actual_classes == known_classes,
-    f"DT classes match expected: {sorted(actual_classes)}",
-    f"Expected {sorted(known_classes)}",
+    actual_classes.issubset(_VALID_REGIME_CLASSES) and len(actual_classes) >= 2,
+    f"DT classes are valid regime labels: {sorted(actual_classes)}",
+    f"Must be a non-empty subset of {sorted(_VALID_REGIME_CLASSES)}",
 )
 check(
     hasattr(kmeans, "cluster_centers_"),
     "K-Means has cluster_centers_ (was properly fitted)",
 )
 check(
-    kmeans.n_clusters == 2,
-    f"K-Means used best K=2 (silhouette 0.8845 won)",
-    f"Got n_clusters={kmeans.n_clusters}",
+    kmeans.n_clusters in K_CANDIDATES,
+    f"K-Means K={kmeans.n_clusters} is in allowed candidates {K_CANDIDATES}",
+    f"K_CANDIDATES={K_CANDIDATES} (from core.constants)",
 )
 
 
@@ -146,7 +156,7 @@ check(
 # Output must always be one of the known valid classes
 for label in [label_calm, label_volatile]:
     check(
-        label in known_classes,
+        label in _VALID_REGIME_CLASSES,
         f"Output '{label}' is a valid regime label",
     )
 

@@ -46,11 +46,17 @@ def queue_and_manager():
 
 @pytest.mark.asyncio
 async def test_volatility_propagation(queue_and_manager):
-    """Setting high volatility via ticks should propagate spread multiplier."""
+    """Setting high volatility via ticks should propagate spread multiplier.
+
+    VOLATILITY_WINDOW=20 requires at least 20 ticks before volatility is non-zero.
+    Feed 21 ticks with sharp price swings to guarantee the window fills.
+    """
     q, mgr = queue_and_manager
 
-    # Feed a sequence of ticks with sharp price movement (high volatility)
-    prices = [50000, 50100, 49900, 50200, 49800, 50300, 49700, 50400, 49600, 50500]
+    # Feed 21 ticks (> VOLATILITY_WINDOW=20) with sharp price movement (high volatility)
+    prices = [50000, 50100, 49900, 50200, 49800, 50300, 49700,
+              50400, 49600, 50500, 49500, 50600, 49400, 50700,
+              49300, 50800, 49200, 50900, 49100, 51000, 49000]
     for p in prices:
         await mgr.update(_make_tick(price=p, bid=p - 1, ask=p + 1))
 
@@ -75,10 +81,11 @@ def test_spread_assumption_proximity():
         threshold=0.002,
     )
     state = CausalState(spread=0.0018)
-    breached = _check_assumption(assumption, state)
+    # _check_assumption returns (breached: bool, proximity: float)
+    breached, proximity = _check_assumption(assumption, state)
 
     assert not breached, "spread=0.0018 < threshold=0.002 should NOT be breached"
-    assert abs(assumption.proximity - 0.9) < 0.001, f"Expected proximity=0.9, got {assumption.proximity}"
+    assert abs(proximity - 0.9) < 0.001, f"Expected proximity=0.9, got {proximity}"
 
 
 # ---------------------------------------------------------------------------

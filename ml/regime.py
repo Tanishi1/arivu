@@ -167,12 +167,17 @@ class RegimeClassifier:
                     best_score = score
                     best_k = k
                     best_labels = labels
+                    best_km = km  # DF1 FIX: track the actual fitted object
 
         if best_labels is None:
-            km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-            best_labels = km.fit_predict(X)
+            best_km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+            best_labels = best_km.fit_predict(X)
 
-        joblib.dump(KMeans(n_clusters=best_k, random_state=42, n_init=10).fit(X), KMEANS_MODEL_PATH)
+        # DF1 FIX: save best_km directly (the object used to generate best_labels).
+        # Previously: KMeans(n_clusters=best_k).fit(X) — a NEW fit, different object.
+        # With random_state=42 both fits are deterministic, but saving the wrong object
+        # is architecturally incorrect and fragile if random_state is ever removed.
+        joblib.dump(best_km, KMEANS_MODEL_PATH)
         return best_k, best_labels
 
     def _name_clusters(
@@ -212,15 +217,33 @@ class RegimeClassifier:
             for c in sorted_by_trend[1:]:
                 regime_map[c] = "calm"
         elif len(sorted_by_vol) == 2:
-            regime_map[sorted_by_vol[1]] = "calm"
+            # With K=2 there is no room for all three regime labels.
+            # Promote the second cluster to "trending" if its mean trend_strength is
+            # meaningfully positive; otherwise label it "calm".
+            # Without this, EMAStrategy can NEVER receive a regime boost when K=2,
+            # breaking the regime-aware architecture during the early accumulation phase
+            # (Weeks 5–7 when only 40–60 entries exist and K=2 is the best-fit K).
+            second_cid = sorted_by_vol[1]
+            if stats[second_cid]["trend"] > 0.4:
+                regime_map[second_cid] = "trending"
+            else:
+                regime_map[second_cid] = "calm"
 
         return [regime_map.get(label, "calm") for label in labels]
 
     def _bootstrap_classify(self, volatility: float, trend_strength: float) -> str:
-        """Bootstrap regime classification via hand-coded thresholds."""
+        """Bootstrap regime classification via hand-coded thresholds.
+
+        DF2 FIX: trending threshold changed from 0.5 to 0.35.
+        EMA heuristic dominates when trend_strength >= ~0.35 (where trend_strength*0.5
+        component outweighs Bollinger's (1-trend)*0.5 component). The bootstrap
+        classifier was withholding the regime boost until 0.5, causing EMA to miss
+        its +0.2 boost in moderately trending markets during Weeks 5-7 before K-Means
+        fires at 40+ closed entries.
+        """
         if volatility > VOLATILE_THRESHOLD:
             return "volatile"
-        if trend_strength > 0.5:
+        if trend_strength > 0.35:   # DF2 FIX: was 0.5
             return "trending"
         return "calm"
 

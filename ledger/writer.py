@@ -128,9 +128,15 @@ class LedgerWriter:
             row.status = new_status
             session.commit()
 
-        # N17 FIX: Prevent infinite memory leak by popping from cache on terminal status
+        # C4 FIX: clear _active_id for ALL terminal statuses, not just CLOSED.
+        # Previously only close() cleared _active_id. If EXECUTION_FAILED was set
+        # and the process continued, get_active() returned the dead object and
+        # comparator tried to close it — writing a garbage OutcomeRecord to the
+        # training buffer.
         if new_status in ("EXECUTION_FAILED", "INTERRUPTED", "CLOSED"):
             with self._state_lock:
+                if self._active_id == decision_object_id:
+                    self._active_id = None
                 self._breach_logs.pop(decision_object_id, None)
 
         logger.info("Ledger status updated | id=%s status=%s", decision_object_id, new_status)
@@ -154,19 +160,24 @@ class LedgerWriter:
         breach_timestamp: str,
     ) -> None:
         """Record a breach event. Called by the assumption monitor."""
-        # N1 FIX: acquire lock before touching _breach_logs — log_breach runs
-        # in a thread via asyncio.to_thread and can race with commit/close.
+        # H2 FIX: Only record the FIRST breach timestamp for each assumption.
+        # The monitor runs every 5s; a sustained breach previously overwrote the
+        # timestamp every cycle. OutcomeRecord.breach_timestamps showed the LAST
+        # detection, not the first. First breach time is the scientifically correct
+        # record for lifecycle plots and breach proximity analysis.
         with self._state_lock:
-            self._breach_logs.setdefault(decision_object_id, {})[assumption_name] = breach_timestamp
+            inner = self._breach_logs.setdefault(decision_object_id, {})
+            inner.setdefault(assumption_name, breach_timestamp)  # only writes if not already present
 
-        # DB write happens outside the lock — no need to hold it during I/O
+        # DB write: only update if this assumption has not been logged before
         with SessionLocal() as session:
             row = session.get(DecisionObjectRow, decision_object_id)
             if row:
                 log = json.loads(row.breach_log or "{}")
-                log[assumption_name] = breach_timestamp
-                row.breach_log = json.dumps(log)
-                session.commit()
+                if assumption_name not in log:  # preserve first breach timestamp
+                    log[assumption_name] = breach_timestamp
+                    row.breach_log = json.dumps(log)
+                    session.commit()
 
     def get_breach_log(self, decision_object_id: str) -> dict:
         """Return the current breach log for a decision object.
@@ -206,7 +217,14 @@ class LedgerWriter:
             return None
         with SessionLocal() as session:
             row = session.get(DecisionObjectRow, active_id)
-            if row is None or row.status in ("CLOSED", "INTERRUPTED"):
+            # C3 FIX: exclude EXECUTION_FAILED in addition to CLOSED and INTERRUPTED.
+            # Previously EXECUTION_FAILED objects stayed in _active_id (update_status
+            # did not clear it). get_active() would return the dead object, and the
+            # next decision cycle would try to close it — writing a garbage OutcomeRecord
+            # with actual_pnl=0.0 to the training buffer.
+            if row is None or row.status in (
+                "CLOSED", "INTERRUPTED", "EXECUTION_FAILED"
+            ):
                 return None
             return self._row_to_schema(row)
 
@@ -224,6 +242,53 @@ class LedgerWriter:
         with SessionLocal() as session:
             max_cp = session.query(func.max(ModelCheckpointRow.checkpoint_number)).scalar()
             return max_cp if max_cp is not None else 0
+
+    def count_closed(self) -> int:
+        """Return the total number of CLOSED DecisionObjects.
+
+        Used by the K-Means re-run trigger in main.py to decide when to retrain
+        the regime classifier on live data (threshold: 40+, every 10 entries).
+        """
+        from sqlalchemy.sql import func
+        with SessionLocal() as session:
+            result = session.query(
+                func.count(DecisionObjectRow.id)
+            ).filter(
+                DecisionObjectRow.status == "CLOSED"
+            ).scalar()
+            return result or 0
+
+    def get_closed_entries_for_regime(self) -> list[dict]:
+        """Return closed DecisionObject market snapshots for K-Means re-training.
+
+        Format matches what ml/regime.py's run_kmeans_and_retrain() expects:
+        each dict has keys: volatility, spread, trend_strength, volume,
+        strategy_name, symbol.
+
+        Called by decision_cycle_loop after count_closed() meets the threshold.
+        """
+        with SessionLocal() as session:
+            rows = session.query(DecisionObjectRow).filter(
+                DecisionObjectRow.status == "CLOSED"
+            ).all()
+
+        entries = []
+        for row in rows:
+            try:
+                snapshot = json.loads(row.market_state_snapshot)
+                entries.append({
+                    "volatility":     float(snapshot.get("volatility", 0.0)),
+                    "spread":         float(snapshot.get("spread", 0.0)),
+                    "trend_strength": float(snapshot.get("trend_strength", 0.0)),
+                    "volume":         float(snapshot.get("volume", 0.0)),
+                    "strategy_name":  row.strategy_name,
+                    "symbol":         row.symbol,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping malformed snapshot for %s: %s", row.id[:8], exc)
+                continue
+        return entries
+
 
     # ------------------------------------------------------------------
     # Close

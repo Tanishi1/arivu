@@ -71,6 +71,10 @@ class ML2BreachPredictor:
         A stressed algorithm in a volatile market has a fundamentally different
         breach profile than a normally executing one in identical conditions.
 
+        CRITICAL: Assumption is frozen (Pydantic frozen=True). Direct attribute
+        assignment raises ValidationError. Use model_copy() to produce a new
+        Assumption with the updated breach_risk field.
+
         Args:
             assumptions: list of Assumption objects to annotate
             state: current CausalState snapshot (at decision time)
@@ -78,21 +82,25 @@ class ML2BreachPredictor:
             ml1_vector: [p_normal, p_stressed, p_degraded] from ML1
 
         Returns:
-            Same assumptions list with breach_risk fields populated.
+            New list of Assumption objects with breach_risk fields populated.
         """
+        annotated: list[Assumption] = []
         for assumption in assumptions:
             if not self._is_trained:
                 risk = self._proximity_baseline(assumption)
             else:
                 risk = self._predict_trained(assumption, state, time_horizon, ml1_vector)
 
-            assumption.breach_risk = round(risk, 4)
+            # Assumption is frozen — must use model_copy, NOT direct assignment.
+            # Direct assignment raises pydantic.ValidationError silently swallowed
+            # by the decision cycle, leaving all breach_risk values at 0.5 forever.
+            annotated.append(assumption.model_copy(update={"breach_risk": round(risk, 4)}))
 
         logger.info(
             "ML2 annotated | risks=%s",
-            [f"{a.name}={a.breach_risk}" for a in assumptions],
+            [f"{a.name}={a.breach_risk}" for a in annotated],
         )
-        return assumptions
+        return annotated
 
     def maybe_retrain(self, ledger_writer) -> tuple[bool, float | None]:
         """Retrain if enough new closed entries have accumulated.
@@ -113,6 +121,10 @@ class ML2BreachPredictor:
             logger.warning(
                 "ML2 retrain skipped | only %d samples (need %d)", len(data), MIN_SAMPLES
             )
+            # Reset counter so we don't re-check the buffer on every single close cycle.
+            # Without this reset, once _new_entries_since_retrain > RETRAIN_THRESHOLD,
+            # we do a full CSV read every cycle indefinitely while the buffer is too small.
+            self._new_entries_since_retrain = 0
             return False, None
 
         X, y = self._prepare_xy(data)
@@ -154,19 +166,31 @@ class ML2BreachPredictor:
             self._is_trained = True
             self._checkpoint_count += 1
             joblib.dump(model, ML2_MODEL_PATH)
-            
+
             # N8 FIX: Write the checkpoint to the database so Research Metric 2 exists!
             ledger_writer.save_checkpoint(
                 checkpoint_number=self._checkpoint_count,
-                phase="bootstrap" if self._checkpoint_count == 1 else "trained",
+                phase="trained",
                 ml2_brier_score=brier,
                 training_sample_count=len(X),
             )
+            logger.info(
+                "ML2 beat baseline — transitioning to trained mode | "
+                "baseline=%.4f trained=%.4f checkpoint=#%d",
+                baseline_brier, brier, self._checkpoint_count,
+            )
+            self._new_entries_since_retrain = 0
+            return True, brier   # C2 FIX: True ONLY when model actually improved
+
         else:
-            logger.warning("ML2 does not beat baseline — keeping previous model")
+            logger.warning(
+                "ML2 did not beat baseline — keeping previous model | "
+                "baseline=%.4f trained=%.4f",
+                baseline_brier, brier,
+            )
 
         self._new_entries_since_retrain = 0
-        return True, brier
+        return False, brier   # C2 FIX: False when model failed to improve
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -203,8 +227,19 @@ class ML2BreachPredictor:
             "proximity", "time_horizon",
             "p_normal", "p_stressed", "p_degraded",
         ]
-        X = np.array([[float(row[k]) for k in feature_keys] for row in data])
-        y = np.array([int(row["breached"]) for row in data])
+        # S3-2 FIX: Guard against malformed CSV rows (partial writes from crashes,
+        # disk-full mid-append, Ctrl+C during CSV write). A single bad row previously
+        # raised KeyError that propagated through maybe_retrain() — marking the active
+        # DO as INTERRUPTED instead of CLOSED and permanently blocking ML2 retraining.
+        rows_X, rows_y = [], []
+        for row in data:
+            try:
+                rows_X.append([float(row[k]) for k in feature_keys])
+                rows_y.append(int(row["breached"]))
+            except (KeyError, ValueError) as exc:
+                logger.warning("Skipping malformed training buffer row | %s | row=%s", exc, row)
+        X = np.array(rows_X) if rows_X else np.empty((0, len(feature_keys)))
+        y = np.array(rows_y)
         return X, y
 
     def _load_model_if_exists(self) -> None:
@@ -212,6 +247,15 @@ class ML2BreachPredictor:
             try:
                 self._model = joblib.load(ML2_MODEL_PATH)
                 self._is_trained = True
-                logger.info("ML2 model loaded from disk | path=%s", ML2_MODEL_PATH)
+                # Estimate entries accumulated since last retrain so process
+                # restarts do not reset the counter to zero. CSV has 3 rows per
+                # cycle (one per assumption), so divide by 3 for cycle count.
+                data = self._load_buffer()
+                cycle_count = max(len(data) // 3, 0)
+                self._new_entries_since_retrain = cycle_count % RETRAIN_THRESHOLD
+                logger.info(
+                    "ML2 model loaded from disk | path=%s | est_entries_since_retrain=%d",
+                    ML2_MODEL_PATH, self._new_entries_since_retrain,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ML2 model load failed | bootstrap mode | %s", exc)

@@ -23,13 +23,16 @@ def test_schemas_import():
     assert 'close_reason' in OutcomeRecord.model_fields
 
 def test_decision_object_is_frozen():
-    from core.schemas import DecisionObject
+    from core.schemas import DecisionObject, Assumption
+    dummy_assumption = Assumption(
+        name="test", variable="volatility", operator="lt", threshold=0.1
+    )
     do = DecisionObject(
         strategy_name='EMAStrategy',
         tuned_params={},
         market_state_snapshot={},
         algo_health_vector=[1.0, 0.0, 0.0],
-        assumptions=[],
+        assumptions=[dummy_assumption, dummy_assumption, dummy_assumption],
         projected_pnl=0.0,
         confidence=0.0,
         hill_climb_iterations=1,
