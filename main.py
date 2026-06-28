@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import datetime, timezone  # B4 FIX: was re-imported inside event loop body
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -92,7 +93,11 @@ def _handle_sigint(*_):
 # Time Horizon Watcher
 # ---------------------------------------------------------------------------
 
-async def time_horizon_watcher(decision_id: str, horizon_minutes: int, queue: asyncio.Queue) -> None:
+async def time_horizon_watcher(
+    decision_id: str,
+    horizon_minutes: float | int,  # B5 FIX: crash-recovery passes a float (remaining_m)
+    queue: asyncio.Queue,
+) -> None:
     """Sleeps for horizon_minutes, then triggers a horizon_expired event."""
     await asyncio.sleep(horizon_minutes * 60)
     event = {
@@ -124,11 +129,14 @@ async def time_horizon_watcher(decision_id: str, horizon_minutes: int, queue: as
 
 async def market_feed_loop(
     feed: BinanceFeed,
-    ml1: ML1BehaviourClassifier,
     state_manager: CausalStateManager,
 ) -> None:
     """Stream Binance WebSocket ticks into CausalState.
-    Also runs ML1 inference after each ExecutionTelemetry update.
+
+    HIGH-1 FIX: ml1 parameter removed. ML1 inference runs in decision_cycle_loop
+    (line ~378), not here. The parameter was dead — market_feed_loop only calls
+    feed.run() and never invoked ml1. Keeping it implied ML1 was called here,
+    misleading any reader expecting health-vector updates from the feed loop.
     """
     await feed.run()
 
@@ -173,7 +181,6 @@ async def decision_cycle_loop(
             await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
         elif active.status == "ACTIVE":
             # Recover the time horizon watcher
-            from datetime import datetime, timezone
             try:
                 commit_time = datetime.fromisoformat(active.timestamp_committed)
                 elapsed_s = (datetime.now(timezone.utc) - commit_time).total_seconds()
@@ -198,6 +205,22 @@ async def decision_cycle_loop(
         if event_do_id and (not active or event_do_id != str(active.id)):
             logger.debug("Discarding stale event for closed cycle %s", event_do_id)
             continue
+
+        # P-5 FIX: Threshold events (type='threshold_crossed') carry no decision_object_id.
+        # Two rapid triggers fired within 1 second (e.g. volatility spike + trend reversal)
+        # both enter the queue. Without this guard, the second event immediately closes
+        # the DO that the first event just created — producing a junk OutcomeRecord with
+        # < 30s lifetime and outcome_delta = projected_pnl (no actual position existed).
+        # Grace period: skip closing a DO that is less than 30s old on an anonymous trigger.
+        if active and not event_do_id:
+            age_s = (datetime.now(timezone.utc) - active.timestamp_committed).total_seconds()
+            if age_s < 30:
+                logger.warning(
+                    "Rapid trigger suppressed — active DO age=%.1fs < 30s grace period "
+                    "| trigger=%s | id=%s",
+                    age_s, event.get("type"), str(active.id)[:8],
+                )
+                continue
 
         logger.info(
             "Decision cycle started | trigger=%s phase=%s",
@@ -234,7 +257,9 @@ async def decision_cycle_loop(
                     # Previously the return was discarded and current_phase never updated,
                     # causing every DecisionObject to be stamped phase='bootstrap' forever.
                     # All 4 research analyses depend on the phase transition happening.
-                    improved, brier = await asyncio.to_thread(ml2.maybe_retrain, ledger)
+                    # B16 FIX: pass current_phase[0] so checkpoint #1 is tagged 'bootstrap'
+                    # (still bootstrap before the if-block below flips it to 'trained').
+                    improved, brier = await asyncio.to_thread(ml2.maybe_retrain, ledger, current_phase[0])
                     if improved and current_phase[0] == "bootstrap":
                         current_phase[0] = "trained"
                         logger.info(
@@ -382,8 +407,20 @@ async def decision_cycle_loop(
         await asyncio.to_thread(ledger.update_status, str(do.id), "ACTIVE")
 
         # Check if ML1 should retrain
-        if await asyncio.to_thread(ml1.maybe_retrain):
-            logger.info("ML1 retrained successfully")
+        # S-3 FIX: maybe_retrain() now returns (retrained, oob_score) so we log a DB
+        # checkpoint. Without this, Week 9 ML1 ablation analysis cannot determine WHEN
+        # ML1 transitioned from bootstrap to trained, or what its accuracy was.
+        ml1_retrained, ml1_oob = await asyncio.to_thread(ml1.maybe_retrain)
+        if ml1_retrained:
+            logger.info("ML1 retrained | oob_accuracy=%.4f", ml1_oob or 0.0)
+            await asyncio.to_thread(
+                ledger.save_checkpoint,
+                checkpoint_number=ml1.checkpoint_count,
+                phase=current_phase[0],
+                ml2_brier_score=0.0,          # N/A for ML1 checkpoints
+                training_sample_count=ml1.last_sample_count,
+                ml1_macro_f1=ml1_oob,
+            )
 
         # Spawn time horizon watcher for this new decision
         active_watcher_task = asyncio.create_task(
@@ -430,8 +467,8 @@ async def main() -> None:
     # all others (which would leave open Alpaca positions unmonitored).
     try:
         results = await asyncio.gather(
-            market_feed_loop(feed, ml1, state_manager),
-            assumption_monitor_loop(state_manager, ledger, decision_queue),
+            market_feed_loop(feed, state_manager),
+            assumption_monitor_loop(state_manager, ledger, decision_queue, _shutdown),
             decision_cycle_loop(
                 decision_queue, state_manager,
                 simulator, ml1, ml2, ledger, executor, comparator,
@@ -478,6 +515,25 @@ async def _graceful_shutdown(feed: BinanceFeed, ledger: LedgerWriter, executor: 
         except Exception as exc:  # noqa: BLE001
             if "position does not exist" not in str(exc).lower():
                 logger.error("Failed to close Alpaca position on shutdown | %s", exc)
+
+    # CRIT-4 FIX: Cancel all open limit orders on shutdown.
+    # If the system shuts down while a limit order is pending (DO is COMMITTED, not yet
+    # ACTIVE), close_position("SOLUSD") above fails silently — the position doesn't exist
+    # yet. The open limit order stays live on Alpaca, eventually fills, and creates a
+    # position nobody monitors. Cancelling open orders prevents orphaned Alpaca exposure.
+    try:
+        open_orders = await asyncio.to_thread(executor._api.list_orders, status="open")
+        cancelled = 0
+        for o in open_orders:
+            try:
+                await asyncio.to_thread(executor._api.cancel_order, o.id)
+                cancelled += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if cancelled:
+            logger.info("Cancelled %d open orders on shutdown", cancelled)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to cancel open orders on shutdown | %s", exc)
 
     logger.info("Graceful shutdown complete")
 

@@ -134,7 +134,7 @@ class Executor:
                     qty=qty,
                     side=side,
                     type="limit",
-                    time_in_force="gtc",
+                    time_in_force="day",  # HIGH-3 FIX: 'gtc' rejected by Alpaca paper crypto; 'day' is universally supported
                     limit_price=round(limit_price, 2),
                 )
 

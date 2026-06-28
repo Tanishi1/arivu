@@ -53,7 +53,18 @@ class ML1BehaviourClassifier:
         self._sample_buffer: list[dict] = []
         self._is_trained = False
         self._checkpoint_count = 0
+        self._last_sample_count = 0  # S-3: sample count at last retrain, for DB checkpoint
         self._load_model_if_exists()
+
+    @property
+    def checkpoint_count(self) -> int:
+        """Number of times ML1 has successfully retrained."""
+        return self._checkpoint_count
+
+    @property
+    def last_sample_count(self) -> int:
+        """Sample count used in the most recent retrain (saved before buffer clear)."""
+        return self._last_sample_count
 
     def predict_proba(
         self,
@@ -90,10 +101,19 @@ class ML1BehaviourClassifier:
             result[CLASSES.index(cls)] = float(proba[i])
         return result
 
-    def maybe_retrain(self) -> bool:
-        """Retrain if enough new samples have accumulated. Returns True if retrained."""
+    def maybe_retrain(self) -> tuple[bool, float | None]:
+        """Retrain if enough new samples have accumulated.
+
+        Returns:
+            (retrained: bool, oob_score: float | None)
+
+        S-3 FIX: Returns oob_score so main.py can log a DB checkpoint every time ML1
+        retrains. Without this, ML1 training is invisible in model_checkpoints — the
+        Week 9 ablation analysis cannot determine when ML1 transitioned from bootstrap
+        to trained mode or what OOB accuracy it achieved.
+        """
         if len(self._sample_buffer) < RETRAIN_THRESHOLD:
-            return False
+            return False, None
 
         labels = [self._bootstrap_label(s) for s in self._sample_buffer]
         if len(set(labels)) < 2:
@@ -102,8 +122,10 @@ class ML1BehaviourClassifier:
             # Without this, the buffer grows past RETRAIN_THRESHOLD and is re-evaluated
             # every single cycle without ever successfully retraining.
             self._sample_buffer.clear()
-            return False
+            return False, None
 
+        # S-3: save count BEFORE clear so the property is readable in main.py
+        self._last_sample_count = len(self._sample_buffer)
         X = np.array([[v for v in s.values()] for s in self._sample_buffer])
         y = np.array(labels)
 
@@ -118,12 +140,17 @@ class ML1BehaviourClassifier:
         self._sample_buffer.clear()
 
         oob = getattr(self._model, "oob_score_", None)
-        logger.info(
-            "ML1 retrained | samples=%d oob_accuracy=%.4f",
-            len(X), oob or 0.0,
-        )
+        # B7 FIX: dump BEFORE incrementing counter. If joblib.dump() raises (disk full,
+        # permission error), the count would be permanently ahead of the saved model,
+        # corrupting every subsequent DB checkpoint number.
         joblib.dump(self._model, ML1_MODEL_PATH)
-        return True
+        self._checkpoint_count += 1
+
+        logger.info(
+            "ML1 retrained | samples=%d oob_accuracy=%.4f checkpoint=#%d",
+            self._last_sample_count, oob or 0.0, self._checkpoint_count,
+        )
+        return True, oob
 
     # ------------------------------------------------------------------
     # Private helpers

@@ -45,14 +45,23 @@ def annotate_proximity(
     for a in assumptions:
         current_val = getattr(state, a.variable, 0.0)
 
-        if a.threshold != 0:
-            prox = current_val / a.threshold
-        elif a.operator == "gt":
-            # H4 FIX: operator='gt', threshold=0.0 — proximity normalised by SLOPE_NORMALISER.
-            # This is the EMA trend_persistence special case (slope must be > 0).
+        if a.threshold == 0 and a.operator == "gt":
+            # H4 FIX: operator='gt', threshold=0.0 (EMA trend_persistence).
+            # Proximity normalised by SLOPE_NORMALISER.
             prox = max(0.0, 1.0 - min(1.0, current_val / SLOPE_NORMALISER))
-        else:
+        elif a.threshold == 0:
             prox = 1.0
+        elif a.operator == "gt":
+            # B11 FIX: for 'gt' assumptions the breach point is current_val <= threshold.
+            # Safe = current_val >> threshold (prox near 0).
+            # At risk = current_val ≈ threshold (prox near 1).
+            # Formula: threshold / current_val  (safe when current >> threshold).
+            # Guard: if current_val <= 0, we're already at or below breach → prox=1.0.
+            prox = (a.threshold / current_val) if current_val > 0 else 1.0
+        else:
+            # operator='lt': breach when current_val >= threshold.
+            # prox = current_val / threshold (approaching from below).
+            prox = current_val / a.threshold
 
         prox = round(min(1.0, max(0.0, prox)), 6)
         annotated.append(a.model_copy(update={

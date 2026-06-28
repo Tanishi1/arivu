@@ -10,6 +10,8 @@ def test_constants_complete():
     assert 'SOLUSDT' in THRESHOLDS
     assert len(INSTRUMENTS) == 3
     assert STRATEGY_HORIZON_MINUTES == 30
+
+
     assert K_CANDIDATES == [2, 3, 4]
 
 def test_schemas_import():

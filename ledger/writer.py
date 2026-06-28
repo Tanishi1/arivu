@@ -184,17 +184,25 @@ class LedgerWriter:
 
         Checks in-memory cache first, falls back to database.
         This ensures breaches survive process crashes (N28 Fix).
+
+        CRIT-3 FIX: Use 'in' check, not truthiness check.
+        An empty dict {} (zero breaches) was previously treated as "not in cache"
+        because `if cached:` is False for {}. This caused every zero-breach close
+        cycle to fall through to a DB read — adding latency and a subtle race with
+        the monitor thread's concurrent log_breach() write.
         """
         with self._state_lock:
-            cached = self._breach_logs.get(decision_object_id, {})
-            if cached:
-                return dict(cached)  # return copy — caller must not mutate
+            if decision_object_id in self._breach_logs:
+                return dict(self._breach_logs[decision_object_id])  # copy — caller must not mutate
 
         # N28 FIX: Fallback to database (e.g. after mid-cycle crash recovery)
         with SessionLocal() as session:
             row = session.get(DecisionObjectRow, decision_object_id)
             if row and row.breach_log:
                 log = json.loads(row.breach_log)
+                # Only cache non-empty logs from DB — empty DB log means no breaches
+                # recorded yet (monitor may still be running). Do not overwrite an
+                # in-memory {} that was explicitly initialised by commit().
                 if log:
                     with self._state_lock:
                         self._breach_logs[decision_object_id] = log
@@ -237,10 +245,21 @@ class LedgerWriter:
             return self._row_to_schema(row)
 
     def get_max_checkpoint(self) -> int:
-        """Return the highest checkpoint_number from the model_checkpoints table."""
+        """Return the highest checkpoint_number for ML2 from model_checkpoints.
+
+        B3 FIX: Filter to rows where ml1_macro_f1 IS NULL (pure ML2 checkpoints).
+        ML1 retraining now also writes to model_checkpoints (with ml1_macro_f1 set).
+        Without this filter, ML2's _checkpoint_count initialises to ML1's highest
+        checkpoint number, causing ML2's first checkpoint to appear as #2 or #3
+        instead of #1 — breaking the Brier score progression chart for Week 9.
+        """
         from sqlalchemy.sql import func
         with SessionLocal() as session:
-            max_cp = session.query(func.max(ModelCheckpointRow.checkpoint_number)).scalar()
+            max_cp = session.query(
+                func.max(ModelCheckpointRow.checkpoint_number)
+            ).filter(
+                ModelCheckpointRow.ml1_macro_f1.is_(None)  # ML2 rows only
+            ).scalar()
             return max_cp if max_cp is not None else 0
 
     def count_closed(self) -> int:
@@ -266,11 +285,19 @@ class LedgerWriter:
         strategy_name, symbol.
 
         Called by decision_cycle_loop after count_closed() meets the threshold.
+
+        S-6 FIX: Limit to the 200 most recent closed entries (ordered by commit time
+        descending). At Week 8 with 160+ entries a full table scan loads all rows and
+        their JSON snapshot columns into memory simultaneously — unnecessary pressure.
+        The 200 most recent entries are more representative of current market conditions
+        than entries from 5 weeks ago, so this also improves regime quality.
         """
         with SessionLocal() as session:
             rows = session.query(DecisionObjectRow).filter(
                 DecisionObjectRow.status == "CLOSED"
-            ).all()
+            ).order_by(
+                DecisionObjectRow.timestamp_committed.desc()
+            ).limit(200).all()
 
         entries = []
         for row in rows:

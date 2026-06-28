@@ -102,11 +102,17 @@ class ML2BreachPredictor:
         )
         return annotated
 
-    def maybe_retrain(self, ledger_writer) -> tuple[bool, float | None]:
+    def maybe_retrain(self, ledger_writer, current_phase: str = "bootstrap") -> tuple[bool, float | None]:
         """Retrain if enough new closed entries have accumulated.
 
         Returns (retrained: bool, brier_score: float | None).
         Also logs a checkpoint to the ledger.
+
+        B16 FIX: current_phase is now a parameter (not hardcoded as 'trained').
+        The 10-week plan requires checkpoint #1 (the bootstrap→trained transition)
+        to carry phase='bootstrap' because it was trained on bootstrap data.
+        Subsequent retraining checkpoints carry phase='trained'. Week 9 Analysis 3
+        plots these as two segments — without this fix there is NO bootstrap segment.
         """
         # N23 FIX: Initialize checkpoint count from DB if not yet loaded (across restarts)
         if self._checkpoint_count == 0:
@@ -168,9 +174,14 @@ class ML2BreachPredictor:
             joblib.dump(model, ML2_MODEL_PATH)
 
             # N8 FIX: Write the checkpoint to the database so Research Metric 2 exists!
+            # B16 FIX: Use the current_phase parameter — NOT hardcoded 'trained'.
+            # Checkpoint #1 is the bootstrap→trained boundary, trained on bootstrap data.
+            # The 10-week plan requires phase='bootstrap' here so Week 9 Analysis 3
+            # can plot the two segments separately. Later retrains in trained phase
+            # will pass current_phase='trained'.
             ledger_writer.save_checkpoint(
                 checkpoint_number=self._checkpoint_count,
-                phase="trained",
+                phase=current_phase,
                 ml2_brier_score=brier,
                 training_sample_count=len(X),
             )
@@ -215,11 +226,34 @@ class ML2BreachPredictor:
         return float(proba[pos_idx])
 
     def _load_buffer(self) -> list[dict]:
-        """Read training_buffer.csv into a list of row dicts."""
+        """Read training_buffer.csv into a list of row dicts.
+
+        B8 FIX: Validate that the CSV header contains all expected columns before
+        returning data. A process crash mid-write of the header row leaves a partial
+        header. csv.DictReader uses it as column names, causing every _prepare_xy
+        call to raise KeyError, permanently blocking ML2 from retraining.
+        """
+        _REQUIRED_COLS = {
+            "volatility", "spread", "trend_strength", "volume",
+            "proximity", "time_horizon", "p_normal", "p_stressed", "p_degraded",
+            "breached",
+        }
         if not TRAINING_BUFFER_PATH.exists():
             return []
         with open(TRAINING_BUFFER_PATH, newline="") as f:
-            return list(csv.DictReader(f))
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                logger.error("Training buffer has no header — file may be corrupt. Skipping.")
+                return []
+            missing = _REQUIRED_COLS - set(reader.fieldnames)
+            if missing:
+                logger.error(
+                    "Training buffer header is corrupt — missing columns: %s. "
+                    "Delete data/training_buffer.csv and restart to rebuild it.",
+                    sorted(missing),
+                )
+                return []
+            return list(reader)
 
     def _prepare_xy(self, data: list[dict]):
         feature_keys = [

@@ -267,7 +267,13 @@ class CausalStateManager:
         """
         prices = list(self._prices)
         if len(prices) < 5:
-            return 0.0
+            # B2 FIX: Return the same safe default as CausalState schema (3.5),
+            # not 0.0. On crash-restart with a recovered ACTIVE DO, the prices
+            # deque is empty. The monitor fires within 5s before enough ticks
+            # arrive. 0.0 < RSI threshold (3.0) → false breach → recovered DO
+            # immediately interrupted. 3.5 > 3.0 keeps the assumption safe until
+            # real price history accumulates.
+            return 3.5
 
         last = len(prices) - 1
         low_span: float | None = None

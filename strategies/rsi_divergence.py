@@ -175,13 +175,20 @@ class RSIStrategy(Strategy):
             * divergence_confidence
         )
 
-        # Strictest proximity penalty of the three strategies
+        # B12 FIX: use operator-aware proximity in evaluate(), matching decision_utils.py.
+        # Previously used current/threshold for ALL operators. For divergence_span
+        # (operator='gt', threshold=3.0), a safe value of 5.0 gave proximity=1.67
+        # which always triggered the ×0.3 penalty — RSI was permanently underscored.
         assumptions = self.get_assumptions(state, params)
         for assumption in assumptions:
             current = getattr(state, assumption.variable, 0.0)
-            if assumption.threshold != 0:
+            if assumption.threshold == 0:
+                continue  # zero-threshold handled elsewhere (EMA slope special case)
+            if assumption.operator == "gt":
+                proximity = (assumption.threshold / current) if current > 0 else 1.0
+            else:
                 proximity = current / assumption.threshold
-                if proximity > 0.8:
-                    score *= 0.3
+            if proximity > 0.8:
+                score *= 0.3
 
         return score

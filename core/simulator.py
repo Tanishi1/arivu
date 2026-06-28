@@ -231,7 +231,8 @@ class Simulator:
             try:
                 # predict returns the string label ("trending", "volatile", "calm")
                 dominant_regime = self._regime_classifier.classify(
-                    state.volatility, state.spread, state.trend_strength, state.volume
+                    state.volatility, state.spread, state.trend_strength, state.volume,
+                    trend_slope=state.trend_slope,  # HIGH-4: needed for bootstrap downtrend guard
                 )
             except Exception:
                 pass

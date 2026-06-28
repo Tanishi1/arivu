@@ -46,6 +46,13 @@ class BinanceFeed:
     def __init__(self, state_manager: CausalStateManager) -> None:
         self._state_manager = state_manager
         self._running = False
+        # B10 FIX: store the live WebSocket so stop() can close it.
+        # Previously stop() only set _running=False, which only prevents
+        # RECONNECTION — the active `async for raw_message in ws:` loop
+        # continues waiting for the next Binance message indefinitely.
+        # Without closing the connection, market_feed_loop never returns,
+        # asyncio.gather blocks forever, and _graceful_shutdown never fires.
+        self._ws = None
 
         # Latest values — merged from multiple stream types
         self._latest_price: float = 0.0
@@ -63,9 +70,11 @@ class BinanceFeed:
             try:
                 logger.info("Connecting to Binance WebSocket...")
                 async with websockets.connect(url) as ws:
+                    self._ws = ws   # B10 FIX: expose handle for stop()
                     logger.info("Market feed connected | streams=%s", STREAMS)
                     async for raw_message in ws:
                         await self._handle_message(raw_message)
+                    self._ws = None
 
             except ConnectionClosed as exc:
                 # Differentiate clean shutdown (code 1000) from unexpected drops
@@ -87,8 +96,19 @@ class BinanceFeed:
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def stop(self) -> None:
-        """Signal the feed to stop reconnecting."""
+        """Signal the feed to stop and close the active WebSocket connection.
+
+        B10 FIX: closing self._ws causes the `async for raw_message in ws:`
+        loop to raise ConnectionClosed immediately, exiting the context manager
+        and allowing market_feed_loop to return. Without this, _running=False
+        only prevents reconnection — the current ws stays open forever.
+        """
         self._running = False
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass  # already closed or connection error — feed will exit regardless
 
     # ------------------------------------------------------------------
     # Private helpers

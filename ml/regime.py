@@ -68,14 +68,28 @@ class RegimeClassifier:
         self._is_trained = False
         self._load_models_if_exist()
 
-    def classify(self, volatility: float, spread: float, trend_strength: float, volume: float) -> str:
+    def classify(
+        self,
+        volatility: float,
+        spread: float,
+        trend_strength: float,
+        volume: float,
+        trend_slope: float = 0.0,
+    ) -> str:
         """Classify current market into a regime.
 
         In bootstrap: threshold rules.
         In trained: Decision Tree predict().
+
+        HIGH-4 FIX: trend_slope added (default 0.0 for backward compatibility with
+        verify_models.py and test callers that use keyword args). The bootstrap
+        classifier previously classified ANY strong trend (positive or negative) as
+        'trending', giving EMAStrategy a +0.2 Stage 1 boost during downtrends.
+        EMA only generates BUY on upward crossovers — selecting it in a downtrend
+        produces HOLD cycles that fill the training buffer with zero-signal rows.
         """
         if not self._is_trained:
-            return self._bootstrap_classify(volatility, trend_strength)
+            return self._bootstrap_classify(volatility, trend_strength, trend_slope)
 
         # Detect if model expects 3 features (historical bootstrap) or 4 (live retrained)
         if hasattr(self._dt, "n_features_in_") and self._dt.n_features_in_ == 3:
@@ -231,7 +245,9 @@ class RegimeClassifier:
 
         return [regime_map.get(label, "calm") for label in labels]
 
-    def _bootstrap_classify(self, volatility: float, trend_strength: float) -> str:
+    def _bootstrap_classify(
+        self, volatility: float, trend_strength: float, trend_slope: float = 0.0
+    ) -> str:
         """Bootstrap regime classification via hand-coded thresholds.
 
         DF2 FIX: trending threshold changed from 0.5 to 0.35.
@@ -240,10 +256,20 @@ class RegimeClassifier:
         classifier was withholding the regime boost until 0.5, causing EMA to miss
         its +0.2 boost in moderately trending markets during Weeks 5-7 before K-Means
         fires at 40+ closed entries.
+
+        HIGH-4 FIX: 'trending' only fires when trend_slope > 0 (uptrend).
+        trend_strength = abs(trend_slope)/SLOPE_NORMALISER — it is direction-agnostic.
+        Without the slope sign check, a strong downtrend (trend_strength=0.5, slope=-0.01)
+        was classified 'trending' and EMAStrategy got a +0.2 Stage 1 boost even though
+        EMA only generates BUY on upward crossovers. In a downtrend it always returns
+        HOLD, producing zero-outcome cycles that contaminate the training buffer.
+        trend_slope defaults to 0.0 so existing callers (verify_models.py, tests) that
+        don't pass trend_slope continue to work — 0.0 slope is not > 0, so they fall
+        through to 'calm', which is correct for a flat state.
         """
         if volatility > VOLATILE_THRESHOLD:
             return "volatile"
-        if trend_strength > 0.35:   # DF2 FIX: was 0.5
+        if trend_strength > 0.35 and trend_slope > 0:   # HIGH-4: must be uptrend
             return "trending"
         return "calm"
 

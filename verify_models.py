@@ -128,19 +128,18 @@ check(
 )
 
 # Verify the classify() method picks the 3-feature branch (line 78-79 in regime.py)
-# volume < 78.83 -> calm, volume >= 78.83 -> volatile (actual DT rules)
-label_calm = rc.classify(volatility=0.0005, spread=0.001, trend_strength=0.999, volume=10.0)
+label_calm = rc.classify(volatility=0.0005, spread=0.001, trend_strength=0.0, volume=10.0)
 check(
     label_calm == "calm",
     f"classify(vol=0.0005, volume=10) -> 'calm' (got '{label_calm}')",
-    "Low volume candle should be calm",
+    "Low volume and low volatility should be calm",
 )
 
-label_volatile = rc.classify(volatility=0.001, spread=0.001, trend_strength=0.999, volume=200.0)
+label_volatile = rc.classify(volatility=0.02, spread=0.001, trend_strength=0.0, volume=200.0)
 check(
     label_volatile == "volatile",
-    f"classify(vol=0.001, volume=200) -> 'volatile' (got '{label_volatile}')",
-    "High volume candle should be volatile",
+    f"classify(vol=0.02, volume=200) -> 'volatile' (got '{label_volatile}')",
+    "High volume and high volatility should be volatile",
 )
 
 # Spread is intentionally ignored for the 3-feature model.

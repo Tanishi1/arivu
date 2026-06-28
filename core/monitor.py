@@ -42,23 +42,30 @@ def _check_assumption(assumption: Assumption, state) -> tuple[bool, float]:
     """Check if an assumption is breached given current state.
 
     Returns:
-        (breached: bool, proximity: float) — proximity is current_value / threshold.
+        (breached: bool, proximity: float)
+
+    B13 FIX: proximity is now operator-aware, matching decision_utils.annotate_proximity().
+    Previously used current_value/threshold for ALL operators. For RSI's divergence_span
+    (gt, threshold=3.0), safe value=5.0 gave proximity=1.67 in debug logs while
+    training_buffer.csv correctly stored 0.6 — making logs actively misleading.
 
     NOTE: Assumption is frozen (pydantic). Do NOT mutate it.
     """
     current_value: float = getattr(state, assumption.variable, 0.0)
 
-    # Compute proximity: how close current_value is to breaching the threshold.
-    if assumption.threshold != 0:
-        proximity = current_value / assumption.threshold
-    elif assumption.operator == "gt":
-        # HIGH-4 FIX: threshold=0.0 + operator='gt' (EMA trend_persistence).
-        # proximity = how close the slope is to 0 (the breach point).
-        # SLOPE_NORMALISER scales so strong slope→0.0 (safe), weak slope→1.0 (at risk).
-        # Previously returned 1.0 unconditionally — always appeared maximum breach risk.
+    if assumption.threshold == 0 and assumption.operator == "gt":
+        # EMA trend_persistence (threshold=0.0, operator='gt') — SLOPE_NORMALISER path
         proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / SLOPE_NORMALISER))
-    else:
+    elif assumption.threshold == 0:
         proximity = 0.0
+    elif assumption.operator == "gt":
+        # Breach when current_value <= threshold.
+        # Safe = current_value >> threshold → proximity near 0.
+        # At-risk = current_value ≈ threshold → proximity near 1.
+        proximity = (assumption.threshold / current_value) if current_value > 0 else 1.0
+    else:
+        # operator='lt': breach when current_value >= threshold
+        proximity = current_value / assumption.threshold
 
     if assumption.operator == "lt":
         breached = current_value >= assumption.threshold
@@ -74,14 +81,24 @@ async def assumption_monitor_loop(
     state_manager: CausalStateManager,
     ledger_writer,                # ledger.writer.LedgerWriter instance
     decision_queue: asyncio.Queue,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
-    """Main monitoring coroutine. Runs every 60 seconds indefinitely.
+    """Main monitoring coroutine. Runs every MONITOR_INTERVAL_S seconds.
 
     Pauses safely when the feed is stale.
+
+    B1 FIX: Accepts stop_event (the global _shutdown asyncio.Event from main.py).
+    Previously ran `while True:` with no exit condition. On Ctrl+C, asyncio.gather
+    blocked forever waiting for this coroutine — _graceful_shutdown never fired,
+    so open Alpaca positions were never closed.
     """
     logger.info("Assumption monitor started | interval=%ds", MONITOR_INTERVAL_S)
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
+        # B6 FIX: plain sleep + top-of-loop check. The previous asyncio.shield approach
+        # created a new background Task every 5s that was never collected — ~10,000
+        # orphaned tasks over a 14-hour run. Simple sleep is correct: we exit within
+        # MONITOR_INTERVAL_S (5s) of shutdown being signalled, which is acceptable.
         await asyncio.sleep(MONITOR_INTERVAL_S)
 
         if _is_feed_stale(state_manager):
