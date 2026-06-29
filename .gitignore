@@ -19,7 +19,7 @@ env/
 # Data — runtime artifacts, not source
 data/arivu.db
 data/training_buffer.csv
-data/models/*.joblib
+data/solusdt_1m_raw.csv
 
 # Logs
 logs/arivu.log

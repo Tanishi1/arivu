@@ -3,8 +3,13 @@
 
 This module is the ONLY place where ML2 feature computation lives.
 It is imported by:
-  - ml/ml2.py       (at training time, reading from training_buffer.csv)
-  - core/simulator.py (at inference time, live in decision_cycle_loop)
+  - ml/ml2.py       (at training time: _prepare_xy() reads from training_buffer.csv)
+  - main.py         (at inference time: decision_cycle_loop → ml2.annotate() → _predict_trained())
+
+# S-4 FIX: Previously listed core/simulator.py as a consumer — it does not import
+# this module. ML2 inference is called from main.py, not the simulator.
+# A wrong docstring here could lead a team member to add a duplicate feature
+# computation inside the simulator, silently re-introducing training-serving skew.
 
 Any feature change MUST be made here and ONLY here.
 Using two different implementations guarantees training-serving skew — a bug

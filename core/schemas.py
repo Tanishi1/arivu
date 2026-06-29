@@ -1,18 +1,45 @@
-"""shared/schemas.py
+"""core/schemas.py
 All 6 pydantic contracts for Arivu.
 
 These schemas are the single source of truth for all inter-component data.
 Every team member MUST read this file before touching any other file.
 Pydantic v2 enforces all types at every component boundary.
+
+Key design decisions enforced here:
+  - DecisionObject is frozen (immutable in Python, not just in the DB).
+  - algo_health_vector is validated to have exactly 3 elements summing to ~1.0.
+  - Assumption.variable is constrained to actual CausalState field names.
+  - All timestamps are timezone-aware (UTC). Never use datetime.utcnow().
+  - OutcomeRecord carries phase so training queries never need a JOIN.
+  - DecisionObject carries hill_climb_iterations so Metric 3 survives INTERRUPTED cycles.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# ---------------------------------------------------------------------------
+# Type alias — constrains Assumption.variable to real CausalState fields.
+# If you add a field to CausalState that should be monitorable, add it here.
+# ---------------------------------------------------------------------------
+
+CausalStateField = Literal[
+    "price",
+    "volatility",
+    "spread",
+    "trend_slope",
+    "trend_strength",
+    "volume",
+    "rsi_current",          # Wilder RSI-14 computed from rolling prices. Default 50.0 (neutral).
+    "divergence_candle_span", # Candles since last local price extreme (low OR high). Default 3.5.
+                              # C_NEW_1 FIX: 3.5 > threshold 3.0 prevents startup false breach.
+                              # Replaced by _compute_divergence_span() after 5 price ticks.
+]
 
 
 # ---------------------------------------------------------------------------
@@ -22,9 +49,10 @@ from pydantic import BaseModel, Field
 class MarketTick(BaseModel):
     """A single parsed message from the Binance WebSocket stream.
 
-    Produced by: shared/stream.py
-    Consumed by: shared/causal_state.py
+    Produced by: core/stream.py
+    Consumed by: core/causal_state.py
     """
+    model_config = ConfigDict(frozen=True)
 
     symbol: str
     timestamp: datetime
@@ -41,22 +69,16 @@ class MarketTick(BaseModel):
 # ---------------------------------------------------------------------------
 
 class Assumption(BaseModel):
-    """A single causal assumption attached to a strategy decision.
-
-    name:       human-readable identifier  e.g. 'volatility_control'
-    variable:   the CausalState field to check  e.g. 'volatility'
-    operator:   'gt' (variable must be > threshold) or 'lt' (< threshold)
-    threshold:  the boundary value
-    proximity:  current_value / threshold  — filled by monitor at check time
-    breach_risk: P(breach) from ML2  — filled before ledger commit
-    """
+    """A single causal assumption attached to a strategy decision."""
+    model_config = ConfigDict(frozen=True)
 
     name: str
-    variable: str
+    variable: CausalStateField          # constrained — no silent typos
     operator: Literal["gt", "lt"]
     threshold: float
+    current_value: float = 0.0
     proximity: float = 0.0
-    breach_risk: float = 0.0  # annotated by ML2 pre-commit
+    breach_risk: float = 0.5           # annotated by ML2 pre-commit
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +98,11 @@ class CausalState(BaseModel):
       It is NOT a one-time snapshot — ML1 runs continuously in the background
       and the latest vector is captured at the moment of each ledger commit.
     """
+    model_config = ConfigDict(frozen=True)
 
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     price: float = 0.0
     volatility: float = 0.0         # rolling std of returns
     spread: float = 0.0             # ask - bid (propagated from market)
@@ -88,6 +113,20 @@ class CausalState(BaseModel):
     # ML1 output — updated continuously in background, captured at commit time
     # [p_normal, p_stressed, p_degraded] — all three values, not a single label
     algo_health_vector: list[float] = Field(default_factory=lambda: [1.0, 0.0, 0.0])
+
+    # RSI current value — computed by causal_state.py from rolling price history.
+    # Range [0, 100]. Default 50.0 (neutral) until >= 15 ticks are available.
+    # Used by RSIStrategy's rsi_not_extreme assumption (operator='lt', threshold=80.0)
+    # to detect overbought conditions. The monitor checks getattr(state, 'rsi_current').
+    rsi_current: float = 50.0
+
+    # Candles since last local price low/high — computed by causal_state.py.
+    # C_NEW_1 FIX: Default is 3.5 (above threshold=3.0) so startup state does NOT
+    # immediately breach the divergence_span assumption before enough price history
+    # accumulates. The real value takes over once _compute_divergence_span() has
+    # at least 5 prices to scan. Without this, every RSI cycle closes within 5s.
+    divergence_candle_span: float = 3.5
+
 
     active_strategy: str = "none"
     position_size: float = 0.0
@@ -102,17 +141,15 @@ class CausalState(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ExecutionTelemetry(BaseModel):
-    """Emitted by the executor after every order attempt.
-
-    Produced by: execution/executor.py
-    Consumed by: ml/ml1.py (for ML1 retraining + inference)
-    """
-
+    """Emitted by the executor after every order attempt."""
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    symbol: str
     fill_rate: float                # fills / orders placed in last 10 orders
     order_latency_ms: float         # time from order submit to fill
     slippage: float                 # intended_price − actual_fill_price
     position_size_deviation: float  # actual_size / intended_size − 1
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -120,14 +157,11 @@ class ExecutionTelemetry(BaseModel):
 # ---------------------------------------------------------------------------
 
 class SimulatorResult(BaseModel):
-    """Output of the two-stage simulator.
-
-    Produced by: shared/simulator.py
-    Consumed by: shared/comparator.py, ledger/writer.py
-    hill_climb_iterations is logged per cycle for Research Metric 3.
-    """
+    """Output of the two-stage simulator."""
+    model_config = ConfigDict(frozen=True)
 
     strategy_name: str
+    symbol: str = "SOLUSDT"
     tuned_params: dict
     heuristic_score: float
     hill_climb_iterations: int      # Research Metric 3: must be > 0
@@ -144,28 +178,79 @@ class DecisionObject(BaseModel):
     """The immutable record committed to the ledger BEFORE any actuation.
 
     IMMUTABILITY RULE:
-    Once status=COMMITTED, only the 'status' field may change.
-    All other fields are write-once. ledger/writer.py enforces this with
-    a ValueError guard. This is the most important invariant in the system.
+    Once committed, this object is frozen both in Python (model_config frozen=True)
+    and in the database (only the 'status' SQL column may be updated via
+    LedgerWriter.update_status()). Any attempt to mutate a field after
+    creation raises a Pydantic ValidationError immediately.
 
     phase: 'bootstrap' (before ML2 has been trained on real data)
            'trained'   (after ML2 beats the proximity heuristic baseline)
     The phase column must be present from cycle one. Do not add it later.
+
+    hill_climb_iterations: carried directly from SimulatorResult so that
+    Research Metric 3 is preserved even if the cycle is INTERRUPTED before
+    an OutcomeRecord is created.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     id: UUID = Field(default_factory=uuid4)
-    timestamp_committed: datetime = Field(default_factory=datetime.utcnow)
+    timestamp_committed: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     strategy_name: str
+    symbol: str = "SOLUSDT"
     tuned_params: dict
     market_state_snapshot: dict     # snapshot of CausalState at commit time
     algo_health_vector: list[float] # ML1 vector captured at commit time
     assumptions: list[Assumption]
     projected_pnl: float
     confidence: float
+    hill_climb_iterations: int      # Research Metric 3 — preserved on INTERRUPTED
     status: Literal[
         "COMMITTED", "ACTIVE", "CLOSED", "INTERRUPTED", "EXECUTION_FAILED"
     ] = "COMMITTED"
     phase: Literal["bootstrap", "trained"] = "bootstrap"
+    schema_version: int = 1
+
+    @field_validator("algo_health_vector")
+    @classmethod
+    def validate_algo_health_vector(cls, v: list[float]) -> list[float]:
+        """Enforce [p_normal, p_stressed, p_degraded] contract.
+
+        Exactly 3 elements summing to ~1.0.
+        A corrupt vector here corrupts ML2 feature set silently — prevent at source.
+        """
+        if len(v) != 3:
+            raise ValueError(
+                f"algo_health_vector must have exactly 3 elements "
+                f"[p_normal, p_stressed, p_degraded], got {len(v)}"
+            )
+        total = sum(v)
+        if abs(total - 1.0) > 0.02:
+            raise ValueError(
+                f"algo_health_vector must sum to ~1.0 (tolerance ±0.02), "
+                f"got {total:.4f}. Values: {v}"
+            )
+        return v
+
+    @field_validator("assumptions")
+    @classmethod
+    def validate_assumption_count(cls, v: list) -> list:
+        """Enforce exactly 3 assumptions per DecisionObject.
+
+        The monitor, ML2 annotator, and training_buffer.csv all depend on
+        exactly 3 assumptions per cycle. A strategy returning fewer causes:
+          - Uneven CSV rows (breaks ML2's len(data)//3 cycle count estimate)
+          - Monitor checking fewer conditions than designed
+          - Silent scientific integrity violation (underdefined causal model)
+        """
+        if len(v) != 3:
+            raise ValueError(
+                f"Each strategy must return exactly 3 Assumption objects, got {len(v)}. "
+                f"See strategies/base.py get_assumptions() docstring."
+            )
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -173,20 +258,21 @@ class DecisionObject(BaseModel):
 # ---------------------------------------------------------------------------
 
 class OutcomeRecord(BaseModel):
-    """Created when a DecisionObject moves to CLOSED. One per DecisionObject.
-
-    outcome_delta = projected_pnl - actual_pnl  (Research Metric 1)
-    hill_climb_iterations carried over from the SimulatorResult (Metric 3)
-    Both assumptions_held and assumptions_breached must be fully populated —
-    missing labels break ML2 training.
-    """
+    """Created when a DecisionObject moves to CLOSED."""
+    model_config = ConfigDict(frozen=True)
 
     id: UUID = Field(default_factory=uuid4)
     decision_object_id: UUID
-    timestamp_closed: datetime = Field(default_factory=datetime.utcnow)
+    timestamp_closed: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    symbol: str = "SOLUSDT"
     actual_pnl: float
     outcome_delta: float                    # projected − actual
     assumptions_held: list[str]             # assumption names that held
     assumptions_breached: list[str]         # assumption names that breached
     breach_timestamps: dict                 # {assumption_name: iso_timestamp}
     hill_climb_iterations: int
+    close_reason: Literal["horizon_expired", "assumption_breach", "system_shutdown", "manual"]
+    phase: Literal["bootstrap", "trained"]  # carried from DecisionObject
+    schema_version: int = 1

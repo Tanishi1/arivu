@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from core.schemas import Assumption, CausalState
 
 
-class BaseStrategy(ABC):
+class Strategy(ABC):
     """Abstract base class for Arivu trading strategies.
 
     All strategies must implement exactly these 5 methods. No more, no less.
@@ -40,7 +40,12 @@ class BaseStrategy(ABC):
         Returns:
             "BUY", "SELL", or "HOLD"
 
-        Must NOT have side effects. Called repeatedly by the simulator.
+        B14 FIX: generate_signal() IS ALLOWED to have side effects (e.g. appending
+        to self._price_history to maintain rolling windows for EMA/Bollinger/RSI).
+        Only evaluate() must be a pure function with no side effects — it is called
+        100+ times per decision cycle by the hill-climber. Confusing these two
+        contracts caused previous bugs where generate_signal() was stripped of its
+        history updates, breaking signal generation permanently.
         """
 
     # ------------------------------------------------------------------

@@ -16,6 +16,7 @@ for every closed entry — missing labels break ML2 training.
 
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import logging
 import os
@@ -24,10 +25,13 @@ from pathlib import Path
 from uuid import UUID
 
 from core.schemas import DecisionObject, OutcomeRecord
+from core.constants import TRAINING_BUFFER_PATH, STRATEGY_HORIZON_MINUTES
 
 logger = logging.getLogger(__name__)
 
-TRAINING_BUFFER_PATH = Path("data/training_buffer.csv")
+# How long to wait for Alpaca REST calls before giving up (seconds).
+# An unresponsive Alpaca API must not stall the entire decision loop.
+_ALPACA_TIMEOUT_S = 15
 
 # CSV columns for ML training buffer (E10)
 BUFFER_COLUMNS = [
@@ -35,7 +39,7 @@ BUFFER_COLUMNS = [
     "proximity", "time_horizon",
     "p_normal", "p_stressed", "p_degraded",
     "assumption_type", "breached",
-    "phase",
+    "phase", "close_reason",
 ]
 
 
@@ -50,7 +54,7 @@ class OutcomeComparator:
     def close_cycle(
         self,
         decision_object: DecisionObject,
-        hill_climb_iterations: int,
+        close_reason: str,
     ) -> OutcomeRecord | None:
         """Close the decision cycle.
 
@@ -59,14 +63,21 @@ class OutcomeComparator:
         3. Commit OutcomeRecord to ledger.
         4. Append rows to training_buffer.csv.
 
-        Returns the OutcomeRecord, or None if Alpaca read fails.
+        Returns the OutcomeRecord, or None if Alpaca read fails or cycle is already closed.
         """
-        actual_pnl = self._read_actual_pnl()
+        existing = self._ledger.get_decision_object(str(decision_object.id))
+        if existing and existing.status == "CLOSED":
+            logger.info("Comparator | Decision %s already CLOSED. Skipping.", decision_object.id)
+            return None
+        actual_pnl, had_position = self._read_actual_pnl()
         if actual_pnl is None:
             logger.error("Comparator | could not read P&L from Alpaca — cycle not closed")
             return None
 
-        outcome_delta = decision_object.projected_pnl - actual_pnl
+        # HOLD cycles: no Alpaca position was opened so actual P&L is structurally
+        # zero. Storing projected_pnl - 0.0 as outcome_delta would teach ML2 that
+        # every HOLD is a bad prediction. Clamp delta to 0.0 when there was no position.
+        outcome_delta = 0.0 if not had_position else (decision_object.projected_pnl - actual_pnl)
 
         # Determine which assumptions held vs breached
         # The ledger holds breach records committed by the monitor
@@ -84,7 +95,9 @@ class OutcomeComparator:
             assumptions_held=held_names,
             assumptions_breached=breached_names,
             breach_timestamps=breach_log,
-            hill_climb_iterations=hill_climb_iterations,
+            hill_climb_iterations=decision_object.hill_climb_iterations,
+            phase=decision_object.phase,
+            close_reason=close_reason,
         )
 
         self._ledger.close(decision_object.id, record)
@@ -97,14 +110,43 @@ class OutcomeComparator:
         self._append_to_buffer(decision_object, record)
         return record
 
-    def _read_actual_pnl(self) -> float | None:
-        """Read cumulative P&L from Alpaca paper account."""
+    def _read_actual_pnl(self) -> tuple[float | None, bool]:
+        """Close the Alpaca position and return (pnl, had_open_position).
+
+        Returns:
+            (pnl, had_position):
+              - pnl is None if the Alpaca call failed or timed out.
+              - had_position is False when no position existed (HOLD cycle).
+                Callers must set outcome_delta = 0.0 when had_position is False.
+
+        A 15-second timeout is enforced so that an unresponsive Alpaca API
+        does not stall the decision loop indefinitely via asyncio.to_thread().
+        """
+        def _do_read() -> tuple[float, bool]:
+            try:
+                # N10 & N11 FIX: Close the actual position and get the PNL
+                position = self._alpaca.get_position("SOLUSD")
+                unrealized_pl = float(position.unrealized_pl)
+                self._alpaca.close_position("SOLUSD")
+                return unrealized_pl, True
+            except Exception as exc:  # noqa: BLE001
+                if "position does not exist" in str(exc).lower():
+                    logger.info("Comparator | No open position for SOLUSD (HOLD cycle)")
+                    return 0.0, False
+                raise  # re-raise so the outer except captures it
+
         try:
-            account = self._alpaca.get_account()
-            return float(account.equity) - float(account.last_equity)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_do_read)
+                return future.result(timeout=_ALPACA_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Alpaca P&L read timed out after %ds — cycle not closed", _ALPACA_TIMEOUT_S
+            )
+            return None, False
         except Exception as exc:  # noqa: BLE001
-            logger.error("Alpaca P&L read failed | %s", exc)
-            return None
+            logger.error("Alpaca P&L read/close failed | %s", exc)
+            return None, False
 
     def _append_to_buffer(
         self,
@@ -124,13 +166,14 @@ class OutcomeComparator:
                 "trend_strength": market.get("trend_strength", 0.0),
                 "volume": market.get("volume", 0.0),
                 "proximity": assumption.proximity,
-                "time_horizon": 240,  # default strategy window in minutes
+                "time_horizon": STRATEGY_HORIZON_MINUTES,
                 "p_normal": p_normal,
                 "p_stressed": p_stressed,
                 "p_degraded": p_degraded,
                 "assumption_type": assumption.name,
                 "breached": breached_flag,
                 "phase": do.phase,
+                "close_reason": record.close_reason,
             })
 
         with open(TRAINING_BUFFER_PATH, "a", newline="") as f:

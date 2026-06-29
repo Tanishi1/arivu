@@ -14,15 +14,11 @@ from __future__ import annotations
 import pytest
 
 from core.schemas import CausalState
-from strategies.rsi_divergence import RSIStrategy, _PRICE_HISTORY
+from strategies.rsi_divergence import RSIStrategy
 
 
-@pytest.fixture(autouse=True)
-def clear_price_history():
-    _PRICE_HISTORY.clear()
-    yield
-    _PRICE_HISTORY.clear()
-
+# NOTE: No module-level _PRICE_HISTORY fixture needed.
+# RSIStrategy.__init__() creates a fresh self._price_history per instance.
 
 @pytest.fixture
 def strategy():

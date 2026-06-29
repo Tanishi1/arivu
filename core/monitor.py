@@ -1,4 +1,4 @@
-"""shared/monitor.py
+"""core/monitor.py
 60-second assumption monitoring loop.
 
 Runs as an asyncio coroutine alongside market_feed_loop and decision_cycle_loop.
@@ -20,11 +20,12 @@ import logging
 from datetime import datetime, timezone
 
 from core.causal_state import CausalStateManager, STALE_THRESHOLD_S
+from core.constants import SLOPE_NORMALISER
 from core.schemas import Assumption, DecisionObject
 
 logger = logging.getLogger(__name__)
 
-MONITOR_INTERVAL_S = 60
+MONITOR_INTERVAL_S = 5  # N21 FIX: Reduced from 60s to prevent missing breaches right before horizon expiration
 
 
 def _is_feed_stale(manager: CausalStateManager) -> bool:
@@ -37,56 +38,93 @@ def _is_feed_stale(manager: CausalStateManager) -> bool:
     return age > STALE_THRESHOLD_S
 
 
-def _check_assumption(assumption: Assumption, state) -> bool:
-    """Return True if the assumption is breached given current state.
+def _check_assumption(assumption: Assumption, state) -> tuple[bool, float]:
+    """Check if an assumption is breached given current state.
 
-    Updates assumption.proximity as a side-effect for logging.
+    Returns:
+        (breached: bool, proximity: float)
+
+    B13 FIX: proximity is now operator-aware, matching decision_utils.annotate_proximity().
+    Previously used current_value/threshold for ALL operators. For RSI's divergence_span
+    (gt, threshold=3.0), safe value=5.0 gave proximity=1.67 in debug logs while
+    training_buffer.csv correctly stored 0.6 — making logs actively misleading.
+
+    NOTE: Assumption is frozen (pydantic). Do NOT mutate it.
     """
     current_value: float = getattr(state, assumption.variable, 0.0)
 
-    # Compute proximity: current_value / threshold
-    if assumption.threshold != 0:
-        proximity = current_value / assumption.threshold
+    if assumption.threshold == 0 and assumption.operator == "gt":
+        # EMA trend_persistence (threshold=0.0, operator='gt') — SLOPE_NORMALISER path
+        proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / SLOPE_NORMALISER))
+    elif assumption.threshold == 0:
+        proximity = 0.0
+    elif assumption.operator == "gt":
+        # Breach when current_value <= threshold.
+        # Safe = current_value >> threshold → proximity near 0.
+        # At-risk = current_value ≈ threshold → proximity near 1.
+        proximity = (assumption.threshold / current_value) if current_value > 0 else 1.0
     else:
-        proximity = 1.0
-
-    assumption.proximity = proximity
+        # operator='lt': breach when current_value >= threshold
+        proximity = current_value / assumption.threshold
 
     if assumption.operator == "lt":
-        return current_value >= assumption.threshold
+        breached = current_value >= assumption.threshold
     elif assumption.operator == "gt":
-        return current_value <= assumption.threshold
-    return False
+        breached = current_value <= assumption.threshold
+    else:
+        breached = False
+
+    return breached, proximity
 
 
 async def assumption_monitor_loop(
     state_manager: CausalStateManager,
     ledger_writer,                # ledger.writer.LedgerWriter instance
     decision_queue: asyncio.Queue,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
-    """Main monitoring coroutine. Runs every 60 seconds indefinitely.
+    """Main monitoring coroutine. Runs every MONITOR_INTERVAL_S seconds.
 
     Pauses safely when the feed is stale.
+
+    B1 FIX: Accepts stop_event (the global _shutdown asyncio.Event from main.py).
+    Previously ran `while True:` with no exit condition. On Ctrl+C, asyncio.gather
+    blocked forever waiting for this coroutine — _graceful_shutdown never fired,
+    so open Alpaca positions were never closed.
     """
     logger.info("Assumption monitor started | interval=%ds", MONITOR_INTERVAL_S)
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
+        # B6 FIX: plain sleep + top-of-loop check. The previous asyncio.shield approach
+        # created a new background Task every 5s that was never collected — ~10,000
+        # orphaned tasks over a 14-hour run. Simple sleep is correct: we exit within
+        # MONITOR_INTERVAL_S (5s) of shutdown being signalled, which is acceptable.
         await asyncio.sleep(MONITOR_INTERVAL_S)
 
         if _is_feed_stale(state_manager):
             logger.warning("Monitor paused | feed stale > %ds", STALE_THRESHOLD_S)
             continue
 
-        active: DecisionObject | None = ledger_writer.get_active()
+        active: DecisionObject | None = await asyncio.to_thread(ledger_writer.get_active)
         if active is None:
             logger.debug("Monitor | no active DecisionObject")
+            continue
+
+        # N22 FIX: Prevent monitoring before Alpaca limit order finishes filling
+        if active.status == "COMMITTED":
+            logger.debug("Monitor | object still COMMITTED, waiting for execution")
             continue
 
         state = state_manager.snapshot()
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        # Collect ALL breaches in a single pass, then fire ONE consolidated event.
+        # Firing one event per assumption would cause N redundant decision cycles
+        # when N assumptions breach simultaneously (common during volatility spikes).
+        breached_this_cycle: list[str] = []
+
         for assumption in active.assumptions:
-            breached = _check_assumption(assumption, state)
+            breached, proximity = _check_assumption(assumption, state)
             if breached:
                 logger.warning(
                     "Assumption breached | name=%s variable=%s threshold=%.4f actual=%.4f",
@@ -95,18 +133,32 @@ async def assumption_monitor_loop(
                     assumption.threshold,
                     getattr(state, assumption.variable, 0.0),
                 )
-                ledger_writer.log_breach(
-                    decision_object_id=str(active.id),
-                    assumption_name=assumption.name,
-                    breach_timestamp=now_iso,
-                )
-                await decision_queue.put({
-                    "type": "assumption_breach",
-                    "assumption": assumption.name,
-                    "decision_object_id": str(active.id),
-                })
+                # thread so the async monitor loop is not blocked during disk I/O.
+                try:
+                    await asyncio.to_thread(
+                        ledger_writer.log_breach,
+                        decision_object_id=str(active.id),
+                        assumption_name=assumption.name,
+                        breach_timestamp=now_iso,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Monitor failed to log breach to ledger | %s", exc)
+                breached_this_cycle.append(assumption.name)
             else:
                 logger.debug(
                     "Assumption holds | name=%s proximity=%.3f",
-                    assumption.name, assumption.proximity,
+                    assumption.name, proximity,
+                )
+
+        if breached_this_cycle:
+            try:
+                decision_queue.put_nowait({
+                    "type": "assumption_breach",
+                    "assumptions": breached_this_cycle,
+                    "decision_object_id": str(active.id),
+                })
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Decision queue full — assumption_breach trigger discarded "
+                    "(will retry next monitor cycle)"
                 )
