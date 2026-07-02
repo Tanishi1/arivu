@@ -131,6 +131,7 @@ class CausalState(BaseModel):
     active_strategy: str = "none"
     position_size: float = 0.0
     capital_deployed: float = 0.0
+    price_history: list[float] = Field(default_factory=list)
 
     # Stale feed detection — monitor pauses if this is > 10s ago
     last_tick_timestamp: Optional[datetime] = None
@@ -211,6 +212,8 @@ class DecisionObject(BaseModel):
         "COMMITTED", "ACTIVE", "CLOSED", "INTERRUPTED", "EXECUTION_FAILED"
     ] = "COMMITTED"
     phase: Literal["bootstrap", "trained"] = "bootstrap"
+    meta_params: Optional[dict] = None      
+    causal_chain_snapshot: Optional[dict] = None  
     schema_version: int = 1
 
     @field_validator("algo_health_vector")

@@ -1,9 +1,10 @@
 """main.py — Arivu entry point
 
-Three asyncio coroutines running concurrently in ONE Python process:
+Four asyncio coroutines running concurrently in ONE Python process:
   1. market_feed_loop       — processes every Binance WebSocket tick
   2. assumption_monitor_loop — checks active assumptions every 60 seconds
-  3. decision_cycle_loop    — reads decision_queue; runs Simulator → ML2 → Ledger → Alpaca
+  3. decision_cycle_loop    — legacy arm: EMA/Bollinger/RSI strategies (comparison arm)
+  4. causal_agent_loop      — causal agent: discovers rules, generates hypotheses, trades
 
 Start: python main.py
 Stop:  Ctrl+C  →  graceful shutdown (WebSocket closed, active entry marked INTERRUPTED)
@@ -58,12 +59,18 @@ from core.stream import BinanceFeed
 from core.monitor import assumption_monitor_loop
 from core.simulator import Simulator
 from core.schemas import DecisionObject
+from core.feature_bar import FeatureBarBuilder, VARIABLE_NAMES
+from core.twin_simulator import TwinSimulator
 from execution.executor import Executor
 from ledger.models import init_db
 from ledger.writer import LedgerWriter, LedgerWriteError
 from ml.ml1 import ML1BehaviourClassifier
 from ml.ml2 import ML2BreachPredictor
 from ml.regime import RegimeClassifier
+from ml.causal_discovery import CausalDiscoveryEngine
+from ml.layer1_tracker import Layer1Tracker
+from ml.hypothesis_generator import HypothesisGenerator, MIN_TRADE_SCORE
+from ml.trust_updater import Layer2TrustUpdater
 from strategies.ema_crossover import EMAStrategy
 from strategies.bollinger import BollingerStrategy
 from strategies.rsi_divergence import RSIStrategy
@@ -82,6 +89,14 @@ _CLOSE_REASON_MAP = {
     "horizon_expired": "horizon_expired",
     "system_shutdown": "system_shutdown",
 }
+
+# ---------------------------------------------------------------------------
+# Causal agent configuration
+# ---------------------------------------------------------------------------
+
+GRAPH_REFRESH_S: int = 300          # 5 minutes between PCMCI runs
+CAPITAL_CAUSAL_AGENT: float = 100_000  # $100k allocated to causal agent
+CAPITAL_LEGACY_ARM: float = 100_000.0   # $100k for legacy strategies (run synthetically)
 
 
 def _handle_sigint(*_):
@@ -145,287 +160,664 @@ async def market_feed_loop(
 # Coroutine 2 — Decision cycle loop
 # ---------------------------------------------------------------------------
 
-async def decision_cycle_loop(
-    decision_queue: asyncio.Queue,
+async def legacy_strategy_loop(
     state_manager: CausalStateManager,
-    simulator: Simulator,
-    ml1: ML1BehaviourClassifier,
-    ml2: ML2BreachPredictor,
     ledger: LedgerWriter,
     executor: Executor,
     comparator: OutcomeComparator,
-    current_phase: list[str],  # mutable container: ['bootstrap'] or ['trained']
-    regime_classifier: RegimeClassifier,  # H1: needed for K-Means live re-run trigger
+    ml1: ML1BehaviourClassifier,
+    ml2: ML2BreachPredictor,
+    layer1: Layer1Tracker,
+    regime_classifier: RegimeClassifier,
+    current_phase: list[str],
 ) -> None:
-    """Read events from decision_queue, run the full simulator → ledger → Alpaca cycle.
-
-    Phase is controlled by the outer loop after checking ML2 training results.
     """
-    active_watcher_task: asyncio.Task | None = None
+    Runs EMA, Bollinger, RSI strategies independently on every decision cycle.
+    Completely isolated from the causal agent.
+    Tracks its own active trade locally — never calls ledger.get_active().
+    """
+    from ml.meta_optimizer import TradeOutcome
 
-    # K5 FIX: build strategy_map ONCE before the loop, not on every cycle.
-    # Instantiating strategy objects per-cycle wastes allocations and
-    # silently fell back to EMA for unknown strategy names.
-    strategy_map = {
-        "EMAStrategy": EMAStrategy(),
-        "BollingerStrategy": BollingerStrategy(),
-        "RSIStrategy": RSIStrategy(),
-    }
+    ema_strategy = EMAStrategy()
+    bollinger_strategy = BollingerStrategy()
+    rsi_strategy = RSIStrategy()
 
-    # N29 FIX: Recover state on startup
-    active = ledger.get_active()
-    if active:
-        if active.status == "COMMITTED":
-            # Crashed during execution, cannot be salvaged safely.
-            logger.warning("Recovered COMMITTED object on startup. Marking INTERRUPTED to prevent deadlock.")
-            await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
-        elif active.status == "ACTIVE":
-            # Recover the time horizon watcher
-            try:
-                commit_time = datetime.fromisoformat(active.timestamp_committed)
-                elapsed_s = (datetime.now(timezone.utc) - commit_time).total_seconds()
-                remaining_m = max(0.0, STRATEGY_HORIZON_MINUTES - (elapsed_s / 60.0))
-                logger.info("Recovered ACTIVE object. Spawning watcher for remaining %.1f mins.", remaining_m)
-                active_watcher_task = asyncio.create_task(
-                    time_horizon_watcher(str(active.id), remaining_m, decision_queue)
-                )
-            except Exception as e:
-                logger.error("Failed to parse timestamp, marking INTERRUPTED: %s", e)
-                await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
+    # Recover any active legacy trade from DB on startup
+    # (handles case where process restarted mid-trade)
+    _legacy_active_do: DecisionObject | None = None
 
     while not _shutdown.is_set():
         try:
-            event = await asyncio.wait_for(decision_queue.get(), timeout=5.0)
-        except asyncio.TimeoutError:
-            continue
+            state = state_manager.snapshot()
+            current_regime = regime_classifier.classify(
+                volatility=state.volatility,
+                spread=state.spread,
+                trend_strength=state.trend_strength,
+                volume=state.volume,
+                trend_slope=state.trend_slope,
+            )
 
-        # N32 FIX: Ignore events that belong to a different (closed) decision cycle
-        active = ledger.get_active()
-        event_do_id = event.get("decision_object_id")
-        if event_do_id and (not active or event_do_id != str(active.id)):
-            logger.debug("Discarding stale event for closed cycle %s", event_do_id)
-            continue
-
-        # P-5 FIX: Threshold events (type='threshold_crossed') carry no decision_object_id.
-        # Two rapid triggers fired within 1 second (e.g. volatility spike + trend reversal)
-        # both enter the queue. Without this guard, the second event immediately closes
-        # the DO that the first event just created — producing a junk OutcomeRecord with
-        # < 30s lifetime and outcome_delta = projected_pnl (no actual position existed).
-        # Grace period: skip closing a DO that is less than 30s old on an anonymous trigger.
-        if active and not event_do_id:
-            age_s = (datetime.now(timezone.utc) - active.timestamp_committed).total_seconds()
-            if age_s < 30:
-                logger.warning(
-                    "Rapid trigger suppressed — active DO age=%.1fs < 30s grace period "
-                    "| trigger=%s | id=%s",
-                    age_s, event.get("type"), str(active.id)[:8],
-                )
-                continue
-
-        logger.info(
-            "Decision cycle started | trigger=%s phase=%s",
-            event.get("type"), current_phase[0],
-        )
-
-        # 1. Close any active DecisionObject before starting a new one
-        if active:
-            if active_watcher_task and not active_watcher_task.done():
-                active_watcher_task.cancel()
-                # K8 FIX: await the cancelled task so CancelledError is consumed
-                # cleanly. Without this, Python logs "Task exception was never
-                # retrieved" hours later at GC time.
-                try:
-                    await active_watcher_task
-                except asyncio.CancelledError:
-                    pass
-
-            close_reason = _CLOSE_REASON_MAP.get(event.get("type", ""), "manual")
-            try:
-                # K3 FIX: run synchronous SQLite commit in a thread so the event
-                # loop is not blocked during disk I/O (prevents WebSocket drops).
-                # N30 FIX: Do not pass volatile last_hill_climb_iterations loop variable
-                record = await asyncio.to_thread(
-                    comparator.close_cycle, active, close_reason
-                )
-
-                if record is None:
-                    # N24 FIX: If close_cycle returns None (e.g. Alpaca API failed), mark DO as INTERRUPTED
-                    logger.warning("close_cycle failed to close %s, marking INTERRUPTED to prevent zombies", active.id)
-                    await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
+            # --- Check if active legacy trade needs closing ---
+            if _legacy_active_do is not None:
+                if isinstance(_legacy_active_do.timestamp_committed, str):
+                    commit_time = datetime.fromisoformat(
+                        _legacy_active_do.timestamp_committed
+                    )
                 else:
-                    # C2 FIX: Capture return value — True only when ML2 beat the baseline.
-                    # Previously the return was discarded and current_phase never updated,
-                    # causing every DecisionObject to be stamped phase='bootstrap' forever.
-                    # All 4 research analyses depend on the phase transition happening.
-                    # B16 FIX: pass current_phase[0] so checkpoint #1 is tagged 'bootstrap'
-                    # (still bootstrap before the if-block below flips it to 'trained').
-                    improved, brier = await asyncio.to_thread(ml2.maybe_retrain, ledger, current_phase[0])
-                    if improved and current_phase[0] == "bootstrap":
-                        current_phase[0] = "trained"
-                        logger.info(
-                            "PHASE TRANSITION: bootstrap → trained | ML2 Brier=%.4f",
-                            brier,
-                        )
+                    commit_time = _legacy_active_do.timestamp_committed
 
-                    # H1 FIX: K-Means re-run trigger on live data.
-                    # Fires at 40+ closed entries, every 10 entries thereafter.
-                    # MUST-HAVE: without this, Stage 1 regime heuristics never improve
-                    # beyond the pre-trained historical model.
-                    closed_count = await asyncio.to_thread(ledger.count_closed)
-                    if closed_count >= 40 and closed_count % 10 == 0:
-                        logger.info(
-                            "K-Means re-run triggered | closed_count=%d", closed_count
+                elapsed_s = (
+                    datetime.now(timezone.utc) - commit_time
+                ).total_seconds()
+
+                if elapsed_s >= STRATEGY_HORIZON_MINUTES * 60:
+                    logger.info(
+                        "legacy_strategy_loop: horizon expired | id=%s",
+                        str(_legacy_active_do.id)[:8],
+                    )
+                    try:
+                        record = await asyncio.to_thread(
+                            comparator.close_cycle,
+                            _legacy_active_do,
+                            "horizon_expired",
                         )
-                        entries = await asyncio.to_thread(
-                            ledger.get_closed_entries_for_regime
+                        if record:
+                            # Feed optimizer with outcome from this legacy trade
+                            # using current optimizer params for this regime
+                            current_params = layer1._optimizer.get_params(
+                                current_regime
+                            )
+                            trade_outcome = TradeOutcome(
+                                meta_params_used=current_params.to_dict(),
+                                regime=current_regime,
+                                predicted_return=0.0,
+                                actual_return=(
+                                    record.actual_pnl / 100000.0
+                                ),
+                                pnl_usd=record.actual_pnl,
+                                causal_chain_held=True,
+                                regime_was_stable=True,
+                            )
+                            await asyncio.to_thread(
+                                layer1._optimizer.update, trade_outcome
+                            )
+                            logger.info(
+                                "legacy_strategy_loop: MetaOptimizer updated | "
+                                "regime=%s pnl=%.2f",
+                                current_regime, record.actual_pnl,
+                            )
+                            # Check if ML2 should retrain
+                            ml2_retrained, ml2_brier = await asyncio.to_thread(
+                                ml2.maybe_retrain, ledger, current_phase[0]
+                            )
+                            if ml2_retrained:
+                                logger.info("ML2 retrained | brier_score=%.4f", ml2_brier or 0.0)
+                                if current_phase[0] == "bootstrap":
+                                    current_phase[0] = "trained"
+                                    logger.info("ML2 transitioned to trained mode")
+                    except Exception as exc:
+                        logger.error(
+                            "legacy_strategy_loop: failed to close | %s", exc
                         )
                         await asyncio.to_thread(
-                            regime_classifier.run_kmeans_and_retrain, entries
+                            ledger.update_status,
+                            str(_legacy_active_do.id),
+                            "INTERRUPTED",
                         )
+                    finally:
+                        _legacy_active_do = None
+
+                await asyncio.sleep(10)
+                continue
+
+            # --- No active trade — evaluate strategies ---
+            for strategy in [ema_strategy, bollinger_strategy, rsi_strategy]:
+                strategy_name = strategy.__class__.__name__
+                tuned_params = strategy.get_default_params()
+                signal = strategy.generate_signal(state, tuned_params)
+
+                if signal not in ("BUY", "CLOSE"):
+                    continue
+
+                logger.info(
+                    "legacy_strategy_loop | %s signal=%s",
+                    strategy_name, signal,
+                )
+
+                assumptions = strategy.get_assumptions(state, tuned_params)
+                assumptions = annotate_proximity(assumptions, state)
+                # Annotate with ML2 breach risk predictor
+                ml1_vector = state.algo_health_vector
+                assumptions = ml2.annotate(
+                    assumptions,
+                    state,
+                    time_horizon=STRATEGY_HORIZON_MINUTES,
+                    ml1_vector=ml1_vector,
+                )
+
+                decision = DecisionObject(
+                    strategy_name=strategy_name,
+                    tuned_params={
+                        "decision_source": f"{strategy_name}_legacy",
+                        **tuned_params,
+                    },
+                    market_state_snapshot=state.model_dump(
+                        mode="json",
+                        exclude={
+                            "algo_health_vector", "last_tick_timestamp",
+                            "active_strategy", "position_size",
+                            "capital_deployed", "timestamp",
+                        },
+                    ),
+                    algo_health_vector=state.algo_health_vector,
+                    assumptions=assumptions,
+                    projected_pnl=strategy.evaluate(state, tuned_params)
+                    * 100000,
+                    confidence=strategy.evaluate(state, tuned_params),
+                    phase=current_phase[0],
+                    hill_climb_iterations=0,
+                    meta_params=None,
+                    causal_chain_snapshot=None,
+                )
+
+                try:
+                    await asyncio.to_thread(ledger.commit, decision)
+                except LedgerWriteError as exc:
+                    logger.error(
+                        "legacy_strategy_loop: commit failed | %s", exc
+                    )
+                    continue
+
+                try:
+                    telemetry = await executor.execute(
+                        signal=signal,
+                        params=tuned_params,
+                        state=state,
+                        decision_object_id=str(decision.id),
+                    )
+                    await asyncio.to_thread(
+                        ledger.update_status, str(decision.id), "ACTIVE"
+                    )
+                    # Feed ML1 with execution telemetry
+                    new_vector = ml1.predict_proba(
+                        telemetry, is_real_order=(signal == "BUY")
+                    )
+                    await state_manager.update_algo_health(new_vector)
+                    # Track this as the active legacy trade
+                    _legacy_active_do = decision
+
+                except Exception as exc:
+                    logger.error(
+                        "legacy_strategy_loop: execution failed | %s", exc
+                    )
+                    await asyncio.to_thread(
+                        ledger.update_status,
+                        str(decision.id),
+                        "EXECUTION_FAILED",
+                    )
+
+                # Only one strategy fires per cycle
+                break
+
+        except Exception as exc:
+            logger.error(
+                "legacy_strategy_loop error: %s", exc, exc_info=True
+            )
+
+        await asyncio.sleep(10)
+# ---------------------------------------------------------------------------
+# Coroutine 4 — Causal Agent Loop (Tasks 10, 11, 13)
+# ---------------------------------------------------------------------------
+
+async def causal_agent_loop(
+    state_manager: CausalStateManager,
+    feature_bar: "FeatureBarBuilder",
+    discovery_engine: "CausalDiscoveryEngine",
+    layer1: "Layer1Tracker",
+    hyp_gen: "HypothesisGenerator",
+    twin_sim: "TwinSimulator",
+    trust_updater: "Layer2TrustUpdater",
+    ledger: LedgerWriter,
+    executor: Executor,
+    comparator: OutcomeComparator,
+    ml1: "ML1BehaviourClassifier",
+    ml2: "ML2BreachPredictor",
+    regime_classifier: "RegimeClassifier",
+    current_phase: list[str],
+) -> None:
+    """Autonomous causal discovery → hypothesis generation → trade execution loop.
+
+    Runs independently from decision_cycle_loop (the legacy arm). These two loops:
+      - Read from the same CausalState (read-only, no lock needed).
+      - Write to the same ledger but tagged decision_source="causal_agent".
+      - Share the executor but have isolated capital pools.
+      - Do NOT share causal graph, hypotheses, or strategy signals.
+
+    Every cycle this loop:
+      1. Checks if FeatureBarBuilder has enough data (60+ bars = ~10 min).
+      2. Refreshes the PCMCI graph every GRAPH_REFRESH_S seconds.
+      3. Records the new graph in Layer 1 stability tracker.
+      4. Generates ranked hypotheses from validated causal chains.
+      5. If best hypothesis score > MIN_TRADE_SCORE: simulate, commit, execute.
+      6. Writes observability JSONL (Task 11).
+      7. Monitors active causal trades for trajectory breach.
+      8. On close: updates Layer 2 trust scores.
+    """
+    import json
+    import time
+    from ml.meta_optimizer import TradeOutcome
+
+    # Observability log (Task 11)
+    obs_log_path = Path("logs/causal_agent.jsonl")
+    obs_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _last_graph_refresh: float = 0.0
+    _current_graph = None
+    _active_hyp = None        # CausalHypothesis for current open trade
+    _active_traj = None       # SimulatedTrajectory for current open trade
+    _active_entry_price: float = 0.0
+    _active_do_id: str | None = None
+    _active_entry_time: float = 0.0
+    _prev_regime: str | None = None
+
+    BAR_POLL_S = 10   # poll every bar width
+
+    logger.info("Causal agent loop started | graph_refresh=%ds", GRAPH_REFRESH_S)
+
+    while not _shutdown.is_set():
+        await asyncio.sleep(BAR_POLL_S)
+
+        try:
+            state = state_manager.snapshot()
+            current_regime = regime_classifier.classify(
+                volatility=state.volatility,
+                spread=state.spread,
+                trend_strength=state.trend_strength,
+                volume=state.volume,
+                trend_slope=state.trend_slope,
+            )
+
+            if current_regime != _prev_regime:
+                logger.info(
+                    "Market Regime Change detected | %s -> %s | Volatility=%.4f, Spread=%.4f, Trend=%.4f",
+                    _prev_regime or "INITIAL", current_regime, state.volatility, state.spread, state.trend_strength
+                )
+                _prev_regime = current_regime
+
+            # --- Step 1: Refresh causal graph every GRAPH_REFRESH_S ---
+            now = time.monotonic()
+            if (now - _last_graph_refresh) >= GRAPH_REFRESH_S:
+                if feature_bar.is_ready():
+                    try:
+                        matrix, var_names = feature_bar.get_feature_matrix()
                         logger.info(
-                            "K-Means re-run complete — Stage 1 updated | entries=%d",
-                            len(entries),
+                            "CausalAgent: running PCMCI | bars=%d vars=%d",
+                            matrix.shape[0], matrix.shape[1],
                         )
-            except Exception as exc:  # noqa: BLE001
-                # N24 FIX: Prevent zombie DOs on exception
-                logger.error("Decision cycle crash prevented | close failed | %s", exc)
-                await asyncio.to_thread(ledger.update_status, str(active.id), "INTERRUPTED")
+                        _current_graph = await asyncio.to_thread(
+                            discovery_engine.run, matrix, var_names
+                        )
+                        await asyncio.to_thread(layer1.record_run, _current_graph, current_regime)
+                        _last_graph_refresh = now
+                        logger.info(
+                            "CausalAgent: graph refreshed | %s", _current_graph.summary()
+                        )
+                    except ValueError as exc:
+                        logger.debug("CausalAgent: not enough bars yet — %s", exc)
+                else:
+                    n = feature_bar.n_bars_ready()
+                    logger.info(
+                        "[ML1 Feature Store] Warm-up progress: %d/60 bars (Granger ready: %d/40) | Features: vol=%.4f, spread=%.4f, trend=%.4f",
+                        n, n, state.volatility, state.spread, state.trend_strength
+                    )
 
-        state = state_manager.snapshot()
+            # --- Step 2: Monitor active causal trade for trajectory breach ---
+            if _active_hyp and _active_traj and _active_do_id:
+                elapsed = int(time.monotonic() - _active_entry_time)
+                if state.price > 0 and _active_entry_price > 0:
+                    actual_return = (state.price - _active_entry_price) / _active_entry_price
+                    is_breach = twin_sim.check_breach(_active_traj, actual_return, elapsed)
+                    if is_breach:
+                        logger.warning(
+                            "CausalAgent: trajectory breach detected | id=%s | elapsed=%ds",
+                            _active_do_id[:8], elapsed,
+                        )
+                        # Close the trade — record outcome and update Layer 2
+                        try:
+                            active_do = await asyncio.to_thread(
+                                ledger.get_decision_object, _active_do_id
+                            )
+                            if active_do:
+                                record = await asyncio.to_thread(
+                                    comparator.close_cycle, active_do, "assumption_breach", _current_graph
+                                )
+                                if record and _active_hyp:
+                                    outcome_correct = (
+                                        (_active_hyp.predicted_direction == "up" and actual_return > 0)
+                                        or (_active_hyp.predicted_direction == "down" and actual_return < 0)
+                                    )
+                                    await asyncio.to_thread(
+                                        trust_updater.update,
+                                        _active_hyp,
+                                        outcome_correct,
+                                        actual_return,
+                                        _active_traj.predicted_price_return,
+                                    )
+                                    # Update MetaParameterOptimizer
+                                    trade_outcome = TradeOutcome(
+                                        meta_params_used=active_do.meta_params or {},
+                                        regime=current_regime,
+                                        predicted_return=_active_traj.predicted_price_return,
+                                        actual_return=actual_return,
+                                        pnl_usd=record.actual_pnl,
+                                        causal_chain_held=False,
+                                        regime_was_stable=True,
+                                    )
+                                    await asyncio.to_thread(layer1._optimizer.update, trade_outcome)
+                                    # Check if ML2 should retrain
+                                    ml2_retrained, ml2_brier = await asyncio.to_thread(
+                                        ml2.maybe_retrain, ledger, current_phase[0]
+                                    )
+                                    if ml2_retrained:
+                                        logger.info("ML2 retrained | brier_score=%.4f", ml2_brier or 0.0)
+                                        if current_phase[0] == "bootstrap":
+                                            current_phase[0] = "trained"
+                                            logger.info("ML2 transitioned to trained mode")
+                        except Exception as exc:
+                            logger.error("CausalAgent: failed to close breach trade | %s", exc)
+                        finally:
+                            _active_hyp = None
+                            _active_traj = None
+                            _active_do_id = None
+                            _active_entry_price = 0.0
+                            _active_entry_time = 0.0
 
-        # Stage 1 + Stage 2
-        sim_result = simulator.run(state)
+                # Check mathematical horizon expiry for causal agent trades
+                if _active_traj and elapsed >= _active_traj.time_horizon_s:
+                    logger.info(
+                        "CausalAgent: horizon expired | id=%s | elapsed=%ds | target=%ds",
+                        _active_do_id[:8] if _active_do_id else "?", elapsed, _active_traj.time_horizon_s,
+                    )
+                    try:
+                        active_do = await asyncio.to_thread(
+                            ledger.get_decision_object, _active_do_id
+                        )
+                        if active_do:
+                            actual_return = (
+                                (state.price - _active_entry_price) / _active_entry_price
+                                if _active_entry_price > 0 else 0.0
+                            )
+                            record = await asyncio.to_thread(
+                                comparator.close_cycle, active_do, "horizon_expired", _current_graph
+                            )
+                            if record and _active_hyp:
+                                outcome_correct = (
+                                    (_active_hyp.predicted_direction == "up" and actual_return > 0)
+                                    or (_active_hyp.predicted_direction == "down" and actual_return < 0)
+                                )
+                                await asyncio.to_thread(
+                                    trust_updater.update,
+                                    _active_hyp,
+                                    outcome_correct,
+                                    actual_return,
+                                    _active_traj.predicted_price_return if _active_traj else 0.0,
+                                )
+                                # Update MetaParameterOptimizer
+                                trade_outcome = TradeOutcome(
+                                    meta_params_used=active_do.meta_params or {},
+                                    regime=current_regime,
+                                    predicted_return=_active_traj.predicted_price_return if _active_traj else 0.0,
+                                    actual_return=actual_return,
+                                    pnl_usd=record.actual_pnl,
+                                    causal_chain_held=True,
+                                    regime_was_stable=True,
+                                )
+                                await asyncio.to_thread(layer1._optimizer.update, trade_outcome)
+                                # Check if ML2 should retrain
+                                ml2_retrained, ml2_brier = await asyncio.to_thread(
+                                    ml2.maybe_retrain, ledger, current_phase[0]
+                                )
+                                if ml2_retrained:
+                                    logger.info("ML2 retrained | brier_score=%.4f", ml2_brier or 0.0)
+                                    if current_phase[0] == "bootstrap":
+                                        current_phase[0] = "trained"
+                                        logger.info("ML2 transitioned to trained mode")
+                    except Exception as exc:
+                        logger.error("CausalAgent: failed to close horizon trade | %s", exc)
+                    finally:
+                        _active_hyp = None
+                        _active_traj = None
+                        _active_do_id = None
+                        _active_entry_price = 0.0
+                        _active_entry_time = 0.0
 
-        # Step 1: Populate current_value and proximity from live state FIRST.
-        # CRITICAL ORDER: ML2 bootstrap mode uses assumption.proximity as the breach_risk
-        # score. If proximity is still 0.0 (the Pydantic default), every bootstrap
-        # annotation returns breach_risk=0.0 — corrupting all bootstrap training data.
-        # Proximity MUST be set before ml2.annotate() is called.
-        #
-        # S3-3: annotate_proximity() is imported from core/decision_utils.py — the
-        # single source of truth. The H4 SLOPE_NORMALISER special case for
-        # threshold=0.0 + operator='gt' lives there, not in each strategy.
-        proximity_annotated = annotate_proximity(sim_result.assumptions, state)
-        sim_result = sim_result.model_copy(update={"assumptions": proximity_annotated})
+            # --- Step 3: Skip new trade if already in position ---
+            if _active_do_id:
+                continue
 
-        # Step 2: ML2 annotates with breach_risk (now sees correct proximity values).
-        ml1_vector = state.algo_health_vector
-        annotated_assumptions = ml2.annotate(
-            sim_result.assumptions,
-            state,
-            time_horizon=STRATEGY_HORIZON_MINUTES,
-            ml1_vector=ml1_vector,
-        )
-        # annotate() returns a new list (Assumption is frozen) — replace via model_copy
-        sim_result = sim_result.model_copy(update={"assumptions": annotated_assumptions})
+            # --- Step 4: Generate hypotheses from current graph ---
+            if _current_graph is None:
+                _obs_write(obs_log_path, state, None, [], None, "no_graph_yet")
+                continue
 
-        # Build and COMMIT the DecisionObject — BEFORE any actuation
-        do = DecisionObject(
-            strategy_name=sim_result.strategy_name,
-            tuned_params=sim_result.tuned_params,
-            market_state_snapshot=state.model_dump(
+            params = layer1._optimizer.get_params(current_regime)
+            logger.info(
+                "Causal Agent evaluating hypotheses | regime=%s | Active Params: k_runs=%d, min_runs=%d, threshold=%.2f",
+                current_regime, params.k_runs, params.min_runs, params.threshold
+            )
+
+            hypotheses = await asyncio.to_thread(hyp_gen.generate, _current_graph, current_regime)
+            
+            if not hypotheses:
+                continue
+
+            best_hyp = hypotheses[0]
+
+            if best_hyp is None or (best_hyp.composite_score < MIN_TRADE_SCORE and not best_hyp.is_escape_valve):
+                score_str = f"{best_hyp.composite_score:.4f}" if best_hyp else "none"
+                _obs_write(obs_log_path, state, _current_graph, hypotheses, None,
+                           f"score_too_low:{score_str}")
+                continue
+
+            # --- Step 5: Simulate — pick best hypothesis ---
+            # Thread-safe: use get_feature_matrix() which acquires the lock,
+            # rather than directly accessing feature_bar._bars (race with tick ingestion).
+            try:
+                matrix, var_names = feature_bar.get_feature_matrix()
+                latest_bar = matrix[-1].tolist()
+                current_state_dict = dict(zip(var_names, latest_bar))
+                logger.debug(
+                    "CausalAgent: current_state_dict keys=%s",
+                    list(current_state_dict.keys()),
+                )
+            except ValueError:
+                # Not enough bars ready yet — skip this cycle
+                continue
+            selected_hyp, trajectory = twin_sim.select_best(
+                hypotheses, _current_graph, current_state_dict
+            )
+
+            if selected_hyp is None or trajectory is None:
+                _obs_write(obs_log_path, state, _current_graph, hypotheses, selected_hyp,
+                           "zero_expected_value")
+                continue
+
+            # --- Step 6: Commit Decision Object ---
+            trade_signal = "BUY" if selected_hyp.predicted_direction == "up" else "CLOSE"
+
+            # Represent the causal chain as the "assumptions" for ledger compatibility
+            from core.schemas import Assumption
+            causal_assumptions = []
+            for edge in selected_hyp.chain[:3]:
+                causal_assumptions.append(Assumption(
+                    name=f"causal_edge|{edge.source}|{edge.target}|{edge.lag}",
+                    variable="volatility",  # use a valid CausalStateField as sentinel
+                    operator="lt",
+                    threshold=1.0,
+                    current_value=edge.coeff,
+                    proximity=round(1.0 - abs(edge.coeff), 4),
+                    breach_risk=1.0 - selected_hyp.layer2_score,
+                ))
+            # Pad to exactly 3 assumptions to satisfy legacy database formats and plotting tools
+            padding_idx = 1
+            while len(causal_assumptions) < 3:
+                causal_assumptions.append(Assumption(
+                    name=f"causal_edge_padding|{padding_idx}",
+                    variable="volatility",
+                    operator="lt",
+                    threshold=1.0,
+                    current_value=0.0,
+                    proximity=0.0,
+                    breach_risk=0.0,
+                ))
+                padding_idx += 1
+
+            # Annotate with ML2 breach risk predictor
+            ml1_vector = state.algo_health_vector
+            causal_assumptions = ml2.annotate(
+                causal_assumptions,
+                state,
+                time_horizon=selected_hyp.time_horizon_seconds / 60.0,
+                ml1_vector=ml1_vector,
+            )
+
+            do = DecisionObject(
+                strategy_name="CausalAgent",
+                tuned_params={
+                    "hypothesis_id": selected_hyp.id,
+                    "graph_version_id": selected_hyp.graph_version_id,
+                    "chain_summary": selected_hyp.chain_summary(),
+                    "predicted_direction": selected_hyp.predicted_direction,
+                    "predicted_magnitude": selected_hyp.predicted_magnitude,
+                    "time_horizon_seconds": selected_hyp.time_horizon_seconds,
+                    "layer1_score": selected_hyp.layer1_score,
+                    "layer2_score": selected_hyp.layer2_score,
+                    "composite_score": selected_hyp.composite_score,
+                    "decision_source": "causal_agent",
+                    "capital_allocated": CAPITAL_CAUSAL_AGENT,
+                },
+                market_state_snapshot=state.model_dump(
                     mode="json",
                     exclude={
-                        "algo_health_vector",   # stored separately in the DO
-                        "last_tick_timestamp",  # not a market signal
-                        "active_strategy",      # operational field — string breaks numeric feature iteration
-                        "position_size",        # operational field
-                        "capital_deployed",     # operational field
-                        "timestamp",            # ISO string — breaks float() iteration in Week 9 feature matrix
+                        "algo_health_vector", "last_tick_timestamp",
+                        "active_strategy", "position_size",
+                        "capital_deployed", "timestamp",
                     },
                 ),
-            algo_health_vector=ml1_vector,
-            assumptions=sim_result.assumptions,
-            projected_pnl=sim_result.projected_pnl,
-            confidence=sim_result.confidence,
-            hill_climb_iterations=sim_result.hill_climb_iterations,
-            phase=current_phase[0],
-        )
-        # S3-5: Warn when projected_pnl <= 0.0 — extreme market or no viable signal.
-        # Cycle is valid (records that the system observed the state) but generate_signal()
-        # will likely return HOLD. Identifiable in Week 9 analysis by this WARNING tag.
-        if sim_result.projected_pnl <= 0.0:
-            logger.warning(
-                "Committing DO with projected_pnl=%.4f | strategy=%s "
-                "— extreme market condition or no viable signal. HOLD expected.",
-                sim_result.projected_pnl, sim_result.strategy_name,
+                algo_health_vector=state.algo_health_vector,
+                assumptions=causal_assumptions,
+                projected_pnl=float(trajectory.predicted_price_return * CAPITAL_CAUSAL_AGENT),
+                confidence=selected_hyp.composite_score,
+                hill_climb_iterations=0,  # causal agent doesn't hill-climb
+                phase=current_phase[0],  # will upgrade later when Layer 2 matures
+                meta_params=layer1._optimizer.get_params(current_regime).to_dict(),
+                causal_chain_snapshot={"chain": [e.to_dict() for e in selected_hyp.chain]},
             )
 
+            try:
+                await asyncio.to_thread(ledger.commit, do)
+                logger.info(
+                    "CausalAgent Trade Intent: %s | expected_return=%+.4f%% | chain: %s | capital=$%d",
+                    trade_signal,
+                    trajectory.predicted_price_return * 100,
+                    selected_hyp.chain_summary(),
+                    CAPITAL_CAUSAL_AGENT,
+                )
+            except LedgerWriteError as exc:
+                logger.error("CausalAgent: ledger commit failed | %s", exc)
+                _obs_write(obs_log_path, state, _current_graph, hypotheses, selected_hyp,
+                           f"ledger_commit_failed:{exc}")
+                continue
 
-        try:
-            # K3 FIX: commit is synchronous SQLite I/O — run in thread
-            await asyncio.to_thread(ledger.commit, do)
-        except LedgerWriteError as exc:
-            logger.error("Ledger commit failed — actuation aborted | %s", exc)
-            continue
+            # --- Step 7: Execute ---
+            try:
+                # Detect escape valve trade
+                is_escape_valve = selected_hyp.is_escape_valve
+                position_fraction = 0.01 if is_escape_valve else 0.10
 
-        # Actuate — ONLY after successful ledger commit
-        strategy = strategy_map.get(sim_result.strategy_name)
-        if strategy is None:
-            logger.error(
-                "Unknown strategy '%s' — skipping actuation", sim_result.strategy_name
-            )
-            continue
-        signal = strategy.generate_signal(state, sim_result.tuned_params)
+                if is_escape_valve:
+                    logger.warning(
+                        "CausalAgent: escape valve trade | "
+                        "chain=%s | position capped at 1%% of normal",
+                        selected_hyp.chain_summary(),
+                    )
 
-        # D6 FIX: compute qty once here so execute() re-uses it, avoiding
-        # a redundant Alpaca get_account() REST call per BUY cycle.
-        intended_qty = await executor._compute_quantity(sim_result.tuned_params, state) if signal == "BUY" else 0.0
+                # Use position_fraction when calling executor
+                telemetry = await executor.execute(
+                    signal=trade_signal,
+                    params={"position_fraction": position_fraction},
+                    state=state,
+                    decision_object_id=str(do.id),
+                )
+                _active_hyp = selected_hyp
+                _active_traj = trajectory
+                _active_do_id = str(do.id)
+                _active_entry_price = state.price
+                _active_entry_time = time.monotonic()
+                # Update ML1 with fresh telemetry — only real orders carry meaningful signal.
+                new_vector = ml1.predict_proba(telemetry, is_real_order=(trade_signal == "BUY"))
+                await state_manager.update_algo_health(new_vector)
 
-        try:
-            telemetry = await executor.execute(
-                signal=signal,
-                params=sim_result.tuned_params,
-                state=state,
-                decision_object_id=str(do.id),
-                precomputed_qty=intended_qty if signal == "BUY" else None,
-            )
+                await asyncio.to_thread(ledger.update_status, str(do.id), "ACTIVE")
+                logger.info(
+                    "CausalAgent: trade ACTIVE | id=%s signal=%s price=%.4f",
+                    str(do.id)[:8], trade_signal, state.price,
+                )
+
+                # Check if ML1 should retrain
+                ml1_retrained, ml1_oob = await asyncio.to_thread(ml1.maybe_retrain)
+                if ml1_retrained:
+                    logger.info("ML1 retrained | oob_accuracy=%.4f", ml1_oob or 0.0)
+                    await asyncio.to_thread(
+                        ledger.save_checkpoint,
+                        checkpoint_number=ml1.checkpoint_count,
+                        phase="bootstrap",
+                        ml2_brier_score=0.0,
+                        training_sample_count=ml1.last_sample_count,
+                        ml1_macro_f1=ml1_oob,
+                    )
+            except Exception as exc:
+                logger.error("CausalAgent: execution failed | %s | marking EXECUTION_FAILED", exc)
+                await asyncio.to_thread(ledger.update_status, str(do.id), "EXECUTION_FAILED")
+
+            # Observability log
+            _obs_write(obs_log_path, state, _current_graph, hypotheses, selected_hyp, "traded")
+
         except Exception as exc:  # noqa: BLE001
-            # N5 FIX: executor failure after a successful commit leaves the DO in
-            # COMMITTED status forever, blocking every future decision cycle.
-            # Mark it EXECUTION_FAILED so get_active() returns None next cycle.
-            logger.error(
-                "Executor failed — marking DO as EXECUTION_FAILED | id=%s | %s",
-                do.id, exc,
-            )
-            await asyncio.to_thread(
-                ledger.update_status, str(do.id), "EXECUTION_FAILED"
-            )
-            continue
+            logger.error("CausalAgent: unhandled error in loop | %s", exc, exc_info=True)
 
-        # N19 FIX: Record actual exposure into CausalState.
-        # intended_qty already computed above — no second REST call needed.
-        actual_qty = intended_qty * (1 + telemetry.position_size_deviation)
-        await state_manager.update_position(actual_qty, actual_qty * state.price)
+    logger.info("Causal agent loop exited cleanly")
 
-        # Update ML1 with fresh telemetry — only real orders carry meaningful signal.
-        # HOLD/SELL telemetry is synthetic and would poison the sample buffer.
-        new_vector = ml1.predict_proba(telemetry, is_real_order=(signal == "BUY"))
-        await state_manager.update_algo_health(new_vector)
 
-        # N22 FIX: Mark the object as ACTIVE only after the Alpaca order has successfully filled
-        await asyncio.to_thread(ledger.update_status, str(do.id), "ACTIVE")
-
-        # Check if ML1 should retrain
-        # S-3 FIX: maybe_retrain() now returns (retrained, oob_score) so we log a DB
-        # checkpoint. Without this, Week 9 ML1 ablation analysis cannot determine WHEN
-        # ML1 transitioned from bootstrap to trained, or what its accuracy was.
-        ml1_retrained, ml1_oob = await asyncio.to_thread(ml1.maybe_retrain)
-        if ml1_retrained:
-            logger.info("ML1 retrained | oob_accuracy=%.4f", ml1_oob or 0.0)
-            await asyncio.to_thread(
-                ledger.save_checkpoint,
-                checkpoint_number=ml1.checkpoint_count,
-                phase=current_phase[0],
-                ml2_brier_score=0.0,          # N/A for ML1 checkpoints
-                training_sample_count=ml1.last_sample_count,
-                ml1_macro_f1=ml1_oob,
-            )
-
-        # Spawn time horizon watcher for this new decision
-        active_watcher_task = asyncio.create_task(
-            time_horizon_watcher(str(do.id), STRATEGY_HORIZON_MINUTES, decision_queue)
-        )
+def _obs_write(
+    path: Path,
+    state,
+    graph,
+    hypotheses: list,
+    selected,
+    hold_reason: str,
+) -> None:
+    """Append one JSONL record to the causal agent observability log (Task 11)."""
+    import json
+    try:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "price": state.price,
+            "volatility": round(state.volatility, 6),
+            "spread": round(state.spread, 6),
+            "rsi": round(state.rsi_current, 2),
+            "hold_reason": hold_reason,
+            "graph_edges": len(graph.edges) if graph else 0,
+            "graph_version": graph.version_id[:8] if graph else None,
+            "n_hypotheses": len(hypotheses),
+            "best_score": round(hypotheses[0].composite_score, 6) if hypotheses else 0.0,
+            "selected_chain": selected.chain_summary() if selected else None,
+            "predicted_direction": selected.predicted_direction if selected else None,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # observability log failure must never crash the agent
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +845,48 @@ async def main() -> None:
     strategies = [EMAStrategy(), BollingerStrategy(), RSIStrategy()]
     simulator = Simulator(strategies=strategies, regime_classifier=regime)  # N25 FIX: pass wrapper, not raw model
 
-    feed = BinanceFeed(state_manager=state_manager)
+    # --- Causal agent components (Task 10/13) ---
+    db_path = os.getenv("SQLITE_PATH", "data/arivu.db")
+    feature_bar = FeatureBarBuilder(regime_classifier=regime)
+    discovery_engine = CausalDiscoveryEngine(db_path=db_path)
+    layer1 = Layer1Tracker(db_path=db_path)
+    trust_updater = Layer2TrustUpdater(db_path=db_path)
+    twin_sim = TwinSimulator()
+    hyp_gen = HypothesisGenerator(layer1=layer1, layer2_store=trust_updater)
+    logger.info(
+        "Causal agent initialised | graph_refresh=%ds | capital=$%.0f",
+        GRAPH_REFRESH_S, CAPITAL_CAUSAL_AGENT,
+    )
+
+    feed = BinanceFeed(state_manager=state_manager, feature_bar_builder=feature_bar)
     current_phase: list[str] = ["bootstrap"]
 
+
     logger.info("Causal state initialised | phase=%s", current_phase[0])
+
+    # --- Startup cleanup ---
+    # Mark any leftover ACTIVE or COMMITTED trades as INTERRUPTED
+    await asyncio.to_thread(ledger.cleanup_stale_trades)
+    
+    # Cancel all open Alpaca orders
+    try:
+        open_orders = await asyncio.to_thread(executor._api.list_orders, status="open")
+        for o in open_orders:
+            try:
+                await asyncio.to_thread(executor._api.cancel_order, o.id)
+            except Exception:
+                pass
+        logger.info("Startup: cancelled %d open orders", len(open_orders))
+    except Exception as exc:
+        logger.warning("Startup: could not cancel open orders | %s", exc)
+    
+    # Close any open Alpaca position
+    try:
+        await asyncio.to_thread(executor._api.close_position, "SOLUSD")
+        logger.info("Startup: closed open Alpaca position")
+    except Exception as exc:
+        if "position does not exist" not in str(exc).lower():
+            logger.warning("Startup: could not close position | %s", exc)
 
     # Graceful shutdown handler
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -469,17 +899,20 @@ async def main() -> None:
         results = await asyncio.gather(
             market_feed_loop(feed, state_manager),
             assumption_monitor_loop(state_manager, ledger, decision_queue, _shutdown),
-            decision_cycle_loop(
-                decision_queue, state_manager,
-                simulator, ml1, ml2, ledger, executor, comparator,
-                current_phase, regime,
+            legacy_strategy_loop(
+                state_manager, ledger, executor, comparator, ml1, ml2, layer1, regime, current_phase
+            ),
+            causal_agent_loop(
+                state_manager, feature_bar, discovery_engine,
+                layer1, hyp_gen, twin_sim, trust_updater,
+                ledger, executor, comparator, ml1, ml2, regime, current_phase,
             ),
             _shutdown_watcher(feed),
             return_exceptions=True,
         )
         coroutine_names = [
             "market_feed_loop", "assumption_monitor_loop",
-            "decision_cycle_loop", "_shutdown_watcher",
+            "legacy_strategy_loop", "causal_agent_loop", "_shutdown_watcher",
         ]
         for name, result in zip(coroutine_names, results):
             if isinstance(result, Exception):

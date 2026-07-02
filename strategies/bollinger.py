@@ -53,21 +53,23 @@ class BollingerStrategy(Strategy):
     """Volatility-Banded Mean Reversion using Bollinger Bands."""
 
     def __init__(self) -> None:
-        # Instance-level state — NOT module-level.
-        # Module-level lists are shared and corrupted by evaluate() during hill-climbing.
-        self._price_history: list[float] = []
         self._candles_since_buy: int = 0
 
     def generate_signal(self, state: CausalState, params: dict) -> str:
-        self._price_history.append(state.price)
-        if len(self._price_history) > MAX_HISTORY:
-            self._price_history.pop(0)
+        """Bollinger mean-reversion signal — state-based (§10.2 HOLD-trap fix).
 
+        BUY:  price is currently below the lower band (oversold state).
+        SELL: price is currently above the middle band (reversion complete state).
+
+        FORMER BUG (SELL): checked for exact moment of crossing middle band
+          (closes[-1] > middle[-1] AND closes[-2] <= middle[-2]).
+          This is event-based — misses the signal unless sampled at that exact tick.
+        """
         period = params.get("baseline_period", 20)
-        if len(self._price_history) < period + 1:
+        if len(state.price_history) < period + 1:
             return "HOLD"
 
-        closes = pd.Series(self._price_history)
+        closes = pd.Series(state.price_history)
         middle = ta.sma(closes, length=period)
         std = closes.rolling(period).std()
         mult = params.get("std_dev_multiplier", 2.0)
@@ -75,20 +77,23 @@ class BollingerStrategy(Strategy):
         if middle is None or std is None:
             return "HOLD"
 
-        lower = middle - mult * std
-        self._candles_since_buy += 1
+        last_close = closes.iloc[-1]
+        last_middle = middle.iloc[-1]
+        last_lower = (middle - mult * std).iloc[-1]
 
-        if closes.iloc[-1] < lower.iloc[-1]:
-            self._candles_since_buy = 0
+        if pd.isna(last_middle) or pd.isna(last_lower):
+            return "HOLD"
+
+        # BUY: currently below lower band (already state-based — preserved)
+        if last_close < last_lower:
             return "BUY"
 
-        if (
-            closes.iloc[-1] > middle.iloc[-1]
-            and closes.iloc[-2] <= middle.iloc[-2]
-        ):
-            return "SELL"
+        # SELL: currently above middle band (state-based fix)
+        if last_close > last_middle:
+            return "CLOSE"
 
         return "HOLD"
+
 
     def get_assumptions(self, state: CausalState, params: dict) -> list[Assumption]:
         """Return exactly 3 assumptions for the Bollinger strategy.

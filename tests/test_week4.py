@@ -37,12 +37,15 @@ def make_state(
     volume: float = 1000.0,
     rsi_current: float = 50.0,
     divergence_candle_span: float = 3.5,
+    price_history: list[float] | None = None,
 ) -> CausalState:
     """Build a CausalState for testing.
 
     CausalState is frozen=True — cannot set attributes after creation.
     All values default to a "trending SOLUSDT market" profile.
     """
+    if price_history is None:
+        price_history = []
     return CausalState(
         price=price,
         volatility=volatility,
@@ -52,6 +55,7 @@ def make_state(
         volume=volume,
         rsi_current=rsi_current,
         divergence_candle_span=divergence_candle_span,
+        price_history=price_history,
     )
 
 
@@ -198,25 +202,24 @@ def test_rsi_divergence_span_default_above_threshold():
 def test_evaluate_is_pure_no_mutation():
     """Hill-climbing calls evaluate() up to 100× per cycle.
 
-    If evaluate() mutates _price_history, duplicate prices destroy the
+    If evaluate() mutates state.price_history, duplicate prices destroy the
     EMA crossover signal permanently after the first cycle.
     """
     strategy = EMAStrategy()
     # Seed price history with realistic values
-    for price in range(100, 160):
-        strategy._price_history.append(float(price))
+    initial_history = [float(price) for price in range(100, 160)]
 
-    history_before = list(strategy._price_history)
-    state = make_state(price=160.0, trend_strength=0.7)
+    history_before = list(initial_history)
+    state = make_state(price=160.0, trend_strength=0.7, price_history=initial_history)
     params = strategy.get_default_params()
 
     # Call evaluate() 10 times, as Hill-climbing would
     scores = [strategy.evaluate(state, params) for _ in range(10)]
 
-    history_after = list(strategy._price_history)
+    history_after = list(state.price_history)
 
     assert history_before == history_after, (
-        f"FAIL: evaluate() mutated _price_history. "
+        f"FAIL: evaluate() mutated state.price_history. "
         f"Before length: {len(history_before)}, after: {len(history_after)}"
     )
     assert len(set(scores)) == 1, (

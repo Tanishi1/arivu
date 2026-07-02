@@ -36,3 +36,9 @@ Thumbs.db
 
 # Evaluation output
 evaluation/plots/
+
+# SQLite temporary files, additional logs, backups, scratch
+data/arivu.db*
+logs/*.jsonl
+backup_*
+scratch/

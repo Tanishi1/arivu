@@ -39,9 +39,9 @@ def fresh_db(tmp_path, monkeypatch):
     yield
 
 
-def _make_decision_object(phase="bootstrap") -> DecisionObject:
+def _make_decision_object(phase="bootstrap", strategy_name="EMAStrategy") -> DecisionObject:
     return DecisionObject(
-        strategy_name="EMAStrategy",
+        strategy_name=strategy_name,
         tuned_params={"fast_period": 9, "slow_period": 21, "position_fraction": 0.10},
         market_state_snapshot={"volatility": 0.02, "spread": 0.001, "trend_strength": 0.7},
         algo_health_vector=[0.8, 0.15, 0.05],
@@ -147,7 +147,7 @@ def test_close_creates_outcome():
 def test_only_one_active():
     """get_active() should return the committed DecisionObject."""
     writer = LedgerWriter()
-    do = _make_decision_object()
+    do = _make_decision_object(strategy_name="CausalAgent")
     writer.commit(do)
 
     active = writer.get_active()

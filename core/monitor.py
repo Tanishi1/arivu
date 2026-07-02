@@ -110,10 +110,12 @@ async def assumption_monitor_loop(
             logger.debug("Monitor | no active DecisionObject")
             continue
 
-        # N22 FIX: Prevent monitoring before Alpaca limit order finishes filling
         if active.status == "COMMITTED":
             logger.debug("Monitor | object still COMMITTED, waiting for execution")
             continue
+
+        if active.causal_chain_snapshot is None:
+            continue  # legacy trade, no causal assumptions to monitor
 
         state = state_manager.snapshot()
         now_iso = datetime.now(timezone.utc).isoformat()

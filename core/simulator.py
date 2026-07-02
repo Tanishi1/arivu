@@ -33,6 +33,7 @@ MAX_HILL_CLIMB_ITERATIONS = 20
 # making Research Metric 3 uninformative.
 HILL_CLIMB_RESTART_THRESHOLD = 0.15
 HILL_CLIMB_RANDOM_RESTARTS = 2
+DEFAULT_CAPITAL_ALLOCATION = 10000.0  # USD baseline for projected_pnl scaling
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +275,9 @@ class Simulator:
         assumptions = best_strategy.get_assumptions(state, tuned_params)
 
         # projected_pnl from evaluate() on tuned params
-        projected_pnl = best_strategy.evaluate(state, tuned_params)
+        # Fix 6: Convert heuristic score [0, 1] to expected dollar PnL
+        heuristic_expected_return = best_strategy.evaluate(state, tuned_params)
+        projected_pnl = heuristic_expected_return * DEFAULT_CAPITAL_ALLOCATION
 
         return SimulatorResult(
             strategy_name=best_name,

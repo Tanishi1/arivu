@@ -74,6 +74,8 @@ class DecisionObjectRow(Base):
     status = Column(String, nullable=False, default="COMMITTED")
     phase = Column(String, nullable=False, default="bootstrap")
     hill_climb_iterations = Column(Integer, nullable=False, default=0)
+    meta_params = Column(Text, nullable=True)                           # JSON dict (causal agent only)
+    causal_chain_snapshot = Column(Text, nullable=True)                 # JSON (causal agent only)
     schema_version = Column(Integer, nullable=False, default=1)
 
     # Breach log — JSON dict {assumption_name: iso_timestamp}
@@ -144,3 +146,26 @@ Index("idx_mc_phase", ModelCheckpointRow.phase)
 def init_db() -> None:
     """Create all tables and indexes if they do not exist."""
     Base.metadata.create_all(engine)
+    _migrate_db()
+
+
+def _migrate_db() -> None:
+    """Add new columns to existing tables (safe no-op if already present).
+
+    SQLAlchemy create_all() only creates missing TABLES, not missing COLUMNS.
+    Any column added after the initial schema creation must be manually migrated.
+    This function runs ALTER TABLE ... ADD COLUMN with a try/except so it is
+    safe to call on every startup — it silently skips columns that already exist.
+    """
+    from sqlalchemy import text
+    migrations = [
+        "ALTER TABLE decision_objects ADD COLUMN meta_params TEXT",
+        "ALTER TABLE decision_objects ADD COLUMN causal_chain_snapshot TEXT",
+    ]
+    with engine.connect() as conn:
+        for stmt in migrations:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # Column already exists — ignore

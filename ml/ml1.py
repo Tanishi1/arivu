@@ -11,9 +11,15 @@ The vector flows INTO:
   - DecisionObject (captured at commit time)
 
 Bootstrap mode (< 100 execution telemetry samples):
-  latency > 5000ms  → [0.0, 0.0, 1.0]  (degraded)
-  latency > 2000ms  → [0.0, 1.0, 0.0]  (stressed)
+  latency >= 3500ms → [0.0, 0.0, 1.0]  (degraded)
+  latency >= 2800ms → [0.0, 1.0, 0.0]  (stressed)
   otherwise         → [1.0, 0.0, 0.0]  (normal)
+
+  Thresholds calibrated to Alpaca paper trading baseline:
+  The executor places a limit order then polls every 2s, so every order
+  has a minimum latency of ~2700ms. The old thresholds (5000/2000) put
+  every single order into the 'stressed' bucket, making the buffer
+  always single-class and permanently blocking RF training.
 
 Trained mode (>= 100 samples):
   RandomForestClassifier trained on real ExecutionTelemetry data.
@@ -33,11 +39,14 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 from core.schemas import ExecutionTelemetry
+from core.constants import ML1_RETRAIN_AFTER
 
 logger = logging.getLogger(__name__)
 
 ML1_MODEL_PATH = Path("data/models/ml1.joblib")
-RETRAIN_THRESHOLD = 100   # number of telemetry samples before first real train
+ML1_BUFFER_PATH = Path("data/models/ml1_buffer.json")  # persisted sample buffer
+TELEMETRY_LOG_PATH = Path("data/telemetry_log.csv")    # human-readable log of all telemetry
+RETRAIN_THRESHOLD = ML1_RETRAIN_AFTER  # single source of truth: core/constants.py
 CLASSES = ["normal", "stressed", "degraded"]
 
 
@@ -55,6 +64,7 @@ class ML1BehaviourClassifier:
         self._checkpoint_count = 0
         self._last_sample_count = 0  # S-3: sample count at last retrain, for DB checkpoint
         self._load_model_if_exists()
+        self._load_buffer()  # restore in-progress buffer from previous run
 
     @property
     def checkpoint_count(self) -> int:
@@ -89,6 +99,7 @@ class ML1BehaviourClassifier:
         # Only real BUY orders produce meaningful telemetry for ML1 training.
         if is_real_order:
             self._sample_buffer.append(self._to_features(telemetry))
+            self._save_buffer()  # persist so buffer survives restarts
 
         if not self._is_trained:
             return self._bootstrap_predict(telemetry)
@@ -117,11 +128,17 @@ class ML1BehaviourClassifier:
 
         labels = [self._bootstrap_label(s) for s in self._sample_buffer]
         if len(set(labels)) < 2:
-            logger.warning("ML1 retrain skipped | fewer than 2 classes in buffer")
-            # Clear buffer to prevent unbounded growth and stale data contamination.
-            # Without this, the buffer grows past RETRAIN_THRESHOLD and is re-evaluated
-            # every single cycle without ever successfully retraining.
-            self._sample_buffer.clear()
+            logger.warning(
+                "ML1 retrain skipped | only 1 class in buffer ('%s') | "
+                "samples=%d | check threshold calibration vs. actual latency distribution",
+                list(set(labels))[0], len(self._sample_buffer),
+            )
+            # Drop the oldest 20% of samples (e.g., 100 out of 500) to allow new data 
+            # to shift the distribution while preserving the baseline history.
+            # Without this, the buffer clears completely and causes an amnesia loop.
+            drop_count = int(len(self._sample_buffer) * 0.2)
+            self._sample_buffer = self._sample_buffer[drop_count:]
+            self._save_buffer()
             return False, None
 
         # S-3: save count BEFORE clear so the property is readable in main.py
@@ -138,6 +155,7 @@ class ML1BehaviourClassifier:
         self._model.fit(X, y)
         self._is_trained = True
         self._sample_buffer.clear()
+        self._save_buffer()  # clear persisted buffer now that model is trained
 
         oob = getattr(self._model, "oob_score_", None)
         # B7 FIX: dump BEFORE incrementing counter. If joblib.dump() raises (disk full,
@@ -157,18 +175,23 @@ class ML1BehaviourClassifier:
     # ------------------------------------------------------------------
 
     def _bootstrap_predict(self, telemetry: ExecutionTelemetry) -> list[float]:
-        """Threshold-rule predictions for bootstrap phase."""
-        if telemetry.order_latency_ms >= 5000 or telemetry.fill_rate < 0.4:
+        """Threshold-rule predictions for bootstrap phase.
+
+        Calibrated to Alpaca paper trading baseline where the executor's
+        2s polling sleep means every fill takes 2700ms+ at minimum.
+        Degraded = clear spike or missed fill; Stressed = jitter above baseline.
+        """
+        if telemetry.order_latency_ms >= 3500 or telemetry.fill_rate < 0.7:
             return [0.0, 0.0, 1.0]  # degraded
-        if telemetry.order_latency_ms >= 2000 or telemetry.fill_rate < 0.7:
+        if telemetry.order_latency_ms >= 2800 or telemetry.fill_rate < 0.9:
             return [0.0, 1.0, 0.0]  # stressed
         return [1.0, 0.0, 0.0]     # normal
 
     def _bootstrap_label(self, features: dict) -> str:
         """Bootstrap label using thresholds on raw feature values."""
-        if features["order_latency_ms"] >= 5000 or features["fill_rate"] < 0.4:
+        if features["order_latency_ms"] >= 3500 or features["fill_rate"] < 0.7:
             return "degraded"
-        if features["order_latency_ms"] >= 2000 or features["fill_rate"] < 0.7:
+        if features["order_latency_ms"] >= 2800 or features["fill_rate"] < 0.9:
             return "stressed"
         return "normal"
 
@@ -180,6 +203,35 @@ class ML1BehaviourClassifier:
             "slippage": telemetry.slippage,
             "position_size_deviation": telemetry.position_size_deviation,
         }
+
+    def _save_buffer(self) -> None:
+        """Persist the sample buffer to disk so it survives process restarts."""
+        import json
+        try:
+            ML1_BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ML1_BUFFER_PATH.write_text(json.dumps(self._sample_buffer), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ML1 buffer save failed | %s", exc)
+
+    def _load_buffer(self) -> None:
+        """Restore sample buffer from disk if present (from a previous run)."""
+        import json
+        if not ML1_BUFFER_PATH.exists():
+            return
+        # Do not restore buffer if the model is already trained — the buffer
+        # was cleared after the successful retrain, so stale disk state is noise.
+        if self._is_trained:
+            return
+        try:
+            data = json.loads(ML1_BUFFER_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                self._sample_buffer = data
+                logger.info(
+                    "ML1 buffer restored from disk | samples=%d / %d needed",
+                    len(self._sample_buffer), RETRAIN_THRESHOLD,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ML1 buffer load failed | starting empty | %s", exc)
 
     def _load_model_if_exists(self) -> None:
         """Load saved model from disk if available."""

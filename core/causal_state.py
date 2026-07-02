@@ -136,6 +136,7 @@ class CausalStateManager:
                 position_size=self._state.position_size,
                 capital_deployed=self._state.capital_deployed,
                 last_tick_timestamp=datetime.now(timezone.utc),
+                price_history=list(self._prices),
             )
 
             logger.debug(
@@ -292,7 +293,7 @@ class CausalStateManager:
                 break
 
         spans = [s for s in (low_span, high_span) if s is not None]
-        return min(spans) if spans else 0.0
+        return min(spans) if spans else 3.5
 
     async def _check_thresholds(
         self,

@@ -1,10 +1,13 @@
 """core/stream.py
-Binance WebSocket market data feed for SOL/USDT.
+Binance WebSocket market data feed for SOL/USDT + BTC/ETH macro + L2 depth.
 
-Connects to three simultaneous streams:
-  - kline_1m    — 1-minute candlestick data
-  - bookTicker  — best bid/ask (for spread calculation)
-  - aggTrade    — aggregate trade stream (for volume)
+Connects to six simultaneous streams:
+  - solusdt@kline_1m    — 1-minute candlestick data (SOL price, volume)
+  - solusdt@bookTicker  — best bid/ask (for spread calculation)
+  - solusdt@aggTrade    — aggregate trade stream (volume, trade-side aggression)
+  - solusdt@depth5@100ms — L2 top-5 order book (order book imbalance)
+  - btcusdt@aggTrade    — BTC macro price feed
+  - ethusdt@aggTrade    — ETH macro price feed
 
 Reconnection handler fires within 2 seconds of any drop.
 Stale feed detection: last_tick_timestamp tracked in CausalState.
@@ -17,6 +20,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -35,16 +39,27 @@ STREAMS = [
     f"{SYMBOL}@kline_1m",
     f"{SYMBOL}@bookTicker",
     f"{SYMBOL}@aggTrade",
+    f"{SYMBOL}@depth5@100ms",  # L2 order book imbalance (Task 1 confirmed available)
+    "btcusdt@aggTrade",         # BTC macro lead signal
+    "ethusdt@aggTrade",         # ETH macro secondary signal
 ]
 
 
 class BinanceFeed:
     """Manages the Binance WebSocket connection and parses incoming messages
     into MarketTick objects for the causal state manager.
+
+    Also feeds the FeatureBarBuilder with macro prices, trade aggression,
+    and L2 order book imbalance for causal discovery.
     """
 
-    def __init__(self, state_manager: CausalStateManager) -> None:
+    def __init__(
+        self,
+        state_manager: CausalStateManager,
+        feature_bar_builder=None,  # core.feature_bar.FeatureBarBuilder | None
+    ) -> None:
         self._state_manager = state_manager
+        self._feature_bar = feature_bar_builder
         self._running = False
         # B10 FIX: store the live WebSocket so stop() can close it.
         # Previously stop() only set _running=False, which only prevents
@@ -115,24 +130,51 @@ class BinanceFeed:
     # ------------------------------------------------------------------
 
     async def _handle_message(self, raw: str) -> None:
-        """Parse one WebSocket message and update causal state."""
+        """Parse one WebSocket message and update causal state + feature bar."""
         try:
             envelope = json.loads(raw)
             stream_name: str = envelope.get("stream", "")
             data: dict = envelope.get("data", {})
 
             should_update = False
-            if "kline" in stream_name:
+
+            if "kline" in stream_name and SYMBOL in stream_name:
                 self._parse_kline(data)
                 should_update = True
-            elif "bookTicker" in stream_name:
+
+            elif "bookTicker" in stream_name and SYMBOL in stream_name:
                 self._parse_book_ticker(data)
                 should_update = True  # spread changes matter for propagation
-            elif "aggTrade" in stream_name:
+
+            elif "aggTrade" in stream_name and SYMBOL in stream_name:
                 self._parse_agg_trade(data)
-                # Don't trigger full state recompute for individual trades —
-                # aggTrade fires ~10x more frequently than kline.
-                # Price/volume are updated for the next kline-triggered recompute.
+                # Feed trade aggression to feature bar builder
+                if self._feature_bar is not None:
+                    is_buyer_maker = bool(data.get("m", True))
+                    self._feature_bar.update_trade(is_buyer_maker)
+
+            elif "depth5" in stream_name and SYMBOL in stream_name:
+                # L2 order book imbalance
+                if self._feature_bar is not None:
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if bids and asks:
+                        bid_qty = sum(float(b[1]) for b in bids)
+                        ask_qty = sum(float(a[1]) for a in asks)
+                        total = bid_qty + ask_qty
+                        if total > 0:
+                            imbalance = (bid_qty - ask_qty) / total
+                            self._feature_bar.update_imbalance(imbalance)
+
+            elif "btcusdt" in stream_name:
+                btc_price = float(data.get("p", 0))
+                if btc_price > 0 and self._feature_bar is not None:
+                    self._feature_bar.update_macro("BTC", btc_price)
+
+            elif "ethusdt" in stream_name:
+                eth_price = float(data.get("p", 0))
+                if eth_price > 0 and self._feature_bar is not None:
+                    self._feature_bar.update_macro("ETH", eth_price)
 
             # Only update causal state on kline/bookTicker (not every aggTrade)
             if should_update and self._latest_price > 0 and self._latest_bid > 0:
@@ -146,6 +188,14 @@ class BinanceFeed:
                     spread=self._latest_ask - self._latest_bid,
                 )
                 await self._state_manager.update(tick)
+
+                # Feed SOL price/volume/spread to feature bar builder
+                if self._feature_bar is not None:
+                    self._feature_bar.update_sol(
+                        self._latest_price,
+                        self._latest_volume,
+                        self._latest_ask - self._latest_bid,
+                    )
 
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Malformed tick discarded | %s", exc)

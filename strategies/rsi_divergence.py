@@ -66,25 +66,19 @@ class RSIStrategy(Strategy):
     """RSI Momentum Divergence strategy — conservative, uncertainty regime."""
 
     def __init__(self) -> None:
-        # Instance-level price history — NOT module-level.
-        # Module-level lists are corrupted by evaluate() during hill-climbing.
-        self._price_history: list[float] = []
+        pass
 
     def generate_signal(self, state: CausalState, params: dict) -> str:
-        self._price_history.append(state.price)
-        if len(self._price_history) > MAX_HISTORY:
-            self._price_history.pop(0)
-
         period = params.get("rsi_lookback_period", 14)
-        if len(self._price_history) < period + 5:
+        if len(state.price_history) < period + 5:
             return "HOLD"
 
-        closes = pd.Series(self._price_history)
+        closes = pd.Series(state.price_history)
         rsi = ta.rsi(closes, length=period)
         if rsi is None:
             return "HOLD"
 
-        prices = self._price_history
+        prices = state.price_history
         threshold = params.get("divergence_threshold", 5)
 
         lows = _find_local_lows(prices)
@@ -105,7 +99,7 @@ class RSIStrategy(Strategy):
             rsi2 = rsi.iloc[i2] if i2 < len(rsi) else None
             if rsi1 is not None and rsi2 is not None:
                 if p2 > p1 and rsi2 < rsi1 - threshold:
-                    return "SELL"  # bearish divergence
+                    return "CLOSE"  # bearish divergence
 
         return "HOLD"
 
@@ -162,7 +156,7 @@ class RSIStrategy(Strategy):
         the divergence_span assumption actually checks.
         """
         # RSI divergence needs some price history to detect patterns
-        if len(self._price_history) < 10:
+        if len(state.price_history) < 10:
             return 0.0
 
         # HIGH-1 FIX: use the real divergence span from CausalState

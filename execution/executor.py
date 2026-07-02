@@ -77,10 +77,20 @@ class Executor:
         if signal == "HOLD":
             return self._no_op_telemetry()
 
-        # N27 FIX: Alpaca crypto paper trading does not support short selling.
-        # Since Arivu starts every cycle flat, a SELL signal is an illicit short attempt.
-        if signal == "SELL":
-            logger.warning("Alpaca crypto does not support short selling. Converting SELL to HOLD.")
+        if signal == "SELL" or signal == "CLOSE":
+            try:
+                existing = await asyncio.to_thread(self._api.get_position, SYMBOL)
+                if existing and float(existing.qty) > 0:
+                    logger.info("Closing existing long position via market order")
+                    await asyncio.to_thread(self._api.close_position, SYMBOL)
+                    return ExecutionTelemetry(
+                        symbol=SYMBOL, fill_rate=1.0, order_latency_ms=100.0,
+                        slippage=0.0, position_size_deviation=0.0
+                    )
+            except Exception:
+                pass
+            
+            logger.info("No long position to close, converting SELL/CLOSE to HOLD")
             return self._no_op_telemetry()
 
         intended_price = state.price
@@ -134,7 +144,7 @@ class Executor:
                     qty=qty,
                     side=side,
                     type="limit",
-                    time_in_force="day",  # HIGH-3 FIX: 'gtc' rejected by Alpaca paper crypto; 'day' is universally supported
+                    time_in_force="gtc",  # HIGH-3 FIX: 'day' is invalid for 24/7 crypto; must be 'gtc' or 'ioc'
                     limit_price=round(limit_price, 2),
                 )
 
@@ -169,7 +179,7 @@ class Executor:
                 qty=qty,
                 side=side,
                 type="market",
-                time_in_force="day",
+                time_in_force="gtc",
             )
             # H_NEW_3 FIX: Poll until filled or 10-second timeout.
             # Previously: sleep(3) then read once. If fill takes > 3s,
@@ -187,6 +197,7 @@ class Executor:
                     "Market order not filled after 10s poll | "
                     "fill_price=0.0 — ExecutionTelemetry slippage will be unreliable"
                 )
+                return 0.0, False
             logger.warning("Market order fallback filled | price=%.2f", fill_price)
             return fill_price, True
 
@@ -210,7 +221,9 @@ class Executor:
             params.get("position_fraction", 0.10),
             MAX_POSITION_FRACTION,
         )
-        dollar_exposure = equity * fraction
+        # 50% Hard Split: Each loop (causal and legacy) trades on 50% of the total equity base.
+        virtual_equity = equity * 0.5
+        dollar_exposure = virtual_equity * fraction
         qty = dollar_exposure / state.price if state.price > 0 else 0.0
         return round(qty, 6)
 

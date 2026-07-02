@@ -55,6 +55,7 @@ class OutcomeComparator:
         self,
         decision_object: DecisionObject,
         close_reason: str,
+        current_graph = None,
     ) -> OutcomeRecord | None:
         """Close the decision cycle.
 
@@ -83,6 +84,38 @@ class OutcomeComparator:
         # The ledger holds breach records committed by the monitor
         breach_log = self._ledger.get_breach_log(str(decision_object.id))
         breached_names = list(breach_log.keys())
+
+        # If CausalAgent and graph is supplied, perform causal edge structural breach audit
+        if decision_object.strategy_name == "CausalAgent" and current_graph is not None:
+            for assumption in decision_object.assumptions:
+                if assumption.name.startswith("causal_edge|"):
+                    parts = assumption.name.split("|")
+                    if len(parts) == 4:
+                        source = parts[1]
+                        target = parts[2]
+                        lag = int(parts[3])
+
+                        # Check if this edge exists in the latest live graph snapshot
+                        matching_edge = next((
+                            e for e in current_graph.edges
+                            if e.source == source and e.target == target and e.lag == lag
+                        ), None)
+
+                        is_edge_breached = False
+                        if matching_edge is None:
+                            is_edge_breached = True
+                        else:
+                            # Check sign/direction of the coefficient
+                            hyp_sign = 1 if assumption.current_value >= 0 else -1
+                            act_sign = 1 if matching_edge.coeff >= 0 else -1
+                            if hyp_sign != act_sign:
+                                is_edge_breached = True
+
+                        if is_edge_breached:
+                            if assumption.name not in breached_names:
+                                breached_names.append(assumption.name)
+                                breach_log[assumption.name] = datetime.now(timezone.utc).isoformat()
+
         held_names = [
             a.name for a in decision_object.assumptions
             if a.name not in breached_names

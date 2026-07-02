@@ -79,7 +79,7 @@ THRESHOLDS = {
     },
     "SOLUSDT": {
         "volatility_limit":   0.07,
-        "spread_limit":       0.005,
+        "spread_limit":       0.060,
         "trend_slope_min":    0.0,
         "trend_strength_max": 0.6,
     },

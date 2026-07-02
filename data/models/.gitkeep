@@ -1,2 +1,0 @@
-# data/models/.gitkeep — keeps this directory tracked by git
-# Trained ML model files (*.joblib) are gitignored — only the directory is tracked.

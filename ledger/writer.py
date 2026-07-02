@@ -56,6 +56,28 @@ class LedgerWriter:
         # this lock before touching _active_id or _breach_logs.
         self._state_lock = threading.Lock()
 
+    def cleanup_stale_trades(self) -> None:
+        """Mark any ACTIVE or COMMITTED trades as INTERRUPTED on startup.
+        
+        Prevents ghost trades from prior sessions blocking new cycles.
+        Called once at startup before any loop begins.
+        """
+        with SessionLocal() as session:
+            stale = session.query(DecisionObjectRow).filter(
+                DecisionObjectRow.status.in_(["ACTIVE", "COMMITTED"])
+            ).all()
+            for row in stale:
+                row.status = "INTERRUPTED"
+                logger.info(
+                    "Startup cleanup: marked INTERRUPTED | id=%s strategy=%s",
+                    row.id[:8], row.strategy_name,
+                )
+            session.commit()
+        
+        with self._state_lock:
+            self._active_id = None
+            self._breach_logs.clear()
+
     # ------------------------------------------------------------------
     # Commit — THE most critical operation
     # ------------------------------------------------------------------
@@ -89,6 +111,8 @@ class LedgerWriter:
                 status="COMMITTED",
                 phase=do.phase,
                 hill_climb_iterations=do.hill_climb_iterations,
+                meta_params=json.dumps(do.meta_params) if do.meta_params else None,
+                causal_chain_snapshot=json.dumps(do.causal_chain_snapshot) if do.causal_chain_snapshot else None,
                 schema_version=do.schema_version,
                 breach_log="{}",
             )
@@ -97,15 +121,26 @@ class LedgerWriter:
                 session.add(row)
                 session.commit()
 
-            # N1 FIX: acquire state lock before modifying shared in-memory state
+            # N1 FIX: acquire state lock before modifying shared in-memory state.
+            # Silent 3 FIX: only update _active_id for CausalAgent DOs.
+            # Legacy arm tracks its own DO by reference in legacy_strategy_loop.
+            # The monitor guards on causal_chain_snapshot is not None, so only
+            # CausalAgent DOs need to be reachable via get_active().
             with self._state_lock:
-                self._active_id = str(do.id)
+                if do.strategy_name == "CausalAgent":
+                    self._active_id = str(do.id)
                 self._breach_logs[str(do.id)] = {}
 
-            logger.info(
-                "Ledger committed | id=%s strategy=%s phase=%s projected_pnl=%.4f",
-                do.id, do.strategy_name, do.phase, do.projected_pnl,
-            )
+            if do.strategy_name == "CausalAgent":
+                logger.info(
+                    "Ledger committed | id=%s strategy=%s phase=%s projected_pnl=%.4f",
+                    do.id, do.strategy_name, do.phase, do.projected_pnl,
+                )
+            else:
+                logger.debug(
+                    "Ledger committed | id=%s strategy=%s phase=%s projected_pnl=%.4f",
+                    do.id, do.strategy_name, do.phase, do.projected_pnl,
+                )
             return str(do.id)
 
         except Exception as exc:
@@ -121,11 +156,13 @@ class LedgerWriter:
         Raises:
             ValueError: if caller attempts to pass any non-status field.
         """
+        strategy_name = "unknown"
         with SessionLocal() as session:
             row = session.get(DecisionObjectRow, decision_object_id)
             if row is None:
                 raise LedgerWriteError(f"DecisionObject {decision_object_id} not found")
             row.status = new_status
+            strategy_name = row.strategy_name
             session.commit()
 
         # C4 FIX: clear _active_id for ALL terminal statuses, not just CLOSED.
@@ -139,7 +176,10 @@ class LedgerWriter:
                     self._active_id = None
                 self._breach_logs.pop(decision_object_id, None)
 
-        logger.info("Ledger status updated | id=%s status=%s", decision_object_id, new_status)
+        if strategy_name == "CausalAgent":
+            logger.info("Ledger status updated | id=%s status=%s", decision_object_id, new_status)
+        else:
+            logger.debug("Ledger status updated | id=%s status=%s", decision_object_id, new_status)
 
     def guard_immutable(self, field_name: str) -> None:
         """Raise ValueError if caller attempts to modify an immutable field."""
@@ -427,5 +467,7 @@ class LedgerWriter:
             hill_climb_iterations=row.hill_climb_iterations,
             status=row.status,
             phase=row.phase,
+            meta_params=json.loads(row.meta_params) if getattr(row, "meta_params", None) else None,
+            causal_chain_snapshot=json.loads(row.causal_chain_snapshot) if getattr(row, "causal_chain_snapshot", None) else None,
             schema_version=row.schema_version,
         )

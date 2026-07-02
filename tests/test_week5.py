@@ -86,9 +86,17 @@ def test_ml1_bootstrap_normal():
     assert vec == [1.0, 0.0, 0.0], f"Expected normal, got {vec}"
 
 
-def test_ml1_bootstrap_stressed_by_latency():
+def test_ml1_bootstrap_normal_alpaca_baseline():
+    """Latency 2700ms is normal on Alpaca paper — the executor has a 2s polling floor."""
     ml1 = _ml1_bootstrap()
-    vec = ml1.predict_proba(_tel(latency=2500.0, fill_rate=1.0), is_real_order=True)
+    vec = ml1.predict_proba(_tel(latency=2700.0, fill_rate=1.0), is_real_order=True)
+    assert vec == [1.0, 0.0, 0.0], f"2700ms should be normal on Alpaca paper, got {vec}"
+
+
+def test_ml1_bootstrap_stressed_by_latency():
+    """Latency 2900ms is above Alpaca's baseline jitter — stressed."""
+    ml1 = _ml1_bootstrap()
+    vec = ml1.predict_proba(_tel(latency=2900.0, fill_rate=1.0), is_real_order=True)
     assert vec == [0.0, 1.0, 0.0], f"Expected stressed, got {vec}"
 
 
@@ -100,8 +108,8 @@ def test_ml1_bootstrap_degraded_by_latency():
 
 def test_ml1_bootstrap_degraded_by_fill_rate():
     ml1 = _ml1_bootstrap()
-    vec = ml1.predict_proba(_tel(latency=100.0, fill_rate=0.3), is_real_order=True)
-    assert vec == [0.0, 0.0, 1.0], f"fill_rate<0.4 should be degraded, got {vec}"
+    vec = ml1.predict_proba(_tel(latency=100.0, fill_rate=0.5), is_real_order=True)
+    assert vec == [0.0, 0.0, 1.0], f"fill_rate<0.7 should be degraded, got {vec}"
 
 
 def test_ml1_hold_telemetry_not_buffered():

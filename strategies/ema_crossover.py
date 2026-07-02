@@ -1,10 +1,20 @@
 """strategies/ema_crossover.py  —  Person 1
 Dynamic EMA Crossover Strategy (Momentum).
 
-Signal logic:
-  BUY  if fast_ema[-1] > slow_ema[-1] AND fast_ema[-2] <= slow_ema[-2]  (crossover up)
-  SELL if fast_ema[-1] < slow_ema[-1] AND fast_ema[-2] >= slow_ema[-2]  (crossover down)
-  HOLD otherwise
+Signal logic (§10.2 HOLD-trap fix — state-based, not event-based):
+  BUY  if fast_ema > slow_ema  (fast is currently above slow — sustained uptrend)
+  SELL if fast_ema < slow_ema  (fast is currently below slow — sustained downtrend)
+  HOLD if insufficient data
+
+FORMER BUG: checked for crossover on exactly this tick
+  (fast[-1] > slow[-1] AND fast[-2] <= slow[-2]).
+  Because the decision cycle samples the market every ~10–30 seconds, catching
+  a crossover on the exact second it occurs is statistically very rare — causing
+  permanent HOLD even when the trend was clearly established. State-based check
+  fires whenever fast_ema is above slow_ema, which is the correct condition
+  for a momentum strategy.
+  The legacy strategies are kept as a comparison arm — this fix makes that
+  comparison meaningful (three strategies that can actually trade vs. one agent).
 
 Three causal assumptions:
   1. trend_persistence  — trend_slope > 0.0    (trend must continue)
@@ -47,33 +57,37 @@ class EMAStrategy(Strategy):
     """Dynamic EMA Crossover momentum strategy."""
 
     def __init__(self) -> None:
-        # Instance-level price history — NOT module-level.
-        # Module-level lists are shared across all instances and across every
-        # evaluate() call during hill-climbing, causing history corruption.
-        self._price_history: list[float] = []
+        pass
 
     def generate_signal(self, state: CausalState, params: dict) -> str:
-        """Compute EMA crossover signal from live price history."""
-        self._price_history.append(state.price)
-        if len(self._price_history) > MAX_HISTORY:
-            self._price_history.pop(0)
+        """Compute EMA state-based signal from live price history.
 
-        if len(self._price_history) < params.get("slow_period", 21) + 1:
+        §10.2 HOLD-trap fix: checks current state, not exact-instant crossover.
+        BUY when fast EMA is currently above slow EMA (trend is up right now).
+        SELL when fast EMA is currently below slow EMA (trend is down right now).
+        """
+        slow_period = params.get("slow_period", 21)
+        if len(state.price_history) < slow_period + 1:
             return "HOLD"
 
-        closes = pd.Series(self._price_history)
+        closes = pd.Series(state.price_history)
         fast = ta.ema(closes, length=params["fast_period"])
         slow = ta.ema(closes, length=params["slow_period"])
 
-        if fast is None or slow is None or len(fast) < 2 or len(slow) < 2:
+        if fast is None or slow is None or len(fast) < 1 or len(slow) < 1:
             return "HOLD"
 
-        # Crossover up
-        if fast.iloc[-1] > slow.iloc[-1] and fast.iloc[-2] <= slow.iloc[-2]:
+        fast_now = fast.iloc[-1]
+        slow_now = slow.iloc[-1]
+
+        if pd.isna(fast_now) or pd.isna(slow_now):
+            return "HOLD"
+
+        # State-based: is the trend currently up or down?
+        if fast_now > slow_now:
             return "BUY"
-        # Crossover down
-        if fast.iloc[-1] < slow.iloc[-1] and fast.iloc[-2] >= slow.iloc[-2]:
-            return "SELL"
+        if fast_now < slow_now:
+            return "CLOSE"
         return "HOLD"
 
     def get_assumptions(self, state: CausalState, params: dict) -> list[Assumption]:
