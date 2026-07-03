@@ -310,23 +310,13 @@ class MetaParameterOptimizer:
                 )
 
                 # --- Stagnation detection ---
-                # Check whether score has meaningfully improved since last update.
-                # Small oscillations (< STAGNATION_DELTA_THRESHOLD) count as stagnation.
-                last_score = self._last_scores.get(regime, current_score)
-                score_delta = abs(current_score - last_score)
-
-                if score_delta >= STAGNATION_DELTA_THRESHOLD:
-                    # Real improvement — reset stagnation counter
-                    self._stagnation_counts[regime] = 0
-                    logger.debug(
-                        "MetaOptimizer: stagnation counter reset | regime=%s | "
-                        "score delta=%.4f", regime, score_delta
-                    )
-                else:
-                    # No meaningful improvement — increment stagnation counter
+                # Check whether step sizes are at minimum floors (optimizer has converged)
+                if current.step_k <= MIN_STEP_K and current.step_thresh <= MIN_STEP_THRESH:
                     self._stagnation_counts[regime] = (
                         self._stagnation_counts.get(regime, 0) + 1
                     )
+                else:
+                    self._stagnation_counts[regime] = 0
 
                 self._last_scores[regime] = current_score
 
