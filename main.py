@@ -261,7 +261,7 @@ async def legacy_strategy_loop(
                                 closed_count = await asyncio.to_thread(ledger.count_closed)
                                 if closed_count >= 40 and closed_count % 10 == 0:
                                     entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
-                                    regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                    regime_retrained = await asyncio.to_thread(regime_classifier.run_kmeans_and_retrain, entries)
                                     if regime_retrained:
                                         logger.info(
                                             "Regime Classifier K-Means & Decision Tree retrained | "
@@ -543,7 +543,7 @@ async def causal_agent_loop(
                                         closed_count = await asyncio.to_thread(ledger.count_closed)
                                         if closed_count >= 40 and closed_count % 10 == 0:
                                             entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
-                                            regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                            regime_retrained = await asyncio.to_thread(regime_classifier.run_kmeans_and_retrain, entries)
                                             if regime_retrained:
                                                 logger.info(
                                                     "Regime Classifier K-Means & Decision Tree retrained | "
@@ -616,7 +616,7 @@ async def causal_agent_loop(
                                     closed_count = await asyncio.to_thread(ledger.count_closed)
                                     if closed_count >= 40 and closed_count % 10 == 0:
                                         entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
-                                        regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                        regime_retrained = await asyncio.to_thread(regime_classifier.run_kmeans_and_retrain, entries)
                                         if regime_retrained:
                                             logger.info(
                                                 "Regime Classifier K-Means & Decision Tree retrained | "
