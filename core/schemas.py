@@ -240,18 +240,14 @@ class DecisionObject(BaseModel):
     @field_validator("assumptions")
     @classmethod
     def validate_assumption_count(cls, v: list) -> list:
-        """Enforce exactly 3 assumptions per DecisionObject.
+        """Enforce 1-3 assumptions per DecisionObject.
 
         The monitor, ML2 annotator, and training_buffer.csv all depend on
-        exactly 3 assumptions per cycle. A strategy returning fewer causes:
-          - Uneven CSV rows (breaks ML2's len(data)//3 cycle count estimate)
-          - Monitor checking fewer conditions than designed
-          - Silent scientific integrity violation (underdefined causal model)
+        assumptions per cycle.
         """
-        if len(v) != 3:
+        if not (1 <= len(v) <= 3):
             raise ValueError(
-                f"Each strategy must return exactly 3 Assumption objects, got {len(v)}. "
-                f"See strategies/base.py get_assumptions() docstring."
+                f"Each strategy must return 1-3 Assumption objects, got {len(v)}."
             )
         return v
 

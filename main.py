@@ -645,6 +645,17 @@ async def causal_agent_loop(
             # --- Step 6: Commit Decision Object ---
             trade_signal = "BUY" if selected_hyp.predicted_direction == "up" else "CLOSE"
 
+            if trade_signal == "CLOSE":
+                # Check if we actually have a position to close
+                try:
+                    pos = await asyncio.to_thread(executor._api.get_position, "SOLUSD")
+                    if not pos or float(pos.qty) <= 0:
+                        logger.debug("CausalAgent: CLOSE signal skipped — no open position")
+                        continue
+                except Exception:
+                    logger.debug("CausalAgent: CLOSE signal skipped — no position exists")
+                    continue
+
             # Represent the causal chain as the "assumptions" for ledger compatibility
             from core.schemas import Assumption
             causal_assumptions = []
@@ -658,19 +669,6 @@ async def causal_agent_loop(
                     proximity=round(1.0 - abs(edge.coeff), 4),
                     breach_risk=1.0 - selected_hyp.layer2_score,
                 ))
-            # Pad to exactly 3 assumptions to satisfy legacy database formats and plotting tools
-            padding_idx = 1
-            while len(causal_assumptions) < 3:
-                causal_assumptions.append(Assumption(
-                    name=f"causal_edge_padding|{padding_idx}",
-                    variable="volatility",
-                    operator="lt",
-                    threshold=1.0,
-                    current_value=0.0,
-                    proximity=0.0,
-                    breach_risk=0.0,
-                ))
-                padding_idx += 1
 
             # Annotate with ML2 breach risk predictor
             ml1_vector = state.algo_health_vector
@@ -710,7 +708,11 @@ async def causal_agent_loop(
                 confidence=selected_hyp.composite_score,
                 hill_climb_iterations=0,  # causal agent doesn't hill-climb
                 phase=current_phase[0],  # will upgrade later when Layer 2 matures
-                meta_params=layer1._optimizer.get_params(current_regime).to_dict(),
+                meta_params={
+                    **layer1._optimizer.get_params(current_regime).to_dict(),
+                    "is_escape_valve": selected_hyp.is_escape_valve,
+                    "edge_stability": selected_hyp.layer1_score,
+                },
                 causal_chain_snapshot={"chain": [e.to_dict() for e in selected_hyp.chain]},
             )
 

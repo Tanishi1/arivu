@@ -155,6 +155,8 @@ class TradeOutcome:
     pnl_usd:            float
     causal_chain_held:  bool
     regime_was_stable:  bool
+    is_escape_valve:    bool = False
+    edge_stability:     float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,13 +208,12 @@ class MetaParameterOptimizer:
         for regime in RegimeType:
             if regime.value not in self._state:
                 self._state[regime.value] = {
-                    "params":  self._random_init(regime.value),
+                    "population": [self._random_init(regime.value) for _ in range(3)],
                     "history": [],   # list of scored outcomes for this regime
                 }
                 logger.info(
-                    "MetaOptimizer: random init | regime=%s | %s",
+                    "MetaOptimizer: random init | regime=%s | 3 candidates created",
                     regime.value,
-                    self._state[regime.value]["params"].to_dict(),
                 )
 
         # Persist newly initialized regimes immediately so params
@@ -233,7 +234,18 @@ class MetaParameterOptimizer:
         """
         key = regime if regime in self._state else RegimeType.UNKNOWN.value
         with self._lock:
-            return self._state[key]["params"]
+            bucket = self._state[key]
+            if "history" not in bucket or not bucket["history"]:
+                return bucket["population"][0]
+            
+            best_cand = None
+            best_score = -1.0
+            for cand in bucket["population"]:
+                score = self._score_config(cand.to_dict(), bucket["history"])
+                if score > best_score:
+                    best_score = score
+                    best_cand = cand
+            return best_cand
 
     def update(self, outcome: TradeOutcome) -> None:
         """
@@ -248,7 +260,10 @@ class MetaParameterOptimizer:
 
         with self._lock:
             bucket  = self._state[regime]
-            current = bucket["params"]
+            population = bucket.get("population", [])
+            if not population and "params" in bucket:
+                population = [bucket["params"]]
+                bucket["population"] = population
 
             bucket["history"].append({
                 "params": outcome.meta_params_used,
@@ -258,92 +273,79 @@ class MetaParameterOptimizer:
             if len(bucket["history"]) > 200:
                 bucket["history"] = bucket["history"][-200:]
 
-            current_score = self._score_config(
-                outcome.meta_params_used, bucket["history"]
-            )
+            candidate_scores = []
+            for cand in population:
+                cand_score = self._score_config(cand.to_dict(), bucket["history"])
+                candidate_scores.append((cand_score, cand))
+                
+            candidate_scores.sort(key=lambda x: x[0], reverse=True)
+            
+            new_population = []
+            for idx, (c_score, current) in enumerate(candidate_scores):
+                # Generate all neighbours (±step for each parameter)
+                neighbours = self._get_neighbours(current)
+                best_neighbour      = None
+                best_neighbour_score = c_score
 
-            # Generate all neighbours (±step for each parameter)
-            neighbours = self._get_neighbours(current)
-            best_neighbour      = None
-            best_neighbour_score = current_score
+                for neighbour in neighbours:
+                    n_dict = neighbour.to_dict()
+                    n_score = self._score_config(n_dict, bucket["history"])
+                    if n_score > best_neighbour_score:
+                        best_neighbour       = neighbour
+                        best_neighbour_score = n_score
 
-            for neighbour in neighbours:
-                n_dict = neighbour.to_dict()
-                n_score = self._score_config(n_dict, bucket["history"])
-                if n_score > best_neighbour_score:
-                    best_neighbour       = neighbour
-                    best_neighbour_score = n_score
+                if best_neighbour is not None:
+                    # Improvement found — move to neighbour
+                    if idx == 0:
+                        self._stagnation_counts[regime] = 0
+                        self._last_scores[regime] = best_neighbour_score
 
-            if best_neighbour is not None:
-                # Improvement found — move to neighbour
-                # Reset stagnation counter since we made progress
-                self._stagnation_counts[regime] = 0
-                self._last_scores[regime] = best_neighbour_score
-
-                old_dict = current.to_dict()
-                new_dict = best_neighbour.to_dict()
-                logger.info(
-                    "MetaOptimizer: Hill-climbing regime '%s' (score %.4f -> %.4f) | "
-                    "threshold: %.4f -> %.4f | k_runs: %d -> %d | min_runs: %d -> %d",
-                    regime, current_score, best_neighbour_score,
-                    old_dict["threshold"], new_dict["threshold"],
-                    old_dict["k_runs"], new_dict["k_runs"],
-                    old_dict["min_runs"], new_dict["min_runs"]
-                )
-                bucket["params"] = best_neighbour
-            else:
-                # No improvement — shrink step sizes (converging)
-                old_k = current.step_k
-                old_thresh = current.step_thresh
-                current.step_k      = max(
-                    MIN_STEP_K,
-                    int(current.step_k * STEP_DECAY_RATE)
-                )
-                current.step_thresh = max(
-                    MIN_STEP_THRESH,
-                    current.step_thresh * STEP_DECAY_RATE
-                )
-                logger.info(
-                    "MetaOptimizer: Local optimum reached for regime '%s' (score: %.4f) | "
-                    "Shrinking step sizes: step_k: %d -> %d | step_thresh: %.4f -> %.4f",
-                    regime, current_score, old_k, current.step_k, old_thresh, current.step_thresh
-                )
-
-                # --- Stagnation detection ---
-                # Check whether step sizes are at minimum floors (optimizer has converged)
-                if current.step_k <= MIN_STEP_K and current.step_thresh <= MIN_STEP_THRESH:
-                    self._stagnation_counts[regime] = (
-                        self._stagnation_counts.get(regime, 0) + 1
-                    )
+                        old_dict = current.to_dict()
+                        new_dict = best_neighbour.to_dict()
+                        logger.info(
+                            "MetaOptimizer: Hill-climbing regime '%s' (score %.4f -> %.4f) | "
+                            "threshold: %.4f -> %.4f | k_runs: %d -> %d | min_runs: %d -> %d",
+                            regime, c_score, best_neighbour_score,
+                            old_dict["threshold"], new_dict["threshold"],
+                            old_dict["k_runs"], new_dict["k_runs"],
+                            old_dict["min_runs"], new_dict["min_runs"]
+                        )
+                    new_population.append(best_neighbour)
                 else:
-                    self._stagnation_counts[regime] = 0
+                    # No improvement — shrink step sizes (converging)
+                    old_k = current.step_k
+                    old_thresh = current.step_thresh
+                    current.step_k      = max(MIN_STEP_K, int(current.step_k * STEP_DECAY_RATE))
+                    current.step_thresh = max(MIN_STEP_THRESH, current.step_thresh * STEP_DECAY_RATE)
+                    
+                    if idx == 0:
+                        logger.info(
+                            "MetaOptimizer: Local optimum reached for regime '%s' (score: %.4f) | "
+                            "Shrinking step sizes: step_k: %d -> %d | step_thresh: %.4f -> %.4f",
+                            regime, c_score, old_k, current.step_k, old_thresh, current.step_thresh
+                        )
+                        if current.step_k <= MIN_STEP_K and current.step_thresh <= MIN_STEP_THRESH:
+                            self._stagnation_counts[regime] = self._stagnation_counts.get(regime, 0) + 1
+                        else:
+                            self._stagnation_counts[regime] = 0
+                        self._last_scores[regime] = c_score
 
-                self._last_scores[regime] = current_score
+                    stagnation_count = self._stagnation_counts.get(regime, 0)
+                    if (idx == len(candidate_scores) - 1 and 
+                            stagnation_count >= STAGNATION_LIMIT and 
+                            current.step_k <= MIN_STEP_K and 
+                            current.step_thresh <= MIN_STEP_THRESH):
+                        new_params = self._random_init(regime)
+                        new_population.append(new_params)
+                        logger.warning(
+                            "MetaOptimizer: REPLACING worst candidate due to stagnation | regime=%s | "
+                            "stuck for %d updates | old_score=%.4f",
+                            regime, stagnation_count, c_score
+                        )
+                    else:
+                        new_population.append(current)
 
-                # Trigger restart if stuck for STAGNATION_LIMIT consecutive updates
-                # AND step sizes are already at minimum (fully converged)
-                stagnation_count = self._stagnation_counts.get(regime, 0)
-                if (stagnation_count >= STAGNATION_LIMIT
-                        and current.step_k <= MIN_STEP_K
-                        and current.step_thresh <= MIN_STEP_THRESH):
-
-                    old_params = current.to_dict()
-                    new_params = self._random_init(regime)
-                    bucket["params"] = new_params
-                    self._stagnation_counts[regime] = 0
-                    self._last_scores[regime] = 0.5  # reset to uninformed prior
-
-                    logger.info(
-                        "MetaOptimizer: STAGNATION RESTART | regime=%s | "
-                        "stuck for %d updates | score_range=[%.4f] | "
-                        "escaped_params=k_runs=%d,min_runs=%d,threshold=%.2f | "
-                        "new_params=k_runs=%d,min_runs=%d,threshold=%.2f",
-                        regime, stagnation_count, current_score,
-                        old_params["k_runs"], old_params["min_runs"],
-                        old_params["threshold"],
-                        new_params.k_runs, new_params.min_runs,
-                        new_params.threshold,
-                    )
+            bucket["population"] = new_population
 
         self._persist(regime)
 
@@ -426,14 +428,24 @@ class MetaParameterOptimizer:
             p = h["params"]
             s = h["score"]
             
+            is_ev = p.get("is_escape_valve", False)
+            edge_stability = float(p.get("edge_stability", 0.0))
+            
+            h_thresh = edge_stability if is_ev else float(p.get("threshold", 0.0))
+            
+            if is_ev and target_thresh > edge_stability:
+                effective_score = 0.25
+            else:
+                effective_score = s
+            
             diff_k = (target_k - float(p.get("k_runs", 0))) / sigma_k
             diff_min_r = (target_min_r - float(p.get("min_runs", 0))) / sigma_min_r
-            diff_thresh = (target_thresh - float(p.get("threshold", 0.0))) / sigma_thresh
+            diff_thresh = (target_thresh - h_thresh) / sigma_thresh
             
             d_squared = diff_k * diff_k + diff_min_r * diff_min_r + diff_thresh * diff_thresh
             weight = math.exp(-d_squared / 2.0)
             
-            weighted_sum += weight * s
+            weighted_sum += weight * effective_score
             weight_total += weight
             
         score = (weighted_sum + alpha * 0.5) / (weight_total + alpha)
@@ -506,9 +518,13 @@ class MetaParameterOptimizer:
                     "FROM meta_optimizer_state"
                 ).fetchall()
             for regime, params_json, history_json in rows:
-                p = json.loads(params_json)
-                self._state[regime] = {
-                    "params": MetaParams(
+                p_list = json.loads(params_json)
+                if isinstance(p_list, dict):
+                    p_list = [p_list]
+                
+                population = []
+                for p in p_list:
+                    population.append(MetaParams(
                         k_runs      = p["k_runs"],
                         min_runs    = p["min_runs"],
                         threshold   = p["threshold"],
@@ -516,7 +532,10 @@ class MetaParameterOptimizer:
                         step_k      = p.get("step_k",      5),
                         step_min_r  = p.get("step_min_r",  1),
                         step_thresh = p.get("step_thresh",  0.05),
-                    ).validate(),
+                    ).validate())
+                    
+                self._state[regime] = {
+                    "population": population,
                     "history": json.loads(history_json),
                 }
             logger.info(
@@ -532,7 +551,8 @@ class MetaParameterOptimizer:
         try:
             with self._lock:
                 bucket = self._state[regime]
-                params_json  = json.dumps(bucket["params"].to_dict())
+                population_dicts = [p.to_dict() for p in bucket.get("population", [])]
+                params_json  = json.dumps(population_dicts)
                 history_json = json.dumps(bucket["history"][-200:])
             with sqlite3.connect(self._db_path) as conn:
                 conn.execute(

@@ -195,37 +195,22 @@ class HypothesisGenerator:
         max_depth: int,
         regime: str = "unknown",
     ) -> list[list[CausalEdge]]:
-        """Find all causal chains ending at target, up to max_depth hops."""
+        """Find all causal chains ending at target. Now restricted to 1-hop."""
         completed: list[list[CausalEdge]] = []
 
-        def dfs(current_target: str, path: list[CausalEdge], depth: int) -> None:
-            # Any chain that already has at least 1 hop counts
-            if path:
-                completed.append(list(path))
-            if depth == 0:
-                return
+        in_edges = snapshot.edges_to_target(target)
+        for edge in in_edges:
+            # Only use Layer 1 validated edges
+            if not self._layer1.is_validated(edge.source, edge.target, edge.lag, regime):
+                score = self._layer1.get_stability_score(edge.source, edge.target, edge.lag, regime)
+                logger.debug(
+                    "Edge pruned | edge=%s->%s lag=%d | stability=%.2f | "
+                    "validated=False | reason=layer1_not_validated",
+                    edge.source, edge.target, edge.lag, score
+                )
+                continue
+            completed.append([edge])
 
-            in_edges = snapshot.edges_to_target(current_target)
-            for edge in in_edges:
-                # Prevent cycles — source must not already appear in path
-                sources_in_path = {e.source for e in path} | {e.target for e in path}
-                if edge.source in sources_in_path:
-                    continue
-                # Only use Layer 1 validated edges
-                if not self._layer1.is_validated(edge.source, edge.target, edge.lag, regime):
-                    score = self._layer1.get_stability_score(edge.source, edge.target, edge.lag, regime)
-                    logger.debug(
-                        "Chain pruned | edge=%s->%s lag=%d | stability=%.2f | "
-                        "validated=%s | reason=layer1_not_validated",
-                        edge.source, edge.target, edge.lag, score,
-                        self._layer1.is_validated(edge.source, edge.target, edge.lag, regime)
-                    )
-                    continue
-                path.append(edge)
-                dfs(edge.source, path, depth - 1)
-                path.pop()
-
-        dfs(target, [], max_depth)
         return completed
 
     # ------------------------------------------------------------------
