@@ -331,12 +331,10 @@ class MetaParameterOptimizer:
                         self._last_scores[regime] = c_score
 
                     stagnation_count = self._stagnation_counts.get(regime, 0)
-                    if (idx == len(candidate_scores) - 1 and 
-                            stagnation_count >= STAGNATION_LIMIT and 
-                            current.step_k <= MIN_STEP_K and 
-                            current.step_thresh <= MIN_STEP_THRESH):
+                    if idx == len(candidate_scores) - 1 and stagnation_count >= STAGNATION_LIMIT:
                         new_params = self._random_init(regime)
                         new_population.append(new_params)
+                        self._stagnation_counts[regime] = 0  # Reset stagnation count!
                         logger.warning(
                             "MetaOptimizer: REPLACING worst candidate due to stagnation | regime=%s | "
                             "stuck for %d updates | old_score=%.4f",

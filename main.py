@@ -255,6 +255,20 @@ async def legacy_strategy_loop(
                                 if current_phase[0] == "bootstrap":
                                     current_phase[0] = "trained"
                                     logger.info("ML2 transitioned to trained mode")
+
+                            # Check if Regime Classifier should retrain (every 10 closed trades, >= 40)
+                            try:
+                                closed_count = await asyncio.to_thread(ledger.count_closed)
+                                if closed_count >= 40 and closed_count % 10 == 0:
+                                    entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
+                                    regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                    if regime_retrained:
+                                        logger.info(
+                                            "Regime Classifier K-Means & Decision Tree retrained | "
+                                            "closed_count=%d", closed_count
+                                        )
+                            except Exception as regime_exc:
+                                logger.error("Failed to retrain Regime Classifier | %s", regime_exc)
                     except Exception as exc:
                         logger.error(
                             "legacy_strategy_loop: failed to close | %s", exc
@@ -523,6 +537,20 @@ async def causal_agent_loop(
                                         if current_phase[0] == "bootstrap":
                                             current_phase[0] = "trained"
                                             logger.info("ML2 transitioned to trained mode")
+
+                                    # Check if Regime Classifier should retrain (every 10 closed trades, >= 40)
+                                    try:
+                                        closed_count = await asyncio.to_thread(ledger.count_closed)
+                                        if closed_count >= 40 and closed_count % 10 == 0:
+                                            entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
+                                            regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                            if regime_retrained:
+                                                logger.info(
+                                                    "Regime Classifier K-Means & Decision Tree retrained | "
+                                                    "closed_count=%d", closed_count
+                                                )
+                                    except Exception as regime_exc:
+                                        logger.error("Failed to retrain Regime Classifier | %s", regime_exc)
                         except Exception as exc:
                             logger.error("CausalAgent: failed to close breach trade | %s", exc)
                         finally:
@@ -582,6 +610,20 @@ async def causal_agent_loop(
                                     if current_phase[0] == "bootstrap":
                                         current_phase[0] = "trained"
                                         logger.info("ML2 transitioned to trained mode")
+
+                                # Check if Regime Classifier should retrain (every 10 closed trades, >= 40)
+                                try:
+                                    closed_count = await asyncio.to_thread(ledger.count_closed)
+                                    if closed_count >= 40 and closed_count % 10 == 0:
+                                        entries = await asyncio.to_thread(ledger.get_closed_entries_for_regime)
+                                        regime_retrained = await asyncio.to_thread(regime.run_kmeans_and_retrain, entries)
+                                        if regime_retrained:
+                                            logger.info(
+                                                "Regime Classifier K-Means & Decision Tree retrained | "
+                                                "closed_count=%d", closed_count
+                                            )
+                                except Exception as regime_exc:
+                                    logger.error("Failed to retrain Regime Classifier | %s", regime_exc)
                     except Exception as exc:
                         logger.error("CausalAgent: failed to close horizon trade | %s", exc)
                     finally:

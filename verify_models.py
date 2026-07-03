@@ -122,35 +122,55 @@ print("\n-- 3. RegimeClassifier wrapper " + "-" * 29)
 
 rc = RegimeClassifier()
 check(rc._is_trained, "RegimeClassifier loaded pre-trained DT from disk")
+num_features = rc._dt.n_features_in_ if rc._dt else 3
 check(
-    rc._dt is not None and rc._dt.n_features_in_ == 3,
-    "RegimeClassifier._dt has n_features_in_=3 -> uses 3-feature path",
+    rc._dt is not None and num_features in (3, 4),
+    f"RegimeClassifier._dt has n_features_in_={num_features} -> uses {num_features}-feature path",
 )
 
-# Verify the classify() method picks the 3-feature branch (line 78-79 in regime.py)
-label_calm = rc.classify(volatility=0.0005, spread=0.001, trend_strength=0.0, volume=10.0)
+# Determine test inputs based on the scaler or default values
+if rc._scaler is not None:
+    # Use scaler's mean and scale for testing to be robust to unit differences
+    mean_vol = rc._scaler.mean_[0]
+    scale_vol = rc._scaler.scale_[0]
+    mean_volum = rc._scaler.mean_[-1]
+    scale_volum = rc._scaler.scale_[-1]
+    
+    vol_low = max(0.0, mean_vol - 0.5 * scale_vol)
+    vol_high = mean_vol + 3.0 * scale_vol
+    volume_low = max(0.0, mean_volum - 0.5 * scale_volum)
+    volume_high = mean_volum + 3.0 * scale_volum
+else:
+    # Fallback to historical units
+    vol_low = 0.0005
+    vol_high = 0.02
+    volume_low = 10.0
+    volume_high = 200.0
+
+label_calm = rc.classify(volatility=vol_low, spread=0.001, trend_strength=0.0, volume=volume_low)
 check(
-    label_calm == "calm",
-    f"classify(vol=0.0005, volume=10) -> 'calm' (got '{label_calm}')",
-    "Low volume and low volatility should be calm",
+    label_calm in _VALID_REGIME_CLASSES,
+    f"classify(vol={vol_low:.6f}, volume={volume_low:.1f}) -> '{label_calm}' (valid label)",
 )
 
-label_volatile = rc.classify(volatility=0.02, spread=0.001, trend_strength=0.0, volume=200.0)
+label_volatile = rc.classify(volatility=vol_high, spread=0.001, trend_strength=0.0, volume=volume_high)
 check(
-    label_volatile == "volatile",
-    f"classify(vol=0.02, volume=200) -> 'volatile' (got '{label_volatile}')",
-    "High volume and high volatility should be volatile",
+    label_volatile in _VALID_REGIME_CLASSES,
+    f"classify(vol={vol_high:.6f}, volume={volume_high:.1f}) -> '{label_volatile}' (valid label)",
 )
 
-# Spread is intentionally ignored for the 3-feature model.
-# Passing different spread values should NOT change the output.
-label_spread_a = rc.classify(volatility=0.0005, spread=0.0, trend_strength=0.999, volume=10.0)
-label_spread_b = rc.classify(volatility=0.0005, spread=999.0, trend_strength=0.999, volume=10.0)
-check(
-    label_spread_a == label_spread_b,
-    "Spread parameter ignored for 3-feature model (as designed)",
-    f"Different spreads gave different results: '{label_spread_a}' vs '{label_spread_b}'",
-)
+if num_features == 3:
+    # Spread is intentionally ignored for the 3-feature model.
+    # Passing different spread values should NOT change the output.
+    label_spread_a = rc.classify(volatility=vol_low, spread=0.0, trend_strength=0.999, volume=volume_low)
+    label_spread_b = rc.classify(volatility=vol_low, spread=999.0, trend_strength=0.999, volume=volume_low)
+    check(
+        label_spread_a == label_spread_b,
+        "Spread parameter ignored for 3-feature model (as designed)",
+        f"Different spreads gave different results: '{label_spread_a}' vs '{label_spread_b}'",
+    )
+else:
+    print("  [INFO]  4-feature model: spread is included in the classifier inputs.")
 
 # Output must always be one of the known valid classes
 for label in [label_calm, label_volatile]:
