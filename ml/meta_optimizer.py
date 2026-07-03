@@ -166,6 +166,11 @@ MIN_STEP_K         = 2      # floor for k_runs step
 MIN_STEP_THRESH    = 0.01   # floor for threshold step
 RESTART_THRESHOLD  = 0.30   # score floor — restart if best score stays below this
 
+# Stagnation detection constants
+STAGNATION_DELTA_THRESHOLD = 0.005  # minimum score improvement to reset stagnation counter
+STAGNATION_LIMIT = 20               # consecutive non-improving updates before restart
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MetaParameterOptimizer
@@ -188,6 +193,11 @@ class MetaParameterOptimizer:
         # Per-regime optimizer state
         # { regime_str -> { "params": MetaParams, "history": [...] } }
         self._state: dict[str, dict] = {}
+
+        # Stagnation detection: tracks consecutive non-improving updates per regime
+        # Reset to 0 whenever score improves by >= STAGNATION_DELTA_THRESHOLD
+        self._stagnation_counts: dict[str, int] = {}
+        self._last_scores: dict[str, float] = {}
 
         self._ensure_schema()
         self._load_from_db()
@@ -266,6 +276,10 @@ class MetaParameterOptimizer:
 
             if best_neighbour is not None:
                 # Improvement found — move to neighbour
+                # Reset stagnation counter since we made progress
+                self._stagnation_counts[regime] = 0
+                self._last_scores[regime] = best_neighbour_score
+
                 old_dict = current.to_dict()
                 new_dict = best_neighbour.to_dict()
                 logger.info(
@@ -295,21 +309,51 @@ class MetaParameterOptimizer:
                     regime, current_score, old_k, current.step_k, old_thresh, current.step_thresh
                 )
 
-                # If steps are at minimum floor — random restart
-                if (current.step_k <= MIN_STEP_K and
-                        current.step_thresh <= MIN_STEP_THRESH):
+                # --- Stagnation detection ---
+                # Check whether score has meaningfully improved since last update.
+                # Small oscillations (< STAGNATION_DELTA_THRESHOLD) count as stagnation.
+                last_score = self._last_scores.get(regime, current_score)
+                score_delta = abs(current_score - last_score)
 
-                    avg_score = (
-                        sum(h["score"] for h in bucket["history"][-20:])
-                        / max(1, min(20, len(bucket["history"])))
+                if score_delta >= STAGNATION_DELTA_THRESHOLD:
+                    # Real improvement — reset stagnation counter
+                    self._stagnation_counts[regime] = 0
+                    logger.debug(
+                        "MetaOptimizer: stagnation counter reset | regime=%s | "
+                        "score delta=%.4f", regime, score_delta
                     )
-                    if avg_score < RESTART_THRESHOLD:
-                        bucket["params"] = self._random_init(regime)
-                        logger.info(
-                            "MetaOptimizer: Random restart triggered for regime '%s' | "
-                            "avg_score=%.4f below threshold=%.2f. New Params: %s",
-                            regime, avg_score, RESTART_THRESHOLD, bucket["params"].to_dict(),
-                        )
+                else:
+                    # No meaningful improvement — increment stagnation counter
+                    self._stagnation_counts[regime] = (
+                        self._stagnation_counts.get(regime, 0) + 1
+                    )
+
+                self._last_scores[regime] = current_score
+
+                # Trigger restart if stuck for STAGNATION_LIMIT consecutive updates
+                # AND step sizes are already at minimum (fully converged)
+                stagnation_count = self._stagnation_counts.get(regime, 0)
+                if (stagnation_count >= STAGNATION_LIMIT
+                        and current.step_k <= MIN_STEP_K
+                        and current.step_thresh <= MIN_STEP_THRESH):
+
+                    old_params = current.to_dict()
+                    new_params = self._random_init(regime)
+                    bucket["params"] = new_params
+                    self._stagnation_counts[regime] = 0
+                    self._last_scores[regime] = 0.5  # reset to uninformed prior
+
+                    logger.info(
+                        "MetaOptimizer: STAGNATION RESTART | regime=%s | "
+                        "stuck for %d updates | score_range=[%.4f] | "
+                        "escaped_params=k_runs=%d,min_runs=%d,threshold=%.2f | "
+                        "new_params=k_runs=%d,min_runs=%d,threshold=%.2f",
+                        regime, stagnation_count, current_score,
+                        old_params["k_runs"], old_params["min_runs"],
+                        old_params["threshold"],
+                        new_params.k_runs, new_params.min_runs,
+                        new_params.threshold,
+                    )
 
         self._persist(regime)
 
