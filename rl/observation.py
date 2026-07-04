@@ -121,7 +121,7 @@ def build_base_obs(state: "CausalState") -> np.ndarray:
     values: list[float] = []
     import typing
 
-    for name, field_info in state.model_fields.items():
+    for name, field_info in type(state).model_fields.items():
         if name in _OBS_EXCLUDED:
             continue
         ann = field_info.annotation
