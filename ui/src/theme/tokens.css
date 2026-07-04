@@ -1,0 +1,36 @@
+:root {
+  /* Ivory Causal Research Cockpit */
+  --bg-base: #fffff0;
+  --panel-bg: #f7f7f7;
+  --border-soft: #d4d4d8;
+  --border-active: #71717a;
+  
+  --text-primary: #27272a;
+  --text-secondary: #52525b;
+  --text-muted: #a1a1aa;
+  --text-faint: #d4d4d8;
+
+  --accent: #2563eb;
+  --accent-dim: rgba(37, 99, 235, 0.1);
+  --text-on-accent: #ffffff;
+
+  /* Subsystem Colors */
+  --feed-color: #0d9488;
+  --bars-color: #64748b;
+  --graph-color: #4f46e5;
+  --thesis-color: #2563eb;
+  --twin-color: #7c3aed;
+  --ledger-color: #475569;
+  --trust-color: #16a34a;
+  --optimizer-color: #9333ea;
+  --escape-valve-color: #c2410c;
+  --escape-valve-bg: #fff7ed;
+
+  /* Status Colors */
+  --success: #16a34a;
+  --success-bg: rgba(22, 163, 74, 0.1);
+  --warning: #ca8a04;
+  --warning-bg: rgba(202, 138, 4, 0.1);
+  --error: #dc2626;
+  --error-bg: rgba(220, 38, 38, 0.1);
+}

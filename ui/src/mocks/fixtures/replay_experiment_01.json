@@ -1,0 +1,102 @@
+{
+  "escape_valve": {
+    "armed": true,
+    "fired": false,
+    "holdsCount": 0,
+    "holdsThreshold": 12,
+    "positionFraction": 0,
+    "feedbackEnabled": false
+  },
+  "regime": {
+    "status": "trained",
+    "k": 5,
+    "clusterId": "high_vol_trending",
+    "confidence": 0.92,
+    "populationSize": 1500
+  },
+  "feed": {
+    "price": 145.2,
+    "spread": 0.01,
+    "volume": 12500,
+    "trade_pressure": 1.2,
+    "btc_return": 0.001,
+    "eth_return": 0.002,
+    "stream_status": "live"
+  },
+  "bars": {
+    "bars_ready": 200,
+    "required_bars": 200,
+    "feature_groups": {
+      "macro": [1, 2, 3],
+      "microstructure": [1, 2, 3],
+      "market": [1, 2, 3, 4]
+    }
+  },
+  "graph": {
+    "nodes": [
+      { "id": "vix", "layer": "macro" },
+      { "id": "spread", "layer": "microstructure" },
+      { "id": "price", "layer": "market" },
+      { "id": "target", "layer": "target" }
+    ],
+    "edges": [
+      { "source": "vix", "target": "price", "status": "validated" },
+      { "source": "spread", "target": "target", "status": "hypothesis" }
+    ]
+  },
+  "thesis": {
+    "hypotheses": [
+      {
+        "id": "H1",
+        "rank": 1,
+        "score": 0.85,
+        "selected": true,
+        "chain": [
+          { "source": "vix", "target": "price" },
+          { "source": "price", "target": "target" }
+        ]
+      }
+    ]
+  },
+  "readiness": {
+    "ml1_verdict": "normal",
+    "probabilities": {
+      "normal": 0.8,
+      "stressed": 0.15,
+      "degraded": 0.05
+    },
+    "ml2_breach_risk": 0.2
+  },
+  "twin": {
+    "trajectories": {
+      "H1": { "selected": true, "breached": false }
+    },
+    "actual_path": true
+  },
+  "ledger": {
+    "decision_object": {
+      "id": "DEC-101",
+      "assumptions": [
+        { "source": "vix", "target": "price" }
+      ]
+    },
+    "outcome_record": {
+      "pnl": 1.5
+    }
+  },
+  "trust": {
+    "chain_id": "vix->price",
+    "before": 0.75,
+    "after": 0.80,
+    "delta": 0.05,
+    "reason": "profitable outcome"
+  },
+  "optimizer": {
+    "regime": "high_vol_trending",
+    "candidates": [
+      { "id": "C1", "status": "active", "k_runs": 10, "min_runs": 5, "threshold": 0.7, "score": 0.85 },
+      { "id": "C2", "status": "exploring", "k_runs": 2, "min_runs": 5, "threshold": 0.65, "score": 0.6 },
+      { "id": "C3", "status": "stagnating", "k_runs": 25, "min_runs": 5, "threshold": 0.75, "score": 0.4, "stagnation_counter": 3 }
+    ]
+  }
+}

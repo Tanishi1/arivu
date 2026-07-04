@@ -1,0 +1,83 @@
+{
+  "escape_valve": {
+    "armed": true,
+    "fired": true,
+    "holdsCount": 12,
+    "holdsThreshold": 12,
+    "positionFraction": 0.02,
+    "feedbackEnabled": true
+  },
+  "regime": {
+    "status": "trained",
+    "k": 5,
+    "clusterId": "low_vol_ranging",
+    "confidence": 0.8,
+    "populationSize": 1500
+  },
+  "feed": {
+    "price": 145.2,
+    "spread": 0.01,
+    "volume": 12500,
+    "trade_pressure": 1.2,
+    "btc_return": 0.001,
+    "eth_return": 0.002,
+    "stream_status": "live"
+  },
+  "bars": {
+    "bars_ready": 200,
+    "required_bars": 200,
+    "feature_groups": {}
+  },
+  "graph": {
+    "nodes": [],
+    "edges": []
+  },
+  "thesis": {
+    "hypotheses": [
+      {
+        "id": "H2",
+        "rank": 1,
+        "score": 0.45,
+        "selected": false,
+        "chain": [
+          { "source": "spread", "target": "target" }
+        ]
+      }
+    ]
+  },
+  "readiness": {
+    "ml1_verdict": "normal",
+    "probabilities": {
+      "normal": 0.9,
+      "stressed": 0.05,
+      "degraded": 0.05
+    },
+    "ml2_breach_risk": 0.1
+  },
+  "twin": {
+    "trajectories": {
+      "H2": { "selected": false, "breached": false }
+    },
+    "actual_path": true
+  },
+  "ledger": {
+    "decision_object": {
+      "id": "DEC-102",
+      "assumptions": []
+    },
+    "outcome_record": {
+      "pnl": -0.5
+    }
+  },
+  "trust": {
+    "chain_id": "none",
+    "before": 0,
+    "after": 0,
+    "delta": 0,
+    "reason": "escape valve fired"
+  },
+  "optimizer": {
+    "regime": "low_vol_ranging",
+    "candidates": []
+  }
+}
