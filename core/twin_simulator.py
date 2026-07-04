@@ -180,28 +180,43 @@ class TwinSimulator:
             raise ValueError("TwinSimulator.select_best called with empty hypothesis list")
 
         trajectories = self.simulate_all(hypotheses, snapshot, current_state)
-        
+
         best_ev = 0.0
         best_idx = -1
-        
+
         for i, t in enumerate(trajectories):
-            if abs(t.expected_value) > best_ev:
-                best_ev = abs(t.expected_value)
+            hyp = hypotheses[i]
+            avg_breach_risk = getattr(hyp, "avg_breach_risk", 0.5)
+            
+            # Risk discount: high breach risk reduces expected value
+            risk_discount = max(0.10, 1.0 - avg_breach_risk)
+            risk_adjusted_ev = abs(t.expected_value) * risk_discount
+
+            logger.debug(
+                "TwinSimulator: hypothesis %d | raw_ev=%.6f | "
+                "breach_risk=%.3f | discount=%.3f | risk_adj_ev=%.6f | chain=%s",
+                i, t.expected_value, avg_breach_risk,
+                risk_discount, risk_adjusted_ev,
+                hyp.chain_summary(),
+            )
+
+            if risk_adjusted_ev > best_ev:
+                best_ev = risk_adjusted_ev
                 best_idx = i
-                
+
         if best_idx == -1:
-            logger.info("TwinSimulator: no trajectories with non-zero expected value")
+            logger.info("TwinSimulator: no hypothesis with non-zero risk-adjusted EV")
             return None, None
 
-        best_hyp = hypotheses[best_idx]
-        best_traj = trajectories[best_idx]
-
         logger.info(
-            "TwinSimulator: selected | chain=%s | predicted_return=%.6f | ev=%.6f",
-            best_hyp.chain_summary(), best_traj.predicted_price_return, best_traj.expected_value,
+            "TwinSimulator: selected | chain=%s | raw_ev=%.6f | "
+            "breach_risk=%.3f | risk_adj_ev=%.6f",
+            hypotheses[best_idx].chain_summary(),
+            trajectories[best_idx].expected_value,
+            getattr(hypotheses[best_idx], "avg_breach_risk", 0.5),
+            best_ev,
         )
-
-        return best_hyp, best_traj
+        return hypotheses[best_idx], trajectories[best_idx]
 
     def check_breach(
         self,

@@ -157,6 +157,8 @@ class TradeOutcome:
     regime_was_stable:  bool
     is_escape_valve:    bool = False
     edge_stability:     float = 0.0
+    avg_breach_risk:    float = 0.5
+    ml2_calibration:    float = 0.5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,14 +385,23 @@ class MetaParameterOptimizer:
 
         # Causal chain integrity bonus
         chain_bonus = 1.0 if outcome.causal_chain_held else 0.5
+        
+        # ML2 calibration reward
+        ml2_bonus = outcome.ml2_calibration
+
+        # Penalty for high breach risk on a losing trade
+        risk_penalty = 1.0
+        if outcome.avg_breach_risk > 0.70 and outcome.pnl_usd < 0:
+            risk_penalty = 0.6
 
         # Composite
         raw = (
-            direction_score * 0.45 +
-            accuracy        * 0.30 +
+            direction_score * 0.35 +
+            accuracy        * 0.25 +
             regime_purity   * 0.15 +
-            chain_bonus     * 0.10
-        )
+            chain_bonus     * 0.10 +
+            ml2_bonus       * 0.15
+        ) * risk_penalty
         return round(raw, 6)
 
     def _score_config(

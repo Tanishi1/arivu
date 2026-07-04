@@ -58,6 +58,7 @@ class CausalHypothesis:
     decision_source: str = "causal_agent"
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_escape_valve: bool = False
+    avg_breach_risk: float = 0.5
 
     def chain_summary(self) -> str:
         if not self.chain:

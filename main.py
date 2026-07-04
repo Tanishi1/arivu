@@ -517,6 +517,28 @@ async def causal_agent_loop(
                                         actual_return,
                                         _active_traj.predicted_price_return,
                                     )
+                                    # Retrieve stored breach risk from the DO's meta_params
+                                    avg_breach_risk = (active_do.meta_params or {}).get("avg_breach_risk", 0.5)
+
+                                    # Compute ML2 calibration: how accurate were the pre-trade predictions?
+                                    breach_log = record.assumptions_breached
+                                    calibration_scores = []
+                                    for assumption in active_do.assumptions:
+                                        actually_breached = 1.0 if assumption.name in breach_log else 0.0
+                                        error = abs(assumption.breach_risk - actually_breached)
+                                        calibration_scores.append(1.0 - error)
+
+                                    ml2_calibration = (
+                                        sum(calibration_scores) / len(calibration_scores)
+                                        if calibration_scores else 0.5
+                                    )
+
+                                    logger.info(
+                                        "CausalAgent: ML2 calibration | avg_breach_risk=%.3f | "
+                                        "ml2_calibration=%.3f | assumptions_breached=%s",
+                                        avg_breach_risk, ml2_calibration, breach_log,
+                                    )
+
                                     # Update MetaParameterOptimizer
                                     trade_outcome = TradeOutcome(
                                         meta_params_used=active_do.meta_params or {},
@@ -526,6 +548,8 @@ async def causal_agent_loop(
                                         pnl_usd=record.actual_pnl,
                                         causal_chain_held=False,
                                         regime_was_stable=True,
+                                        avg_breach_risk=avg_breach_risk,
+                                        ml2_calibration=ml2_calibration,
                                     )
                                     await asyncio.to_thread(layer1._optimizer.update, trade_outcome)
                                     # Check if ML2 should retrain
@@ -590,6 +614,28 @@ async def causal_agent_loop(
                                     actual_return,
                                     _active_traj.predicted_price_return if _active_traj else 0.0,
                                 )
+                                # Retrieve stored breach risk from the DO's meta_params
+                                avg_breach_risk = (active_do.meta_params or {}).get("avg_breach_risk", 0.5)
+
+                                # Compute ML2 calibration: how accurate were the pre-trade predictions?
+                                breach_log = record.assumptions_breached
+                                calibration_scores = []
+                                for assumption in active_do.assumptions:
+                                    actually_breached = 1.0 if assumption.name in breach_log else 0.0
+                                    error = abs(assumption.breach_risk - actually_breached)
+                                    calibration_scores.append(1.0 - error)
+
+                                ml2_calibration = (
+                                    sum(calibration_scores) / len(calibration_scores)
+                                    if calibration_scores else 0.5
+                                )
+
+                                logger.info(
+                                    "CausalAgent: ML2 calibration | avg_breach_risk=%.3f | "
+                                    "ml2_calibration=%.3f | assumptions_breached=%s",
+                                    avg_breach_risk, ml2_calibration, breach_log,
+                                )
+
                                 # Update MetaParameterOptimizer
                                 trade_outcome = TradeOutcome(
                                     meta_params_used=active_do.meta_params or {},
@@ -599,6 +645,8 @@ async def causal_agent_loop(
                                     pnl_usd=record.actual_pnl,
                                     causal_chain_held=True,
                                     regime_was_stable=True,
+                                    avg_breach_risk=avg_breach_risk,
+                                    ml2_calibration=ml2_calibration,
                                 )
                                 await asyncio.to_thread(layer1._optimizer.update, trade_outcome)
                                 # Check if ML2 should retrain
@@ -653,6 +701,53 @@ async def causal_agent_loop(
             if not hypotheses:
                 continue
 
+            from core.schemas import Assumption
+            for hyp in hypotheses:
+                if not hyp.chain:
+                    hyp.avg_breach_risk = 0.5
+                    continue
+            
+                proxy_assumptions = []
+                for edge in hyp.chain[:3]:  # cap at 3 edges to avoid ML2 overload
+                    # Use the actual current value of the edge's source variable from
+                    # CausalState — not a sentinel. This gives ML2 real feature values
+                    # to score against its training distribution.
+                    source_var = edge.source
+                    current_val = getattr(state, source_var, None)
+            
+                    if current_val is None:
+                        # Variable exists in graph but not in CausalState — skip rather
+                        # than feeding ML2 a fabricated value.
+                        continue
+            
+                    # Proximity: how far is the current value from triggering a breach?
+                    # Use Layer 1 score as a proxy for how stable this edge has been.
+                    proximity = 1.0 - hyp.layer1_score
+            
+                    proxy_assumptions.append(Assumption(
+                        name=f"edge_{edge.source}_{edge.target}_lag{edge.lag}",
+                        variable=source_var,       # real variable, not a sentinel
+                        operator="lt",
+                        threshold=abs(current_val) * 1.5 if current_val != 0 else 1.0,
+                        current_value=current_val,    # real current value from CausalState
+                        proximity=proximity,
+                    ))
+            
+                if not proxy_assumptions:
+                    hyp.avg_breach_risk = 0.5
+                    continue
+            
+                annotated_proxy = ml2.annotate(
+                    proxy_assumptions,
+                    state,
+                    hyp.time_horizon_seconds / 60.0,
+                    state.algo_health_vector,
+                )
+                hyp.avg_breach_risk = (
+                    sum(a.breach_risk for a in annotated_proxy) / len(annotated_proxy)
+                    if annotated_proxy else 0.5
+                )
+
             best_hyp = hypotheses[0]
 
             if best_hyp is None or (best_hyp.composite_score < MIN_TRADE_SCORE and not best_hyp.is_escape_valve):
@@ -700,17 +795,26 @@ async def causal_agent_loop(
 
             # Represent the causal chain as the "assumptions" for ledger compatibility
             from core.schemas import Assumption
+            from pydantic import ValidationError
             causal_assumptions = []
             for edge in selected_hyp.chain[:3]:
-                causal_assumptions.append(Assumption(
-                    name=f"causal_edge|{edge.source}|{edge.target}|{edge.lag}",
-                    variable="volatility",  # use a valid CausalStateField as sentinel
-                    operator="lt",
-                    threshold=1.0,
-                    current_value=edge.coeff,
-                    proximity=round(1.0 - abs(edge.coeff), 4),
-                    breach_risk=1.0 - selected_hyp.layer2_score,
-                ))
+                source_var = edge.source
+                current_val = getattr(state, source_var, None)
+                if current_val is None:
+                    continue
+                proximity = 1.0 - selected_hyp.layer1_score
+                try:
+                    causal_assumptions.append(Assumption(
+                        name=f"causal_edge|{edge.source}|{edge.target}|{edge.lag}",
+                        variable=source_var,
+                        operator="lt",
+                        threshold=abs(current_val) * 1.5 if current_val != 0 else 1.0,
+                        current_value=current_val,
+                        proximity=proximity,
+                        breach_risk=1.0 - selected_hyp.layer2_score,
+                    ))
+                except ValidationError:
+                    continue
 
             # Annotate with ML2 breach risk predictor
             ml1_vector = state.algo_health_vector
@@ -719,6 +823,28 @@ async def causal_agent_loop(
                 state,
                 time_horizon=selected_hyp.time_horizon_seconds / 60.0,
                 ml1_vector=ml1_vector,
+            )
+
+            # After ml2.annotate() returns causal_assumptions:
+            if causal_assumptions:
+                avg_breach_risk = sum(
+                    a.breach_risk for a in causal_assumptions
+                ) / len(causal_assumptions)
+            else:
+                avg_breach_risk = 0.5
+
+            risk_multiplier = max(0.10, 1.0 - avg_breach_risk)
+
+            original_fraction = 0.01 if selected_hyp.is_escape_valve else 0.10
+            adjusted_params = {
+                "position_fraction": round(original_fraction * risk_multiplier, 4)
+            }
+
+            logger.info(
+                "CausalAgent: ML2 position sizing | avg_breach_risk=%.3f | "
+                "multiplier=%.3f | fraction %.4f → %.4f",
+                avg_breach_risk, risk_multiplier,
+                original_fraction, adjusted_params["position_fraction"],
             )
 
             do = DecisionObject(
@@ -754,6 +880,8 @@ async def causal_agent_loop(
                     **layer1._optimizer.get_params(current_regime).to_dict(),
                     "is_escape_valve": selected_hyp.is_escape_valve,
                     "edge_stability": selected_hyp.layer1_score,
+                    "avg_breach_risk": avg_breach_risk,
+                    "position_fraction_adjusted": adjusted_params["position_fraction"],
                 },
                 causal_chain_snapshot={"chain": [e.to_dict() for e in selected_hyp.chain]},
             )
@@ -777,7 +905,6 @@ async def causal_agent_loop(
             try:
                 # Detect escape valve trade
                 is_escape_valve = selected_hyp.is_escape_valve
-                position_fraction = 0.01 if is_escape_valve else 0.10
 
                 if is_escape_valve:
                     logger.warning(
@@ -786,10 +913,10 @@ async def causal_agent_loop(
                         selected_hyp.chain_summary(),
                     )
 
-                # Use position_fraction when calling executor
+                # Use adjusted_params when calling executor
                 telemetry = await executor.execute(
                     signal=trade_signal,
-                    params={"position_fraction": position_fraction},
+                    params=adjusted_params,
                     state=state,
                     decision_object_id=str(do.id),
                 )

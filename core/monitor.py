@@ -95,20 +95,34 @@ async def assumption_monitor_loop(
     logger.info("Assumption monitor started | interval=%ds", MONITOR_INTERVAL_S)
 
     while stop_event is None or not stop_event.is_set():
-        # B6 FIX: plain sleep + top-of-loop check. The previous asyncio.shield approach
-        # created a new background Task every 5s that was never collected — ~10,000
-        # orphaned tasks over a 14-hour run. Simple sleep is correct: we exit within
-        # MONITOR_INTERVAL_S (5s) of shutdown being signalled, which is acceptable.
-        await asyncio.sleep(MONITOR_INTERVAL_S)
-
         if _is_feed_stale(state_manager):
             logger.warning("Monitor paused | feed stale > %ds", STALE_THRESHOLD_S)
+            await asyncio.sleep(MONITOR_INTERVAL_S)
             continue
 
-        active: DecisionObject | None = await asyncio.to_thread(ledger_writer.get_active)
+        active = await asyncio.to_thread(ledger_writer.get_active)
+
         if active is None:
             logger.debug("Monitor | no active DecisionObject")
+            await asyncio.sleep(MONITOR_INTERVAL_S)
             continue
+
+        # Compute dynamic interval — continuous linear interpolation over [2, 10] seconds.
+        if active.assumptions:
+            max_breach_risk = max(
+                a.breach_risk for a in active.assumptions
+            )
+            interval = max(2.0, min(10.0, round(10.0 - (max_breach_risk * 8.0), 1)))
+        else:
+            interval = float(MONITOR_INTERVAL_S)
+            max_breach_risk = -1.0
+
+        logger.debug(
+            "Monitor: dynamic cadence | max_breach_risk=%.3f | interval=%.1fs",
+            max_breach_risk, interval,
+        )
+
+        await asyncio.sleep(interval)
 
         if active.status == "COMMITTED":
             logger.debug("Monitor | object still COMMITTED, waiting for execution")
