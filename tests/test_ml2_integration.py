@@ -291,6 +291,34 @@ class TestExecutorCrossProcessLock:
         e = Executor()
         assert e._xlock is None
 
+    def test_executor_explicit_credentials_passed(self):
+        """Executor() with explicit keys must set key_id and secret_key correctly."""
+        from execution.executor import Executor
+        e = Executor(api_key="explicit_key", api_secret="explicit_secret")
+        assert e._api._key_id == "explicit_key"
+        assert e._api._secret_key == "explicit_secret"
+
+    @pytest.mark.asyncio
+    async def test_executor_no_capital_split(self, monkeypatch):
+        """Executor._compute_quantity should use 100% of equity (no 0.5 split)."""
+        import os
+        from unittest.mock import MagicMock
+        monkeypatch.setenv("ALPACA_API_KEY", "test")
+        monkeypatch.setenv("ALPACA_SECRET_KEY", "test")
+        from execution.executor import Executor
+        from core.schemas import CausalState
+        
+        e = Executor()
+        mock_acc = MagicMock()
+        mock_acc.equity = 100000.0
+        monkeypatch.setattr(e._api, "get_account", lambda: mock_acc)
+        
+        state = CausalState(price=100.0, volatility=0.01, volume=1000.0)
+        # 10% position fraction on 100,000 equity is 10,000 exposure.
+        # At $100 price, that should be 100 units.
+        qty = await e._compute_quantity(params={"position_fraction": 0.10}, state=state)
+        assert qty == pytest.approx(100.0)
+
     def test_executor_with_lock_path_warns_if_filelock_missing(self, monkeypatch, tmp_path):
         """If filelock is not installed but lock path provided, must log WARNING
         and set _xlock=None — never crash."""

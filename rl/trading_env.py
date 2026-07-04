@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 EPISODE_BARS: int = 240          # 4 hours at 1 bar/minute
 STEP_PENALTY_NEGATIVE: float = -0.0001   # per-step penalty when in a losing unrealised position
 POSITION_FRACTION: float = 0.05          # fixed for both RL arms
+MIN_HOLD_BARS: int = 10         # minimum bars to hold before SELL is allowed (10 bars = 100s)
 
 # Action encoding
 ACTION_HOLD = 0
@@ -80,6 +81,14 @@ class TradingEnv(gym.Env):
         self._in_position: bool = False
         self._entry_price: float = 0.0
         self._episode_pnl: float = 0.0
+        self._steps_since_entry: int = 0   # for MIN_HOLD_BARS enforcement
+        # BUG6 FIX: Reconstruct cumulative price from per-bar returns.
+        # Previously _get_price() returned price_return directly (e.g. 0.0004),
+        # not an actual price level. PnL = (0.0004 - 0.0003) / 0.0003 = 33% per trade —
+        # or worse, negative price_return bars give division by near-zero → \u00b1500% rewards.
+        # PPO learns HOLD=safe because BUY almost always gives catastrophic reward.
+        # Fix: track a reconstructed price starting at 100.0.
+        self._current_price: float = 100.0
 
         logger.debug(
             "TradingEnv init | mode=%s | obs_dim=%d | n_bars=%d | episode_bars=%d",
@@ -106,21 +115,32 @@ class TradingEnv(gym.Env):
         self._in_position = False
         self._entry_price = 0.0
         self._episode_pnl = 0.0
+        self._steps_since_entry = 0
+        self._current_price = 100.0  # BUG6 FIX: reset reconstructed price each episode
 
         obs = self._get_obs()
         return obs, {}
 
     def step(self, action: int):
         bar_idx = self._start_idx + self._current_step
-        price = self._get_price(bar_idx)
+        # BUG6 FIX: Reconstruct price level by applying the bar's price_return to
+        # the running price. This gives a realistic price trajectory for PnL calculation.
+        price_return_bar = float(self._data[min(bar_idx, self._n_bars - 1), 0])
+        self._current_price *= (1.0 + price_return_bar)
+        price = self._current_price
 
         reward = 0.0
         terminated = False
         truncated = False
 
+        # Minimum hold enforcement: mask SELL if < MIN_HOLD_BARS since entry
+        if action == ACTION_SELL and self._in_position and self._steps_since_entry < MIN_HOLD_BARS:
+            action = ACTION_HOLD  # too early to sell — force hold
+
         if action == ACTION_BUY and not self._in_position:
             self._in_position = True
             self._entry_price = price
+            self._steps_since_entry = 0
 
         elif action == ACTION_SELL and self._in_position:
             pnl_pct = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
@@ -128,8 +148,10 @@ class TradingEnv(gym.Env):
             self._episode_pnl += reward
             self._in_position = False
             self._entry_price = 0.0
+            self._steps_since_entry = 0
 
         elif self._in_position:
+            self._steps_since_entry += 1
             # Shaped step penalty for unrealised losing position
             unrealised_pnl = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
             if unrealised_pnl < 0:
@@ -141,7 +163,9 @@ class TradingEnv(gym.Env):
         if self._current_step >= EPISODE_BARS:
             if self._in_position:
                 # Force-close at final bar
-                close_price = self._get_price(self._start_idx + self._current_step - 1)
+                price_return_last = float(self._data[min(self._start_idx + self._current_step - 1, self._n_bars - 1), 0])
+                self._current_price *= (1.0 + price_return_last)
+                close_price = self._current_price
                 pnl_pct = (close_price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
                 reward += float(pnl_pct)
                 self._episode_pnl += float(pnl_pct)
@@ -171,23 +195,34 @@ class TradingEnv(gym.Env):
     def render(self):
         pass
 
+    def action_masks(self) -> list[bool]:
+        """MaskablePPO action masks — prevents logically invalid actions.
+
+        Masks:
+          - BUY  (action 1) when already in position
+          - SELL (action 2) when not in position
+          - SELL (action 2) also masked within MIN_HOLD_BARS of entry to prevent churn
+        This eliminates wasted exploration of invalid actions so the agent
+        focuses on HOLD vs BUY (no position) and HOLD vs SELL (in position).
+        """
+        can_sell = self._in_position and self._steps_since_entry >= MIN_HOLD_BARS
+        return [
+            True,                      # HOLD always valid
+            not self._in_position,     # BUY only valid when flat
+            can_sell,                  # SELL only valid when long AND past min hold
+        ]
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _get_price(self, bar_idx: int) -> float:
-        """Extract close price proxy from feature bar.
+        """[DEPRECATED — price is now tracked via self._current_price in step()]
 
-        The feature matrix doesn't store raw price — we use price_return
-        (col 0) to reconstruct a relative price change for PnL calculation.
-        For the purposes of the gym env, we treat price_return directly as
-        a one-bar return rather than reconstructing an absolute price, which
-        avoids needing a reference price at episode start.
+        Kept for backward compatibility with force-close path.
+        Returns self._current_price which is updated each step.
         """
-        idx = min(bar_idx, self._n_bars - 1)
-        # col 0 is price_return — treat as the bar's return for PnL
-        # This is intentional: the agent learns from returns, not raw price levels
-        return float(self._data[idx, 0])
+        return self._current_price
 
     def _get_obs(self) -> np.ndarray:
         """Build observation from current bar's feature row."""

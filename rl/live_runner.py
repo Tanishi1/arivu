@@ -71,21 +71,30 @@ class RLLiveRunner:
         self._step_count = 0
         self._in_position = False
         self._entry_price: float = 0.0
+        self._steps_since_entry: int = 0   # live min-hold enforcement (mirrors TradingEnv)
+        self._min_hold_bars: int = 10      # 10 bars = 100s at 10s per bar
 
         logger.info(
             "RLLiveRunner init | arm=%s | source=%s | dry_run=%s",
             arm, self._decision_source, dry_run,
         )
 
-        # Load PPO model
-        from stable_baselines3 import PPO
+        # BUG7 FIX: Load as MaskablePPO — standard PPO.load() ignores action_masks()
+        # during predict(), making the masking we add to TradingEnv completely ineffective.
+        try:
+            from sb3_contrib import MaskablePPO
+        except ImportError:
+            logger.error(
+                "sb3_contrib not installed. Run: pip install sb3-contrib"
+            )
+            raise
         if not os.path.exists(model_path + ".zip") and not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"RLLiveRunner: model not found at {model_path}. "
                 "Run rl/train_ppo.py first."
             )
-        self._model = PPO.load(model_path)
-        logger.info("RLLiveRunner: loaded model from %s", model_path)
+        self._model = MaskablePPO.load(model_path)
+        logger.info("RLLiveRunner: loaded MaskablePPO model from %s", model_path)
 
         if self._phase_b_active:
             self._phase_b_start = time.monotonic()
@@ -106,10 +115,24 @@ class RLLiveRunner:
         """Execute one decision step. Called once per bar (every ~10s live)."""
         try:
             obs = self._build_obs(state)
-            action, _ = await asyncio.to_thread(self._model.predict, obs, deterministic=True)
+            # Live action masking mirroring TradingEnv.action_masks()
+            # SELL masked within min-hold period to prevent churn
+            can_sell = self._in_position and self._steps_since_entry >= self._min_hold_bars
+            live_masks = np.array([
+                True,                     # HOLD always valid
+                not self._in_position,    # BUY only when flat
+                can_sell,                 # SELL only when long AND past min hold
+            ])
+            action, _ = await asyncio.to_thread(
+                self._model.predict, obs, deterministic=True, action_masks=live_masks
+            )
             action = int(action)
 
             signal = ["HOLD", "BUY", "SELL"][action]
+
+            # Increment steps_since_entry every step when in position
+            if self._in_position:
+                self._steps_since_entry += 1
 
             if signal == "HOLD":
                 return
@@ -242,9 +265,35 @@ class RLLiveRunner:
             return
 
         try:
+            # If this is a SELL signal, fetch the unrealized PnL from the active position before closing,
+            # and prepare to write the OutcomeRecord for the active BUY trade.
+            active_buy_id = None
+            active_buy_hill_climb_iters = 0
+            actual_pnl = 0.0
+            if signal == "SELL":
+                from ledger.models import SessionLocal, DecisionObjectRow
+                with SessionLocal() as session:
+                    active_buy = session.query(DecisionObjectRow).filter(
+                        DecisionObjectRow.strategy_name == self._decision_source,
+                        DecisionObjectRow.status == "ACTIVE"
+                    ).first()
+                    if active_buy:
+                        active_buy_id = active_buy.id  # str UUID from ORM row
+                        active_buy_hill_climb_iters = active_buy.hill_climb_iterations or 0
+
+                try:
+                    from execution.executor import SYMBOL as _SYMBOL
+                    position = await asyncio.to_thread(self._executor._api.get_position, _SYMBOL)
+                    actual_pnl = float(position.unrealized_pl)
+                except Exception as exc:
+                    logger.warning("RLLiveRunner [%s] failed to get position PnL before close | %s", self._arm, exc)
+
             await self._executor.execute(
                 signal=signal,
-                params={"position_fraction": POSITION_FRACTION},
+                params={
+                    "position_fraction": POSITION_FRACTION,
+                    "order_type": "market",   # RL uses market orders for instant fill
+                },
                 state=state,
                 decision_object_id=str(do.id),
             )
@@ -253,9 +302,40 @@ class RLLiveRunner:
             if signal == "BUY":
                 self._in_position = True
                 self._entry_price = state.price
+                self._steps_since_entry = 0
             elif signal == "SELL":
+                # Compute P&L from tracked entry price vs current exit price.
+                # Do NOT use unrealized_pl from Alpaca — it reads 0 after position is closed.
+                if self._entry_price > 0:
+                    actual_pnl = (state.price - self._entry_price) / self._entry_price * POSITION_FRACTION * 10000.0
+                    # Scale: POSITION_FRACTION=5% of ~$10k = $500 exposure → P&L in USD
+                    actual_pnl = round(actual_pnl, 4)
+                else:
+                    actual_pnl = 0.0
+                logger.info(
+                    "RLLiveRunner [%s]: computed P&L | entry=%.4f exit=%.4f pnl=%.4f",
+                    self._arm, self._entry_price, state.price, actual_pnl,
+                )
                 self._in_position = False
                 self._entry_price = 0.0
+                self._steps_since_entry = 0
+
+                # Write the OutcomeRecord to close the active BUY trade
+                if active_buy_id:
+                    from core.schemas import OutcomeRecord
+                    from uuid import UUID
+                    record = OutcomeRecord(
+                        decision_object_id=UUID(active_buy_id),
+                        actual_pnl=actual_pnl,
+                        outcome_delta=0.0,       # RL doesn't project PnL
+                        assumptions_held=[],
+                        assumptions_breached=[],
+                        breach_timestamps={},
+                        hill_climb_iterations=active_buy_hill_climb_iters,
+                        close_reason="manual",   # closest valid Literal for RL-initiated close
+                        phase="bootstrap",
+                    )
+                    await asyncio.to_thread(self._ledger.close, active_buy_id, record)
 
             logger.info(
                 "RLLiveRunner [%s]: %s | price=%.4f | do_id=%s",

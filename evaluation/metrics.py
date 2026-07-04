@@ -35,6 +35,9 @@ import csv
 import json
 import logging
 import os
+import sqlite3
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -47,6 +50,7 @@ from ledger.models import SessionLocal, OutcomeRecordRow, DecisionObjectRow, Mod
 logger = logging.getLogger(__name__)
 
 PLOTS_DIR = Path("evaluation/plots")
+DB_PATH = os.getenv("SQLITE_PATH", "data/arivu.db")
 
 
 def _ensure_plots_dir() -> None:
@@ -275,6 +279,316 @@ def run_ml1_ablation() -> tuple[float, float] | None:
 
 
 # ---------------------------------------------------------------------------
+# Metric 4 — Regime-Conditional Win Rate Divergence
+# ---------------------------------------------------------------------------
+
+def plot_regime_win_rates() -> None:
+    """Win rate per arm broken down by market regime (Metric 4).
+
+    Regime inferred from market_state_snapshot:
+      regime_volatile > 0.5 → 'volatile', regime_trending > 0.5 → 'trending', else 'calm'.
+    Hypothesis: CausalAgent outperforms in trending (stable chains), RL-Standard is flat.
+    """
+    with SessionLocal() as session:
+        rows = (
+            session.query(DecisionObjectRow, OutcomeRecordRow)
+            .join(OutcomeRecordRow, DecisionObjectRow.id == OutcomeRecordRow.decision_object_id)
+            .filter(DecisionObjectRow.status == "CLOSED")
+            .all()
+        )
+    if not rows:
+        logger.warning("Metric 4: no closed entries")
+        return
+
+    ARM_LABELS = {
+        "CausalAgent": "Causal Agent",
+        "ppo_standard": "PPO Standard",
+        "ppo_causal_feature": "PPO Causal",
+        "EMAStrategy": "EMA Legacy",
+    }
+    REGIMES = ["calm", "trending", "volatile"]
+    stats: dict = {}
+
+    for do, out in rows:
+        arm = do.strategy_name
+        if arm not in ARM_LABELS:
+            continue
+        try:
+            mss = json.loads(do.market_state_snapshot)
+        except Exception:
+            continue
+        v = mss.get("regime_volatile", 0.0)
+        t = mss.get("regime_trending", 0.0)
+        regime = "volatile" if v > 0.5 else ("trending" if t > 0.5 else "calm")
+        key = (arm, regime)
+        if key not in stats:
+            stats[key] = [0, 0]
+        stats[key][1] += 1
+        if out.actual_pnl > 0:
+            stats[key][0] += 1
+
+    arms = [k for k in ARM_LABELS if any((k, r) in stats for r in REGIMES)]
+    if not arms:
+        logger.warning("Metric 4: no regime data in snapshots")
+        return
+
+    x = np.arange(len(arms))
+    width = 0.25
+    colors = {"calm": "#4A90D9", "trending": "#27AE60", "volatile": "#E74C3C"}
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for i, regime in enumerate(REGIMES):
+        win_rates = []
+        for arm in arms:
+            w, n = stats.get((arm, regime), [0, 0])
+            win_rates.append((w / n * 100) if n > 0 else 0.0)
+        bars = ax.bar(x + i * width, win_rates, width, label=regime.capitalize(),
+                      color=colors[regime], alpha=0.85)
+        ax.bar_label(bars, fmt="%.0f%%", padding=2, fontsize=8)
+
+    ax.set_xticks(x + width)
+    ax.set_xticklabels([ARM_LABELS[a] for a in arms])
+    ax.set_ylabel("Win Rate (%)")
+    ax.set_title("Metric 4 — Regime-Conditional Win Rate per Agent\n"
+                 "(CausalAgent should diverge from RL across regimes)")
+    ax.legend(title="Regime")
+    ax.set_ylim(0, 120)
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    _ensure_plots_dir()
+    fig.savefig(PLOTS_DIR / "regime_win_rates.png", dpi=150)
+    plt.close(fig)
+    logger.info("Metric 4 saved | regime_win_rates.png")
+
+
+# ---------------------------------------------------------------------------
+# Metric 5 — Inter-Agent Signal Correlation
+# ---------------------------------------------------------------------------
+
+def plot_signal_correlation() -> None:
+    """Pearson correlation of trade signals between arms (Metric 5).
+
+    Buckets decisions into 10-minute windows. Signal = 1 if arm placed a real
+    trade (projected_pnl != 0), else 0. Low correlation = genuine diversity.
+    """
+    with SessionLocal() as session:
+        rows = (
+            session.query(DecisionObjectRow)
+            .filter(DecisionObjectRow.status.in_(["CLOSED", "ACTIVE", "INTERRUPTED"]))
+            .order_by(DecisionObjectRow.timestamp_committed)
+            .all()
+        )
+    if not rows:
+        logger.warning("Metric 5: no entries")
+        return
+
+    ARM_LABELS = {
+        "CausalAgent": "Causal",
+        "ppo_standard": "PPO-Std",
+        "ppo_causal_feature": "PPO-Causal",
+        "EMAStrategy": "EMA",
+    }
+    arms = list(ARM_LABELS.keys())
+    BUCKET_MIN = 10
+    pivot: dict = {}
+
+    for do in rows:
+        if do.strategy_name not in arms:
+            continue
+        try:
+            ts = datetime.fromisoformat(do.timestamp_committed.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        bucket = ts.replace(minute=(ts.minute // BUCKET_MIN) * BUCKET_MIN,
+                             second=0, microsecond=0)
+        if bucket not in pivot:
+            pivot[bucket] = {a: 0 for a in arms}
+        fired = 1 if do.projected_pnl != 0 else 0
+        pivot[bucket][do.strategy_name] = max(pivot[bucket][do.strategy_name], fired)
+
+    active_arms = [a for a in arms if any(v.get(a, 0) for v in pivot.values())]
+    if len(active_arms) < 2:
+        logger.warning("Metric 5: need ≥2 active arms (got %d)", len(active_arms))
+        return
+    if len(pivot) < 5:
+        logger.warning("Metric 5: only %d time buckets — need more data", len(pivot))
+        return
+
+    sorted_buckets = sorted(pivot.keys())
+    matrix = np.array([[pivot[b].get(a, 0) for a in active_arms] for b in sorted_buckets])
+    corr = np.corrcoef(matrix.T)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdYlGn", aspect="auto")
+    plt.colorbar(im, ax=ax, label="Pearson r")
+    labels = [ARM_LABELS[a] for a in active_arms]
+    ax.set_xticks(range(len(active_arms)))
+    ax.set_yticks(range(len(active_arms)))
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_yticklabels(labels)
+    for i in range(len(active_arms)):
+        for j in range(len(active_arms)):
+            ax.text(j, i, f"{corr[i, j]:.2f}", ha="center", va="center",
+                    fontsize=11, color="black")
+    ax.set_title("Metric 5 — Inter-Agent Signal Correlation\n"
+                 "(lower off-diagonal = more diverse = stronger comparison claim)")
+    fig.tight_layout()
+    _ensure_plots_dir()
+    fig.savefig(PLOTS_DIR / "signal_correlation.png", dpi=150)
+    plt.close(fig)
+    logger.info("Metric 5 saved | signal_correlation.png | arms=%s", active_arms)
+
+
+# ---------------------------------------------------------------------------
+# Metric 3b — Hill-Climb Convergence vs Graph Stability
+# ---------------------------------------------------------------------------
+
+def plot_hillclimb_vs_stability() -> None:
+    """Hill-climb iterations vs validated edge count at decision time (Metric 3b).
+
+    Negative slope → causal graph stability reduces optimizer convergence cost,
+    proving the graph is genuinely guiding regime adaptation.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        do_rows = conn.execute("""
+            SELECT timestamp_committed, hill_climb_iterations
+            FROM decision_objects
+            WHERE strategy_name = 'CausalAgent'
+            AND status IN ('CLOSED', 'INTERRUPTED')
+            AND hill_climb_iterations > 0
+            ORDER BY timestamp_committed ASC
+        """).fetchall()
+        l1_rows = conn.execute("""
+            SELECT timestamp, edge_key, AVG(present) as rate
+            FROM layer1_runs
+            GROUP BY timestamp, edge_key
+        """).fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Metric 3b: DB error | %s", exc)
+        return
+
+    if not do_rows or not l1_rows:
+        logger.warning("Metric 3b: insufficient data (causal_decisions=%d, l1_rows=%d)",
+                       len(do_rows) if do_rows else 0, len(l1_rows) if l1_rows else 0)
+        return
+
+    # Count validated edges per layer1 run timestamp
+    ts_rates: dict = defaultdict(lambda: defaultdict(list))
+    for row in l1_rows:
+        ts_rates[row["timestamp"]][row["edge_key"]].append(row["rate"])
+    validated_per_ts = {
+        ts: sum(1 for rates in edges.values() if sum(rates) / len(rates) >= 0.65)
+        for ts, edges in ts_rates.items()
+    }
+    l1_timestamps = sorted(validated_per_ts.keys())
+
+    x_pts, y_pts = [], []
+    for row in do_rows:
+        ts_str = row["timestamp_committed"]
+        closest = next((t for t in reversed(l1_timestamps) if t <= ts_str), None)
+        if closest is None:
+            continue
+        x_pts.append(validated_per_ts[closest])
+        y_pts.append(row["hill_climb_iterations"])
+
+    if len(x_pts) < 3:
+        logger.warning("Metric 3b: only %d data points — need ≥3", len(x_pts))
+        return
+
+    x_arr = np.array(x_pts, dtype=float)
+    y_arr = np.array(y_pts, dtype=float)
+    reg = LinearRegression().fit(x_arr.reshape(-1, 1), y_arr)
+    slope = reg.coef_[0]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(x_arr, y_arr, color="#4A90D9", alpha=0.7, s=55, label="CausalAgent decisions")
+    x_line = np.linspace(x_arr.min(), x_arr.max(), 100)
+    ax.plot(x_line, reg.predict(x_line.reshape(-1, 1)), color="#E74C3C", linewidth=2,
+            label=f"Regression (slope={slope:.3f})")
+    ax.set_xlabel("Validated Edge Count (Layer 1)")
+    ax.set_ylabel("Hill-Climb Iterations")
+    ax.set_title("Metric 3b — Graph Stability vs Optimizer Convergence Cost\n"
+                 "(negative slope = stable graph guides MetaOptimizer)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _ensure_plots_dir()
+    fig.savefig(PLOTS_DIR / "hillclimb_vs_stability.png", dpi=150)
+    plt.close(fig)
+    logger.info("Metric 3b saved | hillclimb_vs_stability.png | slope=%.3f", slope)
+
+
+# ---------------------------------------------------------------------------
+# Metric 6 — Time to Rediscovery
+# ---------------------------------------------------------------------------
+
+def plot_time_to_rediscovery() -> None:
+    """At which PCMCI run did the agent first rediscover each known-good edge? (Metric 6)
+
+    Earlier rediscovery validates causal signal extraction quality.
+    Known edges are those whose logic mirrors the legacy strategies.
+    """
+    KNOWN_EDGES = {
+        "EMA rediscovery":       ("ema_spread",    "price_return"),
+        "Bollinger rediscovery": ("price_in_band", "price_return"),
+        "RSI rediscovery":       ("rsi",            "price_return"),
+        "Spread causal":         ("spread",         "price_return"),
+    }
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT ce.source, ce.target, cg.n_bars_used, cg.timestamp, cg.algorithm
+            FROM causal_edges ce
+            JOIN causal_graphs cg ON ce.graph_version_id = cg.version_id
+            ORDER BY cg.timestamp ASC
+        """).fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Metric 6: DB error | %s", exc)
+        return
+
+    first_seen: dict = {}
+    for row in rows:
+        for label, (src, tgt) in KNOWN_EDGES.items():
+            if row["source"] == src and row["target"] == tgt and label not in first_seen:
+                first_seen[label] = {
+                    "n_bars": row["n_bars_used"],
+                    "algorithm": row["algorithm"],
+                }
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    all_labels = list(KNOWN_EDGES.keys())
+    colors_bar = ["#27AE60" if lbl in first_seen else "#E74C3C" for lbl in all_labels]
+    values = [first_seen.get(lbl, {}).get("n_bars", 0) for lbl in all_labels]
+
+    bars = ax.barh(all_labels, values, color=colors_bar, alpha=0.85)
+    for bar, lbl, val in zip(bars, all_labels, values):
+        if val > 0:
+            alg = first_seen[lbl]["algorithm"]
+            ax.text(val + 1, bar.get_y() + bar.get_height() / 2,
+                    f"{val} bars ({alg})", va="center", fontsize=9)
+        else:
+            ax.text(2, bar.get_y() + bar.get_height() / 2,
+                    "Not yet discovered", va="center", fontsize=9, color="white")
+
+    ax.set_xlabel("Bars in PCMCI window at first discovery")
+    ax.set_title("Metric 6 — Time to Rediscovery of Known-Good Causal Edges\n"
+                 "(green = found, red = pending | earlier = better signal extraction)")
+    ax.set_xlim(0, max(values + [200]) * 1.35)
+    ax.grid(True, alpha=0.3, axis="x")
+    fig.tight_layout()
+    _ensure_plots_dir()
+    fig.savefig(PLOTS_DIR / "time_to_rediscovery.png", dpi=150)
+    plt.close(fig)
+    logger.info("Metric 6 saved | time_to_rediscovery.png | found=%d/%d",
+                len(first_seen), len(KNOWN_EDGES))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -282,6 +596,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     print("Running research analyses...")
+    print("[Original Metrics]")
     plot_full_lifecycle()
     plot_trained_phase_delta()
     plot_brier_score_progression()
@@ -290,4 +605,10 @@ if __name__ == "__main__":
         w, wo = ablation
         print(f"\nAblation result: with_ML1={w:.4f}  without_ML1={wo:.4f}  ML1_helps={w < wo}")
 
-    print(f"\nPlots saved to: {PLOTS_DIR.resolve()}")
+    print("\n[New Metrics]")
+    plot_regime_win_rates()
+    plot_signal_correlation()
+    plot_hillclimb_vs_stability()
+    plot_time_to_rediscovery()
+
+    print(f"\nAll plots saved to: {PLOTS_DIR.resolve()}")

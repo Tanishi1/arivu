@@ -1,0 +1,38 @@
+2026-07-04 10:30:36,383 | INFO | main | Arivu starting up...
+2026-07-04 10:30:36,422 | INFO | main | Database initialised | path=data/arivu.db
+2026-07-04 10:30:36,427 | INFO | regime | Regime DT and Scaler loaded from disk
+2026-07-04 10:30:36,429 | INFO | comparator | Training buffer created | path=data\training_buffer.csv
+2026-07-04 10:30:36,466 | INFO | meta_optimizer | MetaOptimizer: loaded 0 regime states from DB
+2026-07-04 10:30:36,466 | INFO | meta_optimizer | MetaOptimizer: random init | regime=calm | 3 candidates created
+2026-07-04 10:30:36,466 | INFO | meta_optimizer | MetaOptimizer: random init | regime=volatile | 3 candidates created
+2026-07-04 10:30:36,466 | INFO | meta_optimizer | MetaOptimizer: random init | regime=trending | 3 candidates created
+2026-07-04 10:30:36,466 | INFO | meta_optimizer | MetaOptimizer: random init | regime=unknown | 3 candidates created
+2026-07-04 10:30:36,532 | INFO | trust_updater | Layer2: loaded 0 trust scores from DB
+2026-07-04 10:30:36,532 | INFO | main | Causal agent initialised | graph_refresh=300s | capital=$100000
+2026-07-04 10:30:36,532 | INFO | main | Causal state initialised | phase=bootstrap
+2026-07-04 10:30:38,084 | INFO | main | Startup: cancelled 0 open orders
+2026-07-04 10:30:38,368 | WARNING | main | Startup: could not close position | position not found: SOLUSD
+2026-07-04 10:30:38,369 | INFO | stream | Connecting to Binance WebSocket...
+2026-07-04 10:30:38,395 | INFO | monitor | Assumption monitor started | interval=5s
+2026-07-04 10:30:38,395 | WARNING | monitor | Monitor paused | feed stale > 10s
+2026-07-04 10:30:38,398 | INFO | main | Causal agent loop started | graph_refresh=300s
+2026-07-04 10:30:39,937 | INFO | stream | Market feed connected | streams=['solusdt@kline_1m', 'solusdt@bookTicker', 'solusdt@aggTrade', 'solusdt@depth5@100ms', 'btcusdt@aggTrade', 'ethusdt@aggTrade']
+2026-07-04 10:30:46,431 | WARNING | feature_bar | FeatureBarBuilder: ML1 still at cold-start defaults (1 bars included in PCMCI window, waiting for ML1 to warm up)
+2026-07-04 10:30:48,400 | INFO | main | legacy_strategy_loop | EMAStrategy signal=CLOSE
+2026-07-04 10:30:48,401 | INFO | ml2 | ML2 annotated | risks=['trend_persistence=1.0', 'volatility_control=0.0', 'spread_constraint=0.1667']
+2026-07-04 10:30:48,403 | INFO | main | Market Regime Change detected | INITIAL -> calm | Volatility=0.0000, Spread=0.0100, Trend=0.0000
+2026-07-04 10:30:48,406 | INFO | main | [ML1 Feature Store] Warm-up progress: 1/60 bars (Granger ready: 1/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:30:48,912 | INFO | executor | No long position to close, converting SELL/CLOSE to HOLD
+2026-07-04 10:30:58,394 | INFO | main | [ML1 Feature Store] Warm-up progress: 2/60 bars (Granger ready: 2/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:31:08,401 | INFO | main | [ML1 Feature Store] Warm-up progress: 3/60 bars (Granger ready: 3/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:31:18,390 | INFO | main | [ML1 Feature Store] Warm-up progress: 4/60 bars (Granger ready: 4/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:31:28,404 | INFO | main | Market Regime Change detected | calm -> volatile | Volatility=0.0001, Spread=0.0100, Trend=0.0316
+2026-07-04 10:31:28,404 | INFO | main | [ML1 Feature Store] Warm-up progress: 5/60 bars (Granger ready: 5/40) | Features: vol=0.0001, spread=0.0100, trend=0.0316
+2026-07-04 10:31:38,418 | INFO | main | [ML1 Feature Store] Warm-up progress: 6/60 bars (Granger ready: 6/40) | Features: vol=0.0000, spread=0.0100, trend=0.0203
+2026-07-04 10:31:48,429 | INFO | main | [ML1 Feature Store] Warm-up progress: 7/60 bars (Granger ready: 7/40) | Features: vol=0.0000, spread=0.0100, trend=0.0632
+2026-07-04 10:31:58,429 | INFO | main | Market Regime Change detected | volatile -> calm | Volatility=0.0000, Spread=0.0100, Trend=0.0000
+2026-07-04 10:31:58,429 | INFO | main | [ML1 Feature Store] Warm-up progress: 8/60 bars (Granger ready: 8/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:31:58,979 | INFO | main | Shutdown signal received
+2026-07-04 10:32:08,443 | INFO | main | [ML1 Feature Store] Warm-up progress: 8/60 bars (Granger ready: 8/40) | Features: vol=0.0000, spread=0.0100, trend=0.0000
+2026-07-04 10:32:08,443 | INFO | main | Causal agent loop exited cleanly
+2026-07-04 10:32:11,151 | INFO | main | Graceful shutdown complete

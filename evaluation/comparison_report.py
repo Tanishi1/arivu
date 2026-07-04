@@ -31,10 +31,12 @@ KNOWN_STRATEGY_EDGES = {
 }
 
 ARM_DISPLAY = {
-    "CausalAgent":      "Causal Agent",
-    "EMAStrategy":      "EMA Legacy",
-    "BollingerStrategy":"Bollinger Legacy",
-    "RSIStrategy":      "RSI Legacy",
+    "CausalAgent":         "Causal Agent",
+    "ppo_standard":        "Standard PPO RL",
+    "ppo_causal_feature":  "Causal PPO RL",
+    "EMAStrategy":         "EMA Legacy",
+    "BollingerStrategy":   "Bollinger Legacy",
+    "RSIStrategy":         "RSI Legacy",
 }
 
 

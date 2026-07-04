@@ -49,22 +49,43 @@ def _check_assumption(assumption: Assumption, state) -> tuple[bool, float]:
     (gt, threshold=3.0), safe value=5.0 gave proximity=1.67 in debug logs while
     training_buffer.csv correctly stored 0.6 — making logs actively misleading.
 
+    SIGN-FLIP FIX: Causal agent now sets threshold=0.0 for sign-flip assumptions
+    (operator=gt meaning "breach when var ≤ 0", or operator=lt meaning "breach when
+    var ≥ 0"). The old `elif threshold == 0: proximity = 0.0` branch always returned
+    zero proximity for these, disabling the dynamic poll interval entirely.
+    Now proximity for sign-flip assumptions is how close |current_value| is to zero
+    relative to the commit-time absolute value, so the monitor speeds up as the
+    driver approaches sign reversal.
+
     NOTE: Assumption is frozen (pydantic). Do NOT mutate it.
     """
     current_value: float = getattr(state, assumption.variable, 0.0)
 
     if assumption.threshold == 0 and assumption.operator == "gt":
-        # EMA trend_persistence (threshold=0.0, operator='gt') — SLOPE_NORMALISER path
-        proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / SLOPE_NORMALISER))
-    elif assumption.threshold == 0:
-        proximity = 0.0
+        # Two sub-cases share this branch:
+        # 1. EMA trend_persistence (legacy): threshold=0.0, operator='gt' — SLOPE_NORMALISER path
+        # 2. Causal sign-flip (new): positive-coeff edge, breach when current_value ≤ 0
+        #
+        # For both, proximity measures "how close is the value to flipping negative?"
+        # If assumption.current_value (commit-time val) is available and nonzero,
+        # use it to normalise. Otherwise fall back to SLOPE_NORMALISER for legacy path.
+        commit_val = abs(assumption.current_value) if assumption.current_value != 0 else SLOPE_NORMALISER
+        proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / commit_val))
+
+    elif assumption.threshold == 0 and assumption.operator == "lt":
+        # Causal sign-flip: negative-coeff edge, breach when current_value ≥ 0.
+        # Proximity = how close is the variable to flipping positive?
+        # commit_val is negative (the driver was pointing down at commit time).
+        commit_val = abs(assumption.current_value) if assumption.current_value != 0 else SLOPE_NORMALISER
+        proximity = max(0.0, 1.0 - min(1.0, abs(current_value) / commit_val))
+
     elif assumption.operator == "gt":
-        # Breach when current_value <= threshold.
+        # Breach when current_value <= threshold (threshold > 0).
         # Safe = current_value >> threshold → proximity near 0.
         # At-risk = current_value ≈ threshold → proximity near 1.
         proximity = (assumption.threshold / current_value) if current_value > 0 else 1.0
     else:
-        # operator='lt': breach when current_value >= threshold
+        # operator='lt': breach when current_value >= threshold (threshold > 0)
         proximity = current_value / assumption.threshold
 
     if assumption.operator == "lt":

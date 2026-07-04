@@ -25,20 +25,37 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Type alias — constrains Assumption.variable to real CausalState fields.
-# If you add a field to CausalState that should be monitorable, add it here.
+# Keep this in sync with VARIABLE_NAMES in core/feature_bar.py and the
+# fields added to CausalState below.
 # ---------------------------------------------------------------------------
 
 CausalStateField = Literal[
+    # --- tick-level fields (always populated) ---
     "price",
     "volatility",
     "spread",
     "trend_slope",
     "trend_strength",
     "volume",
-    "rsi_current",          # Wilder RSI-14 computed from rolling prices. Default 50.0 (neutral).
-    "divergence_candle_span", # Candles since last local price extreme (low OR high). Default 3.5.
-                              # C_NEW_1 FIX: 3.5 > threshold 3.0 prevents startup false breach.
-                              # Replaced by _compute_divergence_span() after 5 price ticks.
+    "rsi_current",
+    "divergence_candle_span",
+    # --- 10-second bar features (populated after first bar closes) ---
+    "price_return",
+    "rsi",                    # bar-level RSI (same Wilder method, bar granularity)
+    "trade_intensity",
+    "order_book_imbalance",
+    "ema_spread",
+    "bollinger_width",
+    "price_in_band",
+    "regime_volatile",
+    "regime_trending",
+    "btc_return",
+    "eth_return",
+    "algo_health_p_normal",
+    "algo_health_p_stressed",
+    "algo_health_p_degraded",
+    "session_sin",
+    "session_cos",
 ]
 
 
@@ -115,18 +132,33 @@ class CausalState(BaseModel):
     algo_health_vector: list[float] = Field(default_factory=lambda: [1.0, 0.0, 0.0])
 
     # RSI current value — computed by causal_state.py from rolling price history.
-    # Range [0, 100]. Default 50.0 (neutral) until >= 15 ticks are available.
-    # Used by RSIStrategy's rsi_not_extreme assumption (operator='lt', threshold=80.0)
-    # to detect overbought conditions. The monitor checks getattr(state, 'rsi_current').
     rsi_current: float = 50.0
 
     # Candles since last local price low/high — computed by causal_state.py.
-    # C_NEW_1 FIX: Default is 3.5 (above threshold=3.0) so startup state does NOT
-    # immediately breach the divergence_span assumption before enough price history
-    # accumulates. The real value takes over once _compute_divergence_span() has
-    # at least 5 prices to scan. Without this, every RSI cycle closes within 5s.
     divergence_candle_span: float = 3.5
 
+    # -----------------------------------------------------------------------
+    # 10-second bar features — populated by FeatureBarBuilder after each bar
+    # closes via CausalStateManager.update_graph_features().
+    # Defaults are safe neutrals so the causal agent can build assumptions
+    # even during the initial warm-up period (before the first bar closes).
+    # -----------------------------------------------------------------------
+    price_return: float = 0.0
+    rsi: float = 50.0                    # bar-level RSI (same Wilder, bar granularity)
+    trade_intensity: float = 0.0
+    order_book_imbalance: float = 0.0
+    ema_spread: float = 0.0
+    bollinger_width: float = 0.0
+    price_in_band: float = 0.5
+    regime_volatile: float = 0.0
+    regime_trending: float = 0.0
+    btc_return: float = 0.0
+    eth_return: float = 0.0
+    algo_health_p_normal: float = 1.0
+    algo_health_p_stressed: float = 0.0
+    algo_health_p_degraded: float = 0.0
+    session_sin: float = 0.0
+    session_cos: float = 1.0
 
     active_strategy: str = "none"
     position_size: float = 0.0

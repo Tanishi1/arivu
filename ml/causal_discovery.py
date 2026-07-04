@@ -38,11 +38,13 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-TAU_MAX: int = 4            # max lag in bars (4 × 10s = 40s lookahead)
-ALPHA: float = 0.05         # significance threshold for PCMCI
+TAU_MAX: int = 4            # default max lag in bars (4 × 10s = 40s lookahead)
+ALPHA: float = 0.05         # default significance threshold for PCMCI
 MIN_BARS_PCMCI: int = 80    # minimum bars for PCMCI (uses Granger below this)
 MIN_BARS_GRANGER: int = 40  # minimum for pairwise Granger fallback
-GRANGER_MAXLAG: int = 4     # must match TAU_MAX for consistency
+# Note: GRANGER_MAXLAG is no longer a separate constant.
+# It is always set equal to the tau_max in use so Granger and PCMCI
+# search the same lag range — preventing inconsistency when tau_max changes.
 
 # ---------------------------------------------------------------------------
 # GraphSnapshot data structure
@@ -96,6 +98,8 @@ class GraphSnapshot:
         algorithm: str,  # "pcmci" or "granger_fallback"
         feature_means: dict[str, float] = None,
         feature_stds: dict[str, float] = None,
+        tau_max_used: int = TAU_MAX,
+        alpha_used: float = ALPHA,
     ) -> None:
         self.version_id = version_id
         self.timestamp = timestamp
@@ -105,6 +109,11 @@ class GraphSnapshot:
         self.algorithm = algorithm
         self.feature_means = feature_means or {}
         self.feature_stds = feature_stds or {}
+        # Discovery hyperparameters used for this snapshot.
+        # Stored so MetaOptimizer history can record WHICH tau_max/alpha
+        # produced each graph, enabling correct kernel scoring.
+        self.tau_max_used = tau_max_used
+        self.alpha_used = alpha_used
 
     def edges_to_target(self, target: str) -> list[CausalEdge]:
         """Return all edges whose target is `target`."""
@@ -117,7 +126,8 @@ class GraphSnapshot:
         return (
             f"GraphSnapshot v={self.version_id[:8]} "
             f"alg={self.algorithm} edges={len(self.edges)} "
-            f"bars={self.n_bars_used} ts={self.timestamp.isoformat()}"
+            f"bars={self.n_bars_used} tau={self.tau_max_used} "
+            f"alpha={self.alpha_used} ts={self.timestamp.isoformat()}"
         )
 
 
@@ -144,15 +154,22 @@ class CausalDiscoveryEngine:
         self,
         matrix: np.ndarray,
         variable_names: list[str],
+        tau_max: int = TAU_MAX,
+        alpha: float = ALPHA,
     ) -> GraphSnapshot:
         """Run causal discovery and return a versioned GraphSnapshot.
 
         Args:
             matrix:         shape (n_bars, n_vars), float64, no NaN/Inf.
             variable_names: column labels matching VARIABLE_NAMES.
+            tau_max:        max lag in bars. Passed from MetaOptimizer so the
+                            hill-climber can search for the real causal timescale.
+                            Defaults to module constant TAU_MAX.
+            alpha:          PCMCI significance threshold. Also MetaOptimizer-driven.
+                            Defaults to module constant ALPHA.
 
         Returns:
-            GraphSnapshot with all significant edges.
+            GraphSnapshot with all significant edges, storing tau_max and alpha used.
         """
         n_bars, n_vars = matrix.shape
         version_id = str(uuid.uuid4())
@@ -168,9 +185,13 @@ class CausalDiscoveryEngine:
         feature_stds = {variable_names[i]: float(stds[i]) for i in range(n_vars)}
 
         if n_bars >= MIN_BARS_PCMCI:
-            edges, algorithm = self._run_pcmci(matrix, variable_names, version_id)
+            edges, algorithm = self._run_pcmci(
+                matrix, variable_names, version_id, tau_max, alpha
+            )
         elif n_bars >= MIN_BARS_GRANGER:
-            edges, algorithm = self._run_granger(matrix, variable_names, version_id)
+            edges, algorithm = self._run_granger(
+                matrix, variable_names, version_id, tau_max, alpha
+            )
         else:
             logger.warning(
                 "CausalDiscovery: only %d bars available (min %d for Granger). "
@@ -188,6 +209,8 @@ class CausalDiscoveryEngine:
             algorithm=algorithm,
             feature_means=feature_means,
             feature_stds=feature_stds,
+            tau_max_used=tau_max,
+            alpha_used=alpha,
         )
 
         self._persist(snapshot)
@@ -214,8 +237,13 @@ class CausalDiscoveryEngine:
         matrix: np.ndarray,
         variable_names: list[str],
         version_id: str,
+        tau_max: int = TAU_MAX,
+        alpha: float = ALPHA,
     ) -> tuple[list[CausalEdge], str]:
-        """Run PCMCI with ParCorr conditional independence test."""
+        """Run PCMCI with ParCorr conditional independence test.
+
+        tau_max and alpha are runtime parameters driven by MetaOptimizer.
+        """
         try:
             from tigramite import data_processing as pp
             from tigramite.pcmci import PCMCI
@@ -227,23 +255,27 @@ class CausalDiscoveryEngine:
                 var_names=variable_names,
             )
             pcmci = PCMCI(dataframe=dataframe, cond_ind_test=ParCorr(), verbosity=0)
-            results = pcmci.run_pcmci(tau_max=TAU_MAX, pc_alpha=ALPHA)
+            results = pcmci.run_pcmci(tau_max=tau_max, pc_alpha=alpha)
 
-            edges = self._parse_pcmci_results(results, variable_names, version_id)
+            edges = self._parse_pcmci_results(
+                results, variable_names, version_id, tau_max, alpha
+            )
             return edges, "pcmci"
 
         except ImportError:
             logger.error("tigramite not installed — falling back to Granger")
-            return self._run_granger(matrix, variable_names, version_id)
+            return self._run_granger(matrix, variable_names, version_id, tau_max, alpha)
         except Exception as exc:
             logger.error("PCMCI failed: %s — falling back to Granger", exc)
-            return self._run_granger(matrix, variable_names, version_id)
+            return self._run_granger(matrix, variable_names, version_id, tau_max, alpha)
 
     def _parse_pcmci_results(
         self,
         results: dict,
         variable_names: list[str],
         version_id: str,
+        tau_max: int = TAU_MAX,
+        alpha: float = ALPHA,
     ) -> list[CausalEdge]:
         """Extract significant edges from PCMCI output dict."""
         
@@ -272,7 +304,7 @@ class CausalDiscoveryEngine:
             for i in range(n_vars):   # source variable index
                 if i == j:
                     continue
-                for tau in range(1, TAU_MAX + 1):  # lag (skip self-loops)
+                for tau in range(1, tau_max + 1):  # use runtime tau_max, not module constant
                     p_val = float(p_matrix[i, j, tau])
                     if np.isnan(p_val) or p_val >= 1.0:
                         continue
@@ -284,15 +316,7 @@ class CausalDiscoveryEngine:
             if not p_values:
                 continue
                 
-            reject = [p < ALPHA for p in p_values]
-                
-            # if target_name == "price_return":
-            #     logger.info(
-            #         "BH_DEBUG price_return | raw_candidates=%d | p_values=%s | reject=%s",
-            #         len(target_candidates),
-            #         [round(p, 4) for p in p_values],
-            #         list(reject) if p_values else []
-            #     )
+            reject = [p < alpha for p in p_values]  # use runtime alpha, not module constant
                 
             for idx, (i, tau, p_val, coeff) in enumerate(target_candidates):
                 if reject[idx] and abs(coeff) > 1e-6:
@@ -316,8 +340,14 @@ class CausalDiscoveryEngine:
         matrix: np.ndarray,
         variable_names: list[str],
         version_id: str,
+        tau_max: int = TAU_MAX,
+        alpha: float = ALPHA,
     ) -> tuple[list[CausalEdge], str]:
-        """Pairwise Granger causality tests — used when n_bars < MIN_BARS_PCMCI."""
+        """Pairwise Granger causality tests — used when n_bars < MIN_BARS_PCMCI.
+
+        granger_maxlag is set equal to tau_max so both algorithms search the
+        same lag range. When MetaOptimizer changes tau_max, Granger follows.
+        """
         try:
             from statsmodels.tsa.stattools import grangercausalitytests
         except ImportError:
@@ -327,9 +357,11 @@ class CausalDiscoveryEngine:
         edges: list[CausalEdge] = []
         n_vars = len(variable_names)
         n_bars = matrix.shape[0]
+        # Granger maxlag tracks tau_max — no separate constant that can drift
+        granger_maxlag = tau_max
         
         # Stricter alpha threshold for Granger when data is scarce
-        granger_alpha = 0.01 if n_bars < 100 else ALPHA
+        granger_alpha = 0.01 if n_bars < 100 else alpha
 
         FORBIDDEN_TARGETS = {
             "session_sin", "session_cos", "rsi", 
@@ -351,19 +383,39 @@ class CausalDiscoveryEngine:
                 try:
                     data = np.column_stack([y, x])
                     result = grangercausalitytests(
-                        data, maxlag=GRANGER_MAXLAG, verbose=False
+                        data, maxlag=granger_maxlag, verbose=False
                     )
-                    for lag in range(1, GRANGER_MAXLAG + 1):
+                    for lag in range(1, granger_maxlag + 1):
                         test_stats = result[lag][0]
                         # Use the F-test p-value
                         p_val = test_stats["ssr_ftest"][1]
                         f_stat = test_stats["ssr_ftest"][0]
                         if p_val < granger_alpha:
+                            # F-statistic is always positive and carries no directional
+                            # information. Use the lagged Pearson correlation to get
+                            # the sign of the causal relationship — positive means
+                            # source_t-lag rises → target_t rises ("up" hypothesis),
+                            # negative means the opposite ("down" hypothesis).
+                            if len(x) > lag:
+                                x_lagged = x[:-lag]
+                                y_future = y[lag:]
+                                if np.std(x_lagged) > 1e-9 and np.std(y_future) > 1e-9:
+                                    corr = float(np.corrcoef(x_lagged, y_future)[0, 1])
+                                else:
+                                    corr = 0.0
+                            else:
+                                corr = 0.0
+                            # Scale by F-stat significance but keep sign from correlation
+                            signed_coeff = np.sign(corr) * float(f_stat) if corr != 0.0 else float(f_stat)
+                            logger.debug(
+                                "Granger edge %s→%s lag=%d | F=%.3f corr=%.4f signed_coeff=%.4f",
+                                source, target, lag, f_stat, corr, signed_coeff,
+                            )
                             edges.append(CausalEdge(
                                 source=source,
                                 target=target,
                                 lag=lag,
-                                coeff=float(f_stat),
+                                coeff=signed_coeff,
                                 p_value=float(p_val),
                                 conditioning_set=[],  # pairwise — no conditioning
                                 graph_version_id=version_id,

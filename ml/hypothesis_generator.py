@@ -35,7 +35,12 @@ MAX_HOP_DEPTH: int = 4                  # max causal chain length
 CHAIN_LENGTH_PENALTY: float = 0.85      # per-hop confidence discount
 MIN_TRADE_SCORE: float = 0.02           # below this → HOLD (logged with reason)
 TOP_N_CANDIDATES: int = 5               # always return this many (anti-HOLD)
-MIN_LAYER2_OBS: int = 5                 # minimum trade observations for Layer 2 score to matter
+# Layer 2 observations needed before trust score has full weight in composite_score.
+# Below this count, layer2_score is blended toward the neutral 0.5 — the agent
+# tries new edges cheaply and lets the data accumulate before fully trusting the score.
+# This is a smoothing window, NOT a hard gate. No chain is ever blocked here;
+# blocking is done continuously via position sizing in main.py.
+MIN_LAYER2_OBS: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -196,21 +201,81 @@ class HypothesisGenerator:
         max_depth: int,
         regime: str = "unknown",
     ) -> list[list[CausalEdge]]:
-        """Find all causal chains ending at target. Now restricted to 1-hop."""
+        """Find all validated causal chains ending at target, up to max_depth hops.
+
+        Chain ordering convention (backward-compatible with _score_chain):
+          chain[0]  = edge directly pointing to price_return  (closest to target)
+          chain[-1] = edge at the root of the causal chain    (furthest back)
+
+        Example for 3-hop B->A->RSI->price_return:
+          chain = [RSI->price_return, A->RSI, B->A]
+          chain[0].target == 'price_return'
+          chain[-1].source == 'B'
+
+        Only Layer-1 validated edges are included at each hop.
+        Cycles are prevented via a visited-source set per branch.
+        """
         completed: list[list[CausalEdge]] = []
 
-        in_edges = snapshot.edges_to_target(target)
-        for edge in in_edges:
-            # Only use Layer 1 validated edges
-            if not self._layer1.is_validated(edge.source, edge.target, edge.lag, regime):
-                score = self._layer1.get_stability_score(edge.source, edge.target, edge.lag, regime)
+        def _walk(
+            current_target: str,
+            chain_so_far: list[CausalEdge],
+            visited: set[str],
+            depth: int,
+        ) -> None:
+            """Recursively extend chain_so_far by one more hop."""
+            if depth > max_depth:
+                return
+            for edge in snapshot.edges_to_target(current_target):
+                if not self._layer1.is_validated(
+                    edge.source, edge.target, edge.lag, regime
+                ):
+                    logger.debug(
+                        "Multi-hop: edge pruned | %s->%s lag=%d | "
+                        "reason=layer1_not_validated",
+                        edge.source, edge.target, edge.lag,
+                    )
+                    continue
+                if edge.source in visited:
+                    # Cycle — skip
+                    continue
+                # Build new chain: current price-facing edge stays at index 0,
+                # the new root-side edge is appended at the end.
+                new_chain = chain_so_far + [edge]
+                completed.append(new_chain)
                 logger.debug(
-                    "Edge pruned | edge=%s->%s lag=%d | stability=%.2f | "
-                    "validated=False | reason=layer1_not_validated",
-                    edge.source, edge.target, edge.lag, score
+                    "Multi-hop: found %d-hop chain ending %s->%s | "
+                    "chain=%s",
+                    depth, edge.source, edge.target,
+                    " | ".join(f"{e.source}->{e.target}" for e in new_chain),
+                )
+                # Try to extend further back from this edge's source
+                _walk(
+                    edge.source,
+                    new_chain,
+                    visited | {edge.source},
+                    depth + 1,
+                )
+
+        # Seed: all validated 1-hop edges pointing directly at price_return
+        for edge in snapshot.edges_to_target(target):
+            if not self._layer1.is_validated(
+                edge.source, edge.target, edge.lag, regime
+            ):
+                score = self._layer1.get_stability_score(
+                    edge.source, edge.target, edge.lag, regime
+                )
+                logger.debug(
+                    "1-hop pruned | %s->%s lag=%d | stability=%.2f | "
+                    "reason=layer1_not_validated",
+                    edge.source, edge.target, edge.lag, score,
                 )
                 continue
-            completed.append([edge])
+            chain_1hop = [edge]
+            completed.append(chain_1hop)
+            # Try to extend this chain back one or more hops
+            # visited includes both the target and the edge source to prevent cycles
+            _walk(edge.source, chain_1hop, {target, edge.source}, 2)
 
         return completed
 
@@ -224,7 +289,19 @@ class HypothesisGenerator:
         graph_version_id: str,
         regime: str,
     ) -> CausalHypothesis:
-        """Compute composite score for a single causal chain."""
+        """Compute composite score for a single causal chain.
+
+        Magnitude uses GEOMETRIC MEAN of edge coefficients, not raw product.
+
+        Why: raw product collapses exponentially with chain length.
+          1-hop  coeff=0.30          -> product=0.300, geom_mean=0.300  (same)
+          2-hop  coeffs=0.30, 0.20   -> product=0.060, geom_mean=0.245  (fair)
+          3-hop  coeffs=0.30,0.20,0.15 -> product=0.009, geom_mean=0.208 (fair)
+
+        CHAIN_LENGTH_PENALTY (0.85 per hop) is the ONE AND ONLY confidence
+        discount for chain length. Geometric mean prevents a second hidden
+        penalty from making multi-hop chains mathematically unreachable.
+        """
         n_hops = len(chain)
 
         # Layer 1 stability: mean stability score across all edges in chain
@@ -253,23 +330,28 @@ class HypothesisGenerator:
                 weight = layer2_n_obs / MIN_LAYER2_OBS
                 layer2_score = layer2_score * weight + 0.5 * (1 - weight)
 
-        # Chain length penalty
+        # Chain length penalty: 0.85 per hop AFTER the first.
+        # This is the ONLY length-based confidence discount.
         length_penalty = CHAIN_LENGTH_PENALTY ** (n_hops - 1)
 
-        # Effect magnitude: product of absolute coefficients along chain
-        magnitude = 1.0
+        # Effect magnitude: geometric mean of absolute edge coefficients.
+        # Geometric mean = (product)^(1/n_hops), which normalises for chain length
+        # so multi-hop chains aren't exponentially penalised relative to 1-hop.
+        raw_product = 1.0
         for e in chain:
-            magnitude *= abs(e.coeff)
-        magnitude = min(magnitude, 1.0)  # cap at 1.0
+            raw_product *= abs(e.coeff)
+        # Geometric mean — stays in (0, 1] for typical PCMCI coefficients
+        magnitude = raw_product ** (1.0 / n_hops) if n_hops > 0 else 0.0
+        magnitude = min(magnitude, 1.0)
 
         # Composite score
         composite = layer1_score * layer2_score * length_penalty * magnitude
 
-        # Direction: sign of the final edge's coefficient pointing to price_return
-        final_edge = chain[0]  # chain[0] is the edge closest to price_return
+        # Direction: sign of the edge closest to price_return (chain[0] by convention)
+        final_edge = chain[0]
         direction = "up" if final_edge.coeff > 0 else "down"
 
-        # Time horizon: sum of lags × bar width
+        # Time horizon: sum of lags x bar width
         total_lag = sum(e.lag for e in chain)
         time_horizon_s = total_lag * self._bar_width_s
 

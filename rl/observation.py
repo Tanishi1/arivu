@@ -35,6 +35,28 @@ _OBS_EXCLUDED: frozenset[str] = frozenset({
     "price_history",
     "last_tick_timestamp",
     "algo_health_vector",   # handled explicitly as 3 separate dims
+    
+    # ---------------------------------------------------------
+    # Exclude the 16 bar-level graph features added recently to
+    # keep BASE_OBS_DIM = 13, which is required for the currently
+    # saved PPO zip models (trained on the older schema).
+    # ---------------------------------------------------------
+    "price_return",
+    "rsi",
+    "trade_intensity",
+    "order_book_imbalance",
+    "ema_spread",
+    "bollinger_width",
+    "price_in_band",
+    "regime_volatile",
+    "regime_trending",
+    "btc_return",
+    "eth_return",
+    "algo_health_p_normal",
+    "algo_health_p_stressed",
+    "algo_health_p_degraded",
+    "session_sin",
+    "session_cos",
 })
 
 # Compute base obs dim at import time so TradingEnv can use it

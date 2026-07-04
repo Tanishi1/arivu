@@ -92,18 +92,28 @@ class RegimeType(str, Enum):
 @dataclass
 class MetaParams:
     """
-    The three operational parameters the optimizer controls.
-    These replace the hardcoded constants in layer1_tracker.py.
+    The operational parameters the optimizer controls.
+    These replace the hardcoded constants in layer1_tracker.py (k, min_r, thresh)
+    AND the hardcoded constants in causal_discovery.py (TAU_MAX, ALPHA).
     """
     k_runs:    int   # size of the rolling run history window
     min_runs:  int   # minimum runs observed before validation is eligible
     threshold: float # fraction of k_runs an edge must appear in to validate
     regime:    str   = "unknown"
 
+    # PCMCI discovery hyperparameters — hill-climbed by MetaOptimizer
+    # tau_max:     maximum lag in bars to search (range [2, 12])
+    # pcmci_alpha: significance threshold for edge inclusion (range [0.01, 0.10])
+    # These let the optimizer discover the real causal timescale for the asset.
+    tau_max:     int   = 4
+    pcmci_alpha: float = 0.05
+
     # Internal hill-climbing state — agent should not read these directly
-    step_k:     int   = 5
-    step_min_r: int   = 1
+    step_k:      int   = 5
+    step_min_r:  int   = 1
     step_thresh: float = 0.05
+    step_tau:    int   = 1    # step for tau_max hill-climbing
+    step_alpha:  float = 0.01 # step for pcmci_alpha hill-climbing
 
     def to_dict(self) -> dict:
         """Serialise for ledger / DecisionObject meta_params field."""
@@ -112,9 +122,13 @@ class MetaParams:
             "min_runs":    self.min_runs,
             "threshold":   round(self.threshold, 4),
             "regime":      self.regime,
+            "tau_max":     self.tau_max,
+            "pcmci_alpha": round(self.pcmci_alpha, 4),
             "step_k":      self.step_k,
             "step_min_r":  self.step_min_r,
             "step_thresh": round(self.step_thresh, 4),
+            "step_tau":    self.step_tau,
+            "step_alpha":  round(self.step_alpha, 4),
         }
 
     def validate(self) -> "MetaParams":
@@ -128,6 +142,10 @@ class MetaParams:
         self.step_k     = max(1, int(self.step_k))
         self.step_min_r = max(1, int(self.step_min_r))
         self.step_thresh = max(0.01, float(self.step_thresh))
+        self.tau_max     = max(2, min(12, int(self.tau_max)))
+        self.pcmci_alpha = max(0.005, min(0.15, float(self.pcmci_alpha)))
+        self.step_tau    = max(1, int(self.step_tau))
+        self.step_alpha  = max(0.005, float(self.step_alpha))
         return self
 
 
@@ -159,6 +177,12 @@ class TradeOutcome:
     edge_stability:     float = 0.0
     avg_breach_risk:    float = 0.5
     ml2_calibration:    float = 0.5
+    # Layer 2 trust of the chain AT TIME OF TRADE ENTRY.
+    # This closes the feedback loop: MetaOptimizer sees whether the params
+    # it selected produced hypotheses with high or low Bayesian trust.
+    # Hill climbing then moves toward params that discover higher-trust edges.
+    l2_trust:           float = 0.5
+    l2_n_obs:           int   = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,6 +197,8 @@ RESTART_THRESHOLD  = 0.30   # score floor — restart if best score stays below 
 # Stagnation detection constants
 STAGNATION_DELTA_THRESHOLD = 0.005  # minimum score improvement to reset stagnation counter
 STAGNATION_LIMIT = 20               # consecutive non-improving updates before restart
+IMMUNITY_CYCLES = STAGNATION_LIMIT // 2  # cycles a newly injected candidate is protected
+                                          # from eviction so it can accumulate fair history
 
 
 
@@ -202,6 +228,10 @@ class MetaParameterOptimizer:
         # Reset to 0 whenever score improves by >= STAGNATION_DELTA_THRESHOLD
         self._stagnation_counts: dict[str, int] = {}
         self._last_scores: dict[str, float] = {}
+        # Immunity counter: after a replacement fires, the new random candidate is
+        # protected for IMMUNITY_CYCLES updates so it has time to accumulate history
+        # and be scored fairly before it can itself become the eviction target.
+        self._candidate_immunity: dict[str, int] = {}
 
         self._ensure_schema()
         self._load_from_db()
@@ -275,13 +305,25 @@ class MetaParameterOptimizer:
             if len(bucket["history"]) > 200:
                 bucket["history"] = bucket["history"][-200:]
 
+            # Tick down immunity counter once per trade cycle (outside candidate loop).
+            self._candidate_immunity[regime] = max(
+                0, self._candidate_immunity.get(regime, 0) - 1
+            )
+
             candidate_scores = []
             for cand in population:
                 cand_score = self._score_config(cand.to_dict(), bucket["history"])
                 candidate_scores.append((cand_score, cand))
-                
+
             candidate_scores.sort(key=lambda x: x[0], reverse=True)
-            
+
+            # Capture stagnant candidate's (idx=0) diagnostic state for the replacement
+            # log — these are the step sizes that CAUSED stagnation, not the worst
+            # candidate's info (which would tell us nothing about why we're replacing).
+            _stagnant_step_k: int = 0
+            _stagnant_step_thresh: float = 0.0
+            _stagnant_score: float = 0.0
+
             new_population = []
             for idx, (c_score, current) in enumerate(candidate_scores):
                 # Generate all neighbours (±step for each parameter)
@@ -319,7 +361,7 @@ class MetaParameterOptimizer:
                     old_thresh = current.step_thresh
                     current.step_k      = max(MIN_STEP_K, int(current.step_k * STEP_DECAY_RATE))
                     current.step_thresh = max(MIN_STEP_THRESH, current.step_thresh * STEP_DECAY_RATE)
-                    
+
                     if idx == 0:
                         logger.info(
                             "MetaOptimizer: Local optimum reached for regime '%s' (score: %.4f) | "
@@ -328,20 +370,50 @@ class MetaParameterOptimizer:
                         )
                         if current.step_k <= MIN_STEP_K and current.step_thresh <= MIN_STEP_THRESH:
                             self._stagnation_counts[regime] = self._stagnation_counts.get(regime, 0) + 1
+                            # Record stagnant candidate's state for the replacement log
+                            _stagnant_step_k    = current.step_k
+                            _stagnant_step_thresh = current.step_thresh
+                            _stagnant_score     = c_score
                         else:
                             self._stagnation_counts[regime] = 0
                         self._last_scores[regime] = c_score
 
                     stagnation_count = self._stagnation_counts.get(regime, 0)
-                    if idx == len(candidate_scores) - 1 and stagnation_count >= STAGNATION_LIMIT:
+                    immunity         = self._candidate_immunity.get(regime, 0)
+                    is_last          = idx == len(candidate_scores) - 1
+
+                    if is_last and stagnation_count >= STAGNATION_LIMIT and immunity == 0:
+                        # Replace the worst candidate with a fresh random to re-inject
+                        # diversity.  Log the STAGNANT candidate's (idx=0) step sizes —
+                        # those explain WHY replacement fired, not the worst candidate's
+                        # score.  Grant immunity so the new random isn't immediately
+                        # evicted before it has a chance to accumulate scoring history.
                         new_params = self._random_init(regime)
                         new_population.append(new_params)
-                        self._stagnation_counts[regime] = 0  # Reset stagnation count!
+                        self._stagnation_counts[regime] = 0
+                        self._candidate_immunity[regime] = IMMUNITY_CYCLES
                         logger.warning(
-                            "MetaOptimizer: REPLACING worst candidate due to stagnation | regime=%s | "
-                            "stuck for %d updates | old_score=%.4f",
-                            regime, stagnation_count, c_score
+                            "MetaOptimizer: REPLACING worst candidate | regime=%s | "
+                            "stagnant_candidate: score=%.4f step_k=%d step_thresh=%.4f "
+                            "stuck for %d updates | immunity granted for %d cycles",
+                            regime,
+                            _stagnant_score, _stagnant_step_k, _stagnant_step_thresh,
+                            stagnation_count, IMMUNITY_CYCLES,
                         )
+
+                    elif is_last and stagnation_count >= STAGNATION_LIMIT and immunity > 0:
+                        # Stagnation limit reached but the recently injected candidate
+                        # is still in its immunity window — wait until it has accumulated
+                        # enough history to be scored fairly before replacing again.
+                        logger.info(
+                            "MetaOptimizer: Stagnation limit reached — replacement suppressed | "
+                            "regime=%s | immunity=%d cycles remaining | "
+                            "stagnant_candidate: score=%.4f step_k=%d step_thresh=%.4f",
+                            regime, immunity,
+                            _stagnant_score, _stagnant_step_k, _stagnant_step_thresh,
+                        )
+                        new_population.append(current)
+
                     else:
                         new_population.append(current)
 
@@ -362,6 +434,11 @@ class MetaParameterOptimizer:
           - prediction_accuracy: how close was predicted vs actual return?
           - regime_purity: was the regime stable during this trade?
           - chain_held: did the causal chain hold (no trajectory breach)?
+          - ml2_calibration: how well did ML2 predict breaches?
+          - l2_trust_quality: was the chain well-trusted by Layer 2 at entry?
+            This is the key signal: MetaOptimizer hill-climbs toward Layer 1
+            params that produce high-trust hypotheses, which indirectly filters
+            spurious edges without any hard-coded trust threshold.
         """
         # Direction correctness (binary but weighted heavily)
         direction_correct = (
@@ -385,22 +462,35 @@ class MetaParameterOptimizer:
 
         # Causal chain integrity bonus
         chain_bonus = 1.0 if outcome.causal_chain_held else 0.5
-        
+
         # ML2 calibration reward
         ml2_bonus = outcome.ml2_calibration
+
+        # Layer 2 trust quality signal.
+        # l2_trust=0.5 (untested) → neutral contribution 0.5
+        # l2_trust=0.3 (proven loser) → pulls score down → optimizer avoids these params
+        # l2_trust=0.7 (proven winner) → pulls score up → optimizer seeks these params
+        # Scaled so 0.5 trust = 0.5 contribution (neutral), linear above/below.
+        # l2_n_obs=0 → fully neutral (no data yet, don't penalise bootstrap trades)
+        if outcome.l2_n_obs > 0:
+            l2_quality = outcome.l2_trust
+        else:
+            l2_quality = 0.5  # untested chain: neutral, don't penalise exploration
 
         # Penalty for high breach risk on a losing trade
         risk_penalty = 1.0
         if outcome.avg_breach_risk > 0.70 and outcome.pnl_usd < 0:
             risk_penalty = 0.6
 
-        # Composite
+        # Composite — weights sum to 1.0
+        # l2_quality added at 10%, ml2_bonus reduced from 15%→10%, chain_bonus 10%→5%
         raw = (
             direction_score * 0.35 +
             accuracy        * 0.25 +
             regime_purity   * 0.15 +
-            chain_bonus     * 0.10 +
-            ml2_bonus       * 0.15
+            chain_bonus     * 0.05 +
+            ml2_bonus       * 0.10 +
+            l2_quality      * 0.10
         ) * risk_penalty
         return round(raw, 6)
 
@@ -411,53 +501,71 @@ class MetaParameterOptimizer:
     ) -> float:
         """
         Score a parameter configuration against outcome history using a Gaussian Kernel.
+
+        Operates in a 5-dimensional space: k_runs, min_runs, threshold, tau_max, pcmci_alpha.
+        Historical records without tau_max/alpha (old format) default to module constants
+        so they score correctly against outcomes produced under those parameters.
+
         Each historical trade outcome is weighted by its normalized distance to the
         target configuration, and the final score is the weighted average combined
-        with a Bayesian prior (alpha = 1.0 at score = 0.5) to handle low-data areas.
+        with a Bayesian prior (alpha_prior = 1.0 at score = 0.5) to handle low-data areas.
         """
         if not history:
             return 0.5
 
-        # Normalization bandwidths
-        sigma_k = 5.0
-        sigma_min_r = 2.0
-        sigma_thresh = 0.05
-        
+        # Normalization bandwidths — controls how quickly kernel weight drops off
+        sigma_k      = 5.0    # k_runs: 5-run difference halves the weight
+        sigma_min_r  = 2.0    # min_runs: 2-run difference halves the weight
+        sigma_thresh = 0.05   # threshold: 5% difference halves the weight
+        sigma_tau    = 2.0    # tau_max: 2-bar difference halves the weight
+        sigma_alpha  = 0.02   # pcmci_alpha: 0.02 difference halves the weight
+
         # Bayesian prior weight (equivalent to 1 observation at score 0.5)
-        alpha = 1.0
-        
-        target_k = float(config_dict.get("k_runs", 0))
-        target_min_r = float(config_dict.get("min_runs", 0))
-        target_thresh = float(config_dict.get("threshold", 0.0))
-        
+        alpha_prior = 1.0
+
+        target_k      = float(config_dict.get("k_runs",      0))
+        target_min_r  = float(config_dict.get("min_runs",    0))
+        target_thresh = float(config_dict.get("threshold",   0.0))
+        target_tau    = float(config_dict.get("tau_max",     4))   # default = module constant
+        target_palpha = float(config_dict.get("pcmci_alpha", 0.05)) # default = module constant
+
         weighted_sum = 0.0
         weight_total = 0.0
-        
+
         for h in history:
             p = h["params"]
             s = h["score"]
-            
+
             is_ev = p.get("is_escape_valve", False)
             edge_stability = float(p.get("edge_stability", 0.0))
-            
+
             h_thresh = edge_stability if is_ev else float(p.get("threshold", 0.0))
-            
+
             if is_ev and target_thresh > edge_stability:
                 effective_score = 0.25
             else:
                 effective_score = s
-            
-            diff_k = (target_k - float(p.get("k_runs", 0))) / sigma_k
-            diff_min_r = (target_min_r - float(p.get("min_runs", 0))) / sigma_min_r
-            diff_thresh = (target_thresh - h_thresh) / sigma_thresh
-            
-            d_squared = diff_k * diff_k + diff_min_r * diff_min_r + diff_thresh * diff_thresh
+
+            # 5-dimensional kernel: all dimensions contribute to distance
+            diff_k      = (target_k      - float(p.get("k_runs",      0)))    / sigma_k
+            diff_min_r  = (target_min_r  - float(p.get("min_runs",    0)))    / sigma_min_r
+            diff_thresh = (target_thresh - h_thresh)                           / sigma_thresh
+            diff_tau    = (target_tau    - float(p.get("tau_max",     4)))    / sigma_tau
+            diff_alpha  = (target_palpha - float(p.get("pcmci_alpha", 0.05))) / sigma_alpha
+
+            d_squared = (
+                diff_k      * diff_k +
+                diff_min_r  * diff_min_r +
+                diff_thresh * diff_thresh +
+                diff_tau    * diff_tau +
+                diff_alpha  * diff_alpha
+            )
             weight = math.exp(-d_squared / 2.0)
-            
+
             weighted_sum += weight * effective_score
             weight_total += weight
-            
-        score = (weighted_sum + alpha * 0.5) / (weight_total + alpha)
+
+        score = (weighted_sum + alpha_prior * 0.5) / (weight_total + alpha_prior)
         return round(score, 6)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -465,23 +573,69 @@ class MetaParameterOptimizer:
     # ─────────────────────────────────────────────────────────────────────
 
     def _get_neighbours(self, params: MetaParams) -> list[MetaParams]:
-        """Generate all ±1 step neighbours for each parameter."""
+        """Generate neighbours for hill-climbing.
+
+        Strategy:
+          - Cross-product over (k_runs, min_runs, threshold) — 26 combos as before.
+          - Independent +/- steps for tau_max and pcmci_alpha (4 additional combos).
+          - Total: 30 neighbours. Avoids the 3^5=243 explosion of a full cross-product.
+
+        tau and alpha are perturbed independently because they are independent
+        dimensions of the discovery space, not correlated with k/m/thresh.
+        """
         neighbours = []
+        # Existing 3-param cross-product (k_runs, min_runs, threshold)
         for dk in (-params.step_k, 0, params.step_k):
             for dm in (-params.step_min_r, 0, params.step_min_r):
                 for dt in (-params.step_thresh, 0, params.step_thresh):
                     if dk == 0 and dm == 0 and dt == 0:
                         continue
                     n = MetaParams(
-                        k_runs     = params.k_runs     + dk,
-                        min_runs   = params.min_runs   + dm,
-                        threshold  = params.threshold  + dt,
-                        regime     = params.regime,
-                        step_k     = params.step_k,
-                        step_min_r = params.step_min_r,
-                        step_thresh= params.step_thresh,
+                        k_runs      = params.k_runs      + dk,
+                        min_runs    = params.min_runs    + dm,
+                        threshold   = params.threshold   + dt,
+                        regime      = params.regime,
+                        tau_max     = params.tau_max,
+                        pcmci_alpha = params.pcmci_alpha,
+                        step_k      = params.step_k,
+                        step_min_r  = params.step_min_r,
+                        step_thresh = params.step_thresh,
+                        step_tau    = params.step_tau,
+                        step_alpha  = params.step_alpha,
                     ).validate()
                     neighbours.append(n)
+        # Independent tau_max perturbations
+        for dtau in (-params.step_tau, params.step_tau):
+            n = MetaParams(
+                k_runs      = params.k_runs,
+                min_runs    = params.min_runs,
+                threshold   = params.threshold,
+                regime      = params.regime,
+                tau_max     = params.tau_max + dtau,
+                pcmci_alpha = params.pcmci_alpha,
+                step_k      = params.step_k,
+                step_min_r  = params.step_min_r,
+                step_thresh = params.step_thresh,
+                step_tau    = params.step_tau,
+                step_alpha  = params.step_alpha,
+            ).validate()
+            neighbours.append(n)
+        # Independent pcmci_alpha perturbations
+        for da in (-params.step_alpha, params.step_alpha):
+            n = MetaParams(
+                k_runs      = params.k_runs,
+                min_runs    = params.min_runs,
+                threshold   = params.threshold,
+                regime      = params.regime,
+                tau_max     = params.tau_max,
+                pcmci_alpha = params.pcmci_alpha + da,
+                step_k      = params.step_k,
+                step_min_r  = params.step_min_r,
+                step_thresh = params.step_thresh,
+                step_tau    = params.step_tau,
+                step_alpha  = params.step_alpha,
+            ).validate()
+            neighbours.append(n)
         return neighbours
 
     @staticmethod
@@ -489,18 +643,26 @@ class MetaParameterOptimizer:
         """
         Uninformed random initialization.
         Wide ranges — the optimizer discovers what works, not us.
+        Includes tau_max and pcmci_alpha so the discovery timescale
+        is also searched from scratch.
         """
         k     = random.randint(3, 50)
         min_r = random.randint(2, k)
         thresh = round(random.uniform(0.40, 0.95), 2)
+        tau   = random.randint(2, 10)
+        alpha = round(random.uniform(0.01, 0.10), 3)
         return MetaParams(
-            k_runs     = k,
-            min_runs   = min_r,
-            threshold  = thresh,
-            regime     = regime,
-            step_k     = random.randint(5, 12),
-            step_min_r = random.randint(1, 3),
-            step_thresh= round(random.uniform(0.05, 0.12), 2),
+            k_runs      = k,
+            min_runs    = min_r,
+            threshold   = thresh,
+            regime      = regime,
+            tau_max     = tau,
+            pcmci_alpha = alpha,
+            step_k      = random.randint(5, 12),
+            step_min_r  = random.randint(1, 3),
+            step_thresh = round(random.uniform(0.05, 0.12), 2),
+            step_tau    = 1,
+            step_alpha  = round(random.uniform(0.005, 0.02), 3),
         ).validate()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -538,9 +700,14 @@ class MetaParameterOptimizer:
                         min_runs    = p["min_runs"],
                         threshold   = p["threshold"],
                         regime      = p["regime"],
+                        # New fields — default to module constants for old records
+                        tau_max     = p.get("tau_max",     4),
+                        pcmci_alpha = p.get("pcmci_alpha", 0.05),
                         step_k      = p.get("step_k",      5),
                         step_min_r  = p.get("step_min_r",  1),
-                        step_thresh = p.get("step_thresh",  0.05),
+                        step_thresh = p.get("step_thresh", 0.05),
+                        step_tau    = p.get("step_tau",    1),
+                        step_alpha  = p.get("step_alpha",  0.01),
                     ).validate())
                     
                 self._state[regime] = {

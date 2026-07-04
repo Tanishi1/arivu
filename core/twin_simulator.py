@@ -16,6 +16,7 @@ This is pure arithmetic on the already-discovered graph — runs in milliseconds
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 BAR_WIDTH_S: int = 10     # must match core/feature_bar.py
 CONFIDENCE_BAND_MULTIPLIER: float = 2.0   # breach = deviation > 2× predicted magnitude
 MIN_CONFIDENCE_BAND: float = 0.001        # 0.1% floor — SOL must move 0.1% against prediction
+# BUG4 FIX: Cap predicted_return to a realistic 30-minute SOL range.
+# PCMCI coefficients are Z-score space — un-standardising with a low std_ret can
+# produce unrealistically large returns. SOL rarely moves more than 3% in 30 min.
+MAX_REALISTIC_RETURN: float = 0.03        # 3% per 30-min horizon
+MIN_STD_FLOOR: float = 1e-6              # prevent zero-variance collapse
 
 
 # ---------------------------------------------------------------------------
@@ -128,14 +134,20 @@ class TwinSimulator:
                 "z_new_target_value": simulated_values[edge.target],
             })
 
-        # S-10 FIX: Un-standardize the final predicted price_return back to raw percentage
+        # BUG4 FIX: Un-standardize the final predicted price_return back to raw percentage.
+        # Apply std floor (MIN_STD_FLOOR) to prevent zero-variance collapse where
+        # std_ret ≈ 0 causes all hypotheses to predict the same near-zero return,
+        # making selection arbitrary. Then clip to realistic SOL 30-min range.
         z_predicted_return = simulated_values.get("price_return", 0.0)
         mean_ret = snapshot.feature_means.get("price_return", 0.0)
-        std_ret = snapshot.feature_stds.get("price_return", 1.0)
-        if std_ret == 0.0:
-            std_ret = 1.0
-            
+        std_ret = max(snapshot.feature_stds.get("price_return", 1.0), MIN_STD_FLOOR)
+
         predicted_return = (z_predicted_return * std_ret) + mean_ret
+        # Clamp to realistic range — prevents runaway projection from high-Z outlier bars
+        predicted_return = max(-MAX_REALISTIC_RETURN, min(MAX_REALISTIC_RETURN, predicted_return))
+        if not math.isfinite(predicted_return):
+            predicted_return = 0.0
+
         hypothesis.predicted_direction = "up" if predicted_return > 0 else "down"
         confidence_band = max(
             abs(predicted_return) * CONFIDENCE_BAND_MULTIPLIER,

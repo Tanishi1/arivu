@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 # Position sizing — cap at 20% of account equity
 MAX_POSITION_FRACTION = 0.20
+# Hard notional cap per single order — never exceeds Alpaca's 200k limit
+MAX_ORDER_NOTIONAL = 95_000.0  # $95k max per order (well under Alpaca's $200k cap)
 LIMIT_TIMEOUT_S = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_S = 1
@@ -58,10 +60,17 @@ class Executor:
     If filelock is not installed, the lock is skipped with a WARNING.
     """
 
-    def __init__(self, cross_process_lock_path: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        cross_process_lock_path: str | None = None,
+    ) -> None:
+        key = api_key or os.getenv("ALPACA_API_KEY", "")
+        secret = api_secret or os.getenv("ALPACA_SECRET_KEY", "")
         self._api = tradeapi.REST(
-            key_id=os.getenv("ALPACA_API_KEY", ""),
-            secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
+            key_id=key,
+            secret_key=secret,
             base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
         )
         self._order_history: list[dict] = []  # last 10 orders for fill_rate calc
@@ -132,9 +141,13 @@ class Executor:
         if self._xlock:
             await asyncio.to_thread(self._xlock.acquire)
         try:
-            fill_price, filled = await self._place_limit_with_fallback(
-                side, qty, intended_price
-            )
+            # RL arms pass order_type='market' to skip limit-order polling (avoid 7-32s latency)
+            if params.get("order_type") == "market":
+                fill_price, filled = await self._place_market_order(side, qty)
+            else:
+                fill_price, filled = await self._place_limit_with_fallback(
+                    side, qty, intended_price
+                )
         finally:
             if self._xlock:
                 self._xlock.release()
@@ -159,10 +172,16 @@ class Executor:
             position_size_deviation=pos_size_dev,
         )
 
-        logger.info(
-            "Order placed | side=%s qty=%.6f fill=%.2f slippage=%.4f latency=%.0fms",
-            side, qty, fill_price, slippage, latency_ms,
-        )
+        if filled:
+            logger.info(
+                "Order placed | side=%s qty=%.6f fill=%.2f slippage=%.4f latency=%.0fms",
+                side, qty, fill_price, slippage, latency_ms,
+            )
+        else:
+            logger.warning(
+                "Order NOT placed (all retries exhausted) | side=%s qty=%.6f intended_price=%.2f",
+                side, qty, intended_price,
+            )
         return telemetry
 
     # ------------------------------------------------------------------
@@ -243,25 +262,46 @@ class Executor:
             return 0.0, False
 
     async def _compute_quantity(self, params: dict, state: CausalState) -> float:
-        """Compute order quantity respecting the 20% position cap."""
+        """Compute order quantity using BUYING POWER (not equity) to prevent
+        spending capital that is already locked in open positions."""
         try:
             account = await asyncio.to_thread(self._api.get_account)
             equity = float(account.equity)
+            # buying_power = actual cash available for new orders
+            # This is what matters — equity includes unrealised position value
+            # which is NOT spendable on new orders.
+            buying_power = float(getattr(account, 'buying_power', equity))
+            effective_capital = min(equity, buying_power)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Could not fetch Alpaca account equity | falling back to $10,000 | "
                 "ORDER MAY BE OVERSIZED if real equity is lower | %s", exc
             )
-            equity = 10_000.0  # fallback for testing only — never silently use in live session
+            effective_capital = 10_000.0
 
         fraction = min(
             params.get("position_fraction", 0.10),
             MAX_POSITION_FRACTION,
         )
-        # 50% Hard Split: Each loop (causal and legacy) trades on 50% of the total equity base.
-        virtual_equity = equity * 0.5
-        dollar_exposure = virtual_equity * fraction
+        dollar_exposure = effective_capital * fraction
+        # Hard cap: never place a single order larger than MAX_ORDER_NOTIONAL
+        # regardless of account size. Prevents runaway sizing.
+        dollar_exposure = min(dollar_exposure, MAX_ORDER_NOTIONAL)
+
+        if dollar_exposure > effective_capital * 0.95:
+            logger.warning(
+                "_compute_quantity: requested %.0f but only %.0f buying power available — capping",
+                dollar_exposure, effective_capital,
+            )
+            dollar_exposure = effective_capital * 0.90  # use at most 90% of available cash
+
         qty = dollar_exposure / state.price if state.price > 0 else 0.0
+        logger.debug(
+            "_compute_quantity | equity=%.0f buying_power=%.0f fraction=%.4f "
+            "dollar_exposure=%.0f price=%.2f qty=%.4f",
+            equity if 'equity' in dir() else 0, effective_capital, fraction,
+            dollar_exposure, state.price, qty,
+        )
         return round(qty, 6)
 
     def _no_op_telemetry(self) -> ExecutionTelemetry:

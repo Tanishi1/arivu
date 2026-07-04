@@ -156,17 +156,56 @@ class OutcomeComparator:
         does not stall the decision loop indefinitely via asyncio.to_thread().
         """
         def _do_read() -> tuple[float, bool]:
+            import time as _time
+            MAX_SINGLE_NOTIONAL = 180_000.0  # Alpaca caps at $200k; use $180k for safety margin
             try:
-                # N10 & N11 FIX: Close the actual position and get the PNL
                 position = self._alpaca.get_position("SOLUSD")
                 unrealized_pl = float(position.unrealized_pl)
-                self._alpaca.close_position("SOLUSD")
+                qty_held = float(position.qty)
+                current_price = float(position.current_price)
+                notional = qty_held * current_price
+
+                if notional > MAX_SINGLE_NOTIONAL:
+                    # Position too large for a single close_position() call.
+                    # Chunk into multiple market sell orders of ≤$180k each.
+                    chunk_qty = round(MAX_SINGLE_NOTIONAL / current_price, 6)
+                    remaining = qty_held
+                    chunk_count = 0
+                    logger.warning(
+                        "Comparator: large position %.0f SOL ($%.0f) — chunked close @ %.0f SOL/order",
+                        qty_held, notional, chunk_qty,
+                    )
+                    while remaining > 0.001:
+                        sell_qty = round(min(chunk_qty, remaining), 6)
+                        try:
+                            self._alpaca.submit_order(
+                                symbol="SOLUSD",
+                                qty=sell_qty,
+                                side="sell",
+                                type="market",
+                                time_in_force="gtc",
+                            )
+                            chunk_count += 1
+                            logger.info(
+                                "Comparator: chunk close %d | sold %.4f SOL | remaining %.4f SOL",
+                                chunk_count, sell_qty, remaining - sell_qty,
+                            )
+                        except Exception as chunk_exc:
+                            logger.error("Comparator: chunk close failed | %s", chunk_exc)
+                            break
+                        remaining -= sell_qty
+                        if remaining > 0.001:
+                            _time.sleep(2)  # brief pause between chunks
+                else:
+                    self._alpaca.close_position("SOLUSD")
+
                 return unrealized_pl, True
             except Exception as exc:  # noqa: BLE001
                 if "position does not exist" in str(exc).lower():
                     logger.info("Comparator | No open position for SOLUSD (HOLD cycle)")
                     return 0.0, False
                 raise  # re-raise so the outer except captures it
+
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -209,7 +248,7 @@ class OutcomeComparator:
                 "close_reason": record.close_reason,
             })
 
-        with open(TRAINING_BUFFER_PATH, "a", newline="") as f:
+        with open(TRAINING_BUFFER_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=BUFFER_COLUMNS)
             writer.writerows(rows)
 
@@ -221,7 +260,7 @@ class OutcomeComparator:
         """Create training_buffer.csv with header if it does not exist."""
         TRAINING_BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
         if not TRAINING_BUFFER_PATH.exists():
-            with open(TRAINING_BUFFER_PATH, "w", newline="") as f:
+            with open(TRAINING_BUFFER_PATH, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=BUFFER_COLUMNS)
                 writer.writeheader()
             logger.info("Training buffer created | path=%s", TRAINING_BUFFER_PATH)

@@ -56,7 +56,8 @@ def _evaluate(model, env_class, data: np.ndarray, mode: str, n_episodes: int = 2
         step = 0
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
+            action_masks = env.action_masks()
+            action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
             obs, reward, terminated, truncated, info = env.step(int(action))
             done = terminated or truncated
 
@@ -107,22 +108,36 @@ def train_arm(
     save_path: str,
     total_timesteps: int,
 ) -> dict:
-    """Train a single PPO arm and return evaluation metrics."""
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.env_util import make_vec_env
+    """Train a single MaskablePPO arm and return evaluation metrics."""
+    # BUG7 FIX: Use MaskablePPO from sb3_contrib so that TradingEnv.action_masks()
+    # is respected during training. Standard PPO silently ignores action_masks().
+    try:
+        from sb3_contrib import MaskablePPO
+        from sb3_contrib.common.maskable.utils import get_action_masks
+        from stable_baselines3.common.env_util import make_vec_env
+    except ImportError:
+        logger.error(
+            "sb3_contrib not installed. Run: pip install sb3-contrib"
+        )
+        raise
+    from stable_baselines3.common.vec_env import DummyVecEnv
     from rl.trading_env import TradingEnv
 
     logger.info("=" * 60)
     logger.info("Training %s | mode=%s | timesteps=%d", arm_name, mode, total_timesteps)
     logger.info("=" * 60)
 
-    # Vectorised environment for training efficiency
-    def make_env():
-        return TradingEnv(data=train_data, mode=mode)
+    # DummyVecEnv preserves action_masks() method (make_vec_env wrapping loses it).
+    vec_env = DummyVecEnv([lambda: TradingEnv(data=train_data, mode=mode)] * 4)
 
-    vec_env = make_vec_env(make_env, n_envs=4)
+    # Check if tensorboard is installed to make logging optional
+    try:
+        import tensorboard  # noqa: F401
+        tb_log = f"logs/tensorboard_{arm_name}"
+    except ImportError:
+        tb_log = None
 
-    model = PPO(
+    model = MaskablePPO(
         "MlpPolicy",
         vec_env,
         learning_rate=3e-4,
@@ -133,7 +148,7 @@ def train_arm(
         gae_lambda=0.95,
         clip_range=0.2,
         verbose=1,
-        tensorboard_log=f"logs/tensorboard_{arm_name}",
+        tensorboard_log=tb_log,
     )
 
     model.learn(total_timesteps=total_timesteps)

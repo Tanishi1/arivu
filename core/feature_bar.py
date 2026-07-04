@@ -116,9 +116,12 @@ class FeatureBarBuilder:
         matrix, names = builder.get_feature_matrix()
     """
 
-    def __init__(self, regime_classifier=None) -> None:
+    def __init__(self, regime_classifier=None, on_bar_closed=None) -> None:
         self._lock = threading.Lock()
         self._regime_classifier = regime_classifier
+        # Optional async callback: on_bar_closed(features: dict[str, float]) -> None
+        # Fired on the calling asyncio loop via asyncio.ensure_future when a bar closes.
+        self._on_bar_closed = on_bar_closed
 
         # Current bar accumulator
         self._current_bar: _BarAccumulator = _BarAccumulator(
@@ -142,6 +145,9 @@ class FeatureBarBuilder:
 
         # Track how many bars have cold-start algo health
         self._cold_start_bar_count: int = 0
+
+        # Latest closed bar as a named dict — read by get_latest_features()
+        self._last_bar_features: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Tick ingestion — called per WebSocket message
@@ -209,6 +215,15 @@ class FeatureBarBuilder:
         matrix = np.stack(bars, axis=0)   # shape (n, N_VARS)
         return matrix, list(VARIABLE_NAMES)
 
+    def get_latest_features(self) -> dict[str, float]:
+        """Return the latest closed bar as a {variable_name: value} dict.
+
+        Returns an empty dict if no bar has closed yet.
+        Useful for warm-starting CausalState on process restart.
+        """
+        with self._lock:
+            return dict(self._last_bar_features)
+
     def n_bars_ready(self) -> int:
         with self._lock:
             return len(self._bars)
@@ -222,6 +237,7 @@ class FeatureBarBuilder:
 
     def _maybe_close_bar(self) -> None:
         """Close the current bar if BAR_WIDTH_S seconds have elapsed."""
+        import asyncio
         import time
         now = time.monotonic()
         elapsed = now - self._bar_start_ts
@@ -233,6 +249,18 @@ class FeatureBarBuilder:
             feature_row = self._compute_features(bar)
             if feature_row is not None:
                 self._bars.append(feature_row)
+                # Build named dict for CausalState update
+                self._last_bar_features = dict(zip(VARIABLE_NAMES, feature_row.tolist()))
+                # Fire async callback if registered (runs on the event loop)
+                if self._on_bar_closed is not None:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.ensure_future(
+                                self._on_bar_closed(self._last_bar_features)
+                            )
+                    except RuntimeError:
+                        pass  # no event loop yet — skip, first bar before loop starts
                 if self._cold_start_bar_count > 0 and self._algo_health != _COLD_START_ALGO_HEALTH:
                     logger.info(
                         "FeatureBarBuilder: ML1 now warm — algo_health cold-start bars excluded: %d",
@@ -241,7 +269,7 @@ class FeatureBarBuilder:
                     self._cold_start_bar_count = 0
 
         self._current_bar = _BarAccumulator(open_time=datetime.now(timezone.utc))
-        
+
         # Snap to the next clean multiple of BAR_WIDTH_S, advancing until we catch up
         while self._bar_start_ts + BAR_WIDTH_S <= now:
             self._bar_start_ts += BAR_WIDTH_S

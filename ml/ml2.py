@@ -240,7 +240,7 @@ class ML2BreachPredictor:
         }
         if not TRAINING_BUFFER_PATH.exists():
             return []
-        with open(TRAINING_BUFFER_PATH, newline="") as f:
+        with open(TRAINING_BUFFER_PATH, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
                 logger.error("Training buffer has no header — file may be corrupt. Skipping.")

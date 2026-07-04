@@ -173,6 +173,26 @@ class CausalStateManager:
                 update={"algo_health_vector": vector}
             )
 
+    async def update_graph_features(self, features: dict[str, float]) -> None:
+        """Push the latest 10-second bar features from FeatureBarBuilder into CausalState.
+
+        Called once per bar (every ~10 seconds) after _compute_features() closes a bar.
+        The features dict uses the same VARIABLE_NAMES keys from core/feature_bar.py.
+        This makes every causal graph edge variable available via getattr(state, name)
+        so the CausalAgent can build Assumption objects without silent drop-outs.
+        """
+        async with self._lock:
+            self._state = self._state.model_copy(update=features)
+        logger.debug(
+            "CausalState: graph features updated | btc_ret=%.6f eth_ret=%.6f "
+            "ema_spread=%.4f bollinger_w=%.4f price_ret=%.6f",
+            features.get("btc_return", 0.0),
+            features.get("eth_return", 0.0),
+            features.get("ema_spread", 0.0),
+            features.get("bollinger_width", 0.0),
+            features.get("price_return", 0.0),
+        )
+
     async def update_position(self, qty: float, capital: float) -> None:
         """Update live position exposure after an execution."""
         async with self._lock:
