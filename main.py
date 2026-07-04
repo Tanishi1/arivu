@@ -182,6 +182,15 @@ async def legacy_strategy_loop(
     bollinger_strategy = BollingerStrategy()
     rsi_strategy = RSIStrategy()
 
+    # --- Check if legacy strategies have been permanently stopped in a previous run ---
+    if layer1.is_legacy_permanently_stopped():
+        logger.info(
+            "legacy_strategy_loop: legacy_stopped flag found in DB — "
+            "causal graph was previously validated. Legacy strategies will NOT run. "
+            "This is expected on all runs after the first."
+        )
+        return
+
     # Recover any active legacy trade from DB on startup
     # (handles case where process restarted mid-trade)
     _legacy_active_do: DecisionObject | None = None
@@ -285,6 +294,17 @@ async def legacy_strategy_loop(
                 continue
 
             # --- No active trade — evaluate strategies ---
+            # Check first whether the causal graph has now been validated:
+            # if so, stop legacy strategies permanently and set the DB flag.
+            if layer1.has_stable_edges(current_regime):
+                logger.info(
+                    "legacy_strategy_loop: causal graph has stable validated edges — "
+                    "legacy strategies stopping permanently. "
+                    "Causal agent will trade independently from now on."
+                )
+                await asyncio.to_thread(layer1.set_legacy_permanently_stopped)
+                return
+
             for strategy in [ema_strategy, bollinger_strategy, rsi_strategy]:
                 strategy_name = strategy.__class__.__name__
                 tuned_params = strategy.get_default_params()
@@ -1006,7 +1026,7 @@ async def main() -> None:
     decision_queue: asyncio.Queue = asyncio.Queue(maxsize=10)  # K2: bounded — full queue discards triggers, not decisions
     state_manager = CausalStateManager(decision_queue=decision_queue)
     ledger = LedgerWriter()
-    executor = Executor()
+    executor = Executor(cross_process_lock_path="data/alpaca.lock")
 
     ml1 = ML1BehaviourClassifier()
     ml2 = ML2BreachPredictor()

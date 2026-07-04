@@ -161,6 +161,53 @@ class Layer1Tracker:
                 return 0
             return max(len(h) for h in self._run_history.values())
 
+    def has_stable_edges(self, regime: str = "unknown") -> bool:
+        """Return True if at least one validated edge exists.
+
+        Used by legacy_strategy_loop to determine if the causal agent is
+        ready to trade independently — at which point legacy strategies
+        should stop permanently.
+        """
+        return len(self.get_validated_edges(regime)) > 0
+
+    def is_legacy_permanently_stopped(self) -> bool:
+        """Check the DB flag that marks legacy strategies as permanently stopped.
+
+        Once set, this persists across restarts — legacy strategies never
+        resume after the causal graph has been validated for the first time.
+        """
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute(
+                    "SELECT value FROM arivu_flags WHERE key = 'legacy_stopped'"
+                ).fetchone()
+                return row is not None and row[0] == "1"
+        except Exception:
+            return False
+
+    def set_legacy_permanently_stopped(self) -> None:
+        """Persist the legacy_stopped flag in the DB.
+
+        Called once, the first time has_stable_edges() returns True.
+        """
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS arivu_flags "
+                    "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO arivu_flags (key, value) VALUES ('legacy_stopped', '1')"
+                )
+                conn.commit()
+            logger.info(
+                "Layer1: legacy_stopped flag set permanently in DB — "
+                "legacy strategies will not restart on future runs"
+            )
+        except Exception as exc:
+            logger.error("Layer1: failed to set legacy_stopped flag | %s", exc)
+
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------

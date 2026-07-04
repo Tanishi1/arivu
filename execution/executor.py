@@ -28,6 +28,12 @@ from dotenv import load_dotenv
 
 from core.schemas import CausalState, ExecutionTelemetry
 
+try:
+    from filelock import FileLock
+    _FILELOCK_AVAILABLE = True
+except ImportError:
+    _FILELOCK_AVAILABLE = False
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -42,15 +48,34 @@ SYMBOL = "SOLUSD"
 
 
 class Executor:
-    """Places orders on Alpaca paper trading and emits ExecutionTelemetry."""
+    """Places orders on Alpaca paper trading and emits ExecutionTelemetry.
+    
+    cross_process_lock_path: optional path to a file used as a cross-process
+    advisory lock. When two processes (main.py and rl_main.py) share the same
+    Alpaca account, this prevents concurrent order placement that could breach
+    Alpaca's position limits or create race conditions.
+    Pass the same path string to all Executor instances that share the account.
+    If filelock is not installed, the lock is skipped with a WARNING.
+    """
 
-    def __init__(self) -> None:
+    def __init__(self, cross_process_lock_path: str | None = None) -> None:
         self._api = tradeapi.REST(
             key_id=os.getenv("ALPACA_API_KEY", ""),
             secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
             base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
         )
         self._order_history: list[dict] = []  # last 10 orders for fill_rate calc
+        # Cross-process lock — shared across main.py and rl_main.py
+        if cross_process_lock_path and _FILELOCK_AVAILABLE:
+            self._xlock: FileLock | None = FileLock(cross_process_lock_path, timeout=30)
+        elif cross_process_lock_path and not _FILELOCK_AVAILABLE:
+            logger.warning(
+                "Executor: cross_process_lock_path provided but 'filelock' is not installed. "
+                "Install it with: pip install filelock. Running WITHOUT cross-process lock."
+            )
+            self._xlock = None
+        else:
+            self._xlock = None
 
     async def execute(
         self,
@@ -82,7 +107,13 @@ class Executor:
                 existing = await asyncio.to_thread(self._api.get_position, SYMBOL)
                 if existing and float(existing.qty) > 0:
                     logger.info("Closing existing long position via market order")
-                    await asyncio.to_thread(self._api.close_position, SYMBOL)
+                    if self._xlock:
+                        await asyncio.to_thread(self._xlock.acquire)
+                    try:
+                        await asyncio.to_thread(self._api.close_position, SYMBOL)
+                    finally:
+                        if self._xlock:
+                            self._xlock.release()
                     return ExecutionTelemetry(
                         symbol=SYMBOL, fill_rate=1.0, order_latency_ms=100.0,
                         slippage=0.0, position_size_deviation=0.0
@@ -98,9 +129,15 @@ class Executor:
         qty = precomputed_qty if precomputed_qty is not None else await self._compute_quantity(params, state)
 
         start_time = time.monotonic()
-        fill_price, filled = await self._place_limit_with_fallback(
-            side, qty, intended_price
-        )
+        if self._xlock:
+            await asyncio.to_thread(self._xlock.acquire)
+        try:
+            fill_price, filled = await self._place_limit_with_fallback(
+                side, qty, intended_price
+            )
+        finally:
+            if self._xlock:
+                self._xlock.release()
         latency_ms = (time.monotonic() - start_time) * 1000
 
         slippage = intended_price - fill_price if filled else 0.0
