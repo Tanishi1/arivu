@@ -423,6 +423,7 @@ async def causal_agent_loop(
     ml2: "ML2BreachPredictor",
     regime_classifier: "RegimeClassifier",
     current_phase: list[str],
+    decision_queue: asyncio.Queue | None = None,
 ) -> None:
     """Autonomous causal discovery → hypothesis generation → trade execution loop.
 
@@ -467,7 +468,36 @@ async def causal_agent_loop(
     logger.info("Causal agent loop started | graph_refresh=%ds", GRAPH_REFRESH_S)
 
     while not _shutdown.is_set():
-        await asyncio.sleep(BAR_POLL_S)
+        # Wait up to BAR_POLL_S for a queue event (assumption_breach or threshold_crossed).
+        # Wakes immediately when breach arrives for the active DO, giving sub-10s response.
+        # Consuming threshold_crossed events keeps the queue open for breach events
+        # (otherwise causal_state.py fills the queue to maxsize=10 and monitor drops breaches).
+        _queue_breach_event: dict | None = None
+        if decision_queue is not None:
+            try:
+                _ev = await asyncio.wait_for(decision_queue.get(), timeout=BAR_POLL_S)
+                if _ev.get("type") == "assumption_breach":
+                    if _ev.get("decision_object_id") == _active_do_id:
+                        _queue_breach_event = _ev
+                        logger.info(
+                            "CausalAgent: queue breach event received | id=%s | assumptions=%s",
+                            (_active_do_id or "")[:8], _ev.get("assumptions", []),
+                        )
+                    else:
+                        logger.debug(
+                            "CausalAgent: queue breach for stale DO %s — discarding",
+                            str(_ev.get("decision_object_id", ""))[:8],
+                        )
+                elif _ev.get("type") == "threshold_crossed":
+                    logger.debug(
+                        "CausalAgent: queue threshold_crossed | reason=%s value=%.4f",
+                        _ev.get("reason", "?"), _ev.get("value", 0.0),
+                    )
+                # Any other event type: consume silently to keep queue drained
+            except asyncio.TimeoutError:
+                pass   # No event within BAR_POLL_S — run normal cycle
+        else:
+            await asyncio.sleep(BAR_POLL_S)
 
         try:
             state = state_manager.snapshot()
@@ -546,26 +576,41 @@ async def causal_agent_loop(
                     actual_return = (state.price - _active_entry_price) / _active_entry_price
                     # Check trajectory divergence (twin sim confidence band)
                     is_breach = twin_sim.check_breach(_active_traj, actual_return, elapsed)
+                    breach_source = "trajectory_breach" if is_breach else None
 
-                    # BUG3 FIX: Also check assumption monitor breach log.
-                    # The monitor coroutine writes sign-flip breaches to the ledger DB,
-                    # but previously nothing read the log to act on them. Now we do.
+                    # Fast path: queue delivered breach event for this DO (sub-10s response).
+                    if not is_breach and _queue_breach_event is not None:
+                        is_breach = True
+                        breach_source = "assumption_breach"
+                        logger.warning(
+                            "CausalAgent: fast-path queue breach | "
+                            "id=%s | elapsed=%ds | assumptions=%s",
+                            _active_do_id[:8], elapsed,
+                            _queue_breach_event.get("assumptions", []),
+                        )
+
+                    # Fallback: DB breach log — catches cases where queue was full
+                    # and the monitor event was dropped (put_nowait QueueFull).
                     if not is_breach:
                         monitor_breach_log = await asyncio.to_thread(
                             ledger.get_breach_log, _active_do_id
                         )
                         if monitor_breach_log:
                             is_breach = True
+                            breach_source = "assumption_breach"
                             logger.warning(
-                                "CausalAgent: assumption monitor breach detected | "
+                                "CausalAgent: DB breach log detected | "
                                 "id=%s | elapsed=%ds | breached=%s",
                                 _active_do_id[:8], elapsed, list(monitor_breach_log.keys()),
                             )
-                    elif is_breach:
+                    elif is_breach and breach_source == "trajectory_breach":
                         logger.warning(
                             "CausalAgent: trajectory breach detected | id=%s | elapsed=%ds",
                             _active_do_id[:8], elapsed,
                         )
+
+                    # Unified close handler for BOTH breach types
+                    if is_breach:
                         # Close the trade — record outcome and update Layer 2
                         try:
                             active_do = await asyncio.to_thread(
@@ -573,7 +618,7 @@ async def causal_agent_loop(
                             )
                             if active_do:
                                 record = await asyncio.to_thread(
-                                    comparator.close_cycle, active_do, "assumption_breach", _current_graph
+                                    comparator.close_cycle, active_do, breach_source, _current_graph
                                 )
                                 if record and _active_hyp:
                                     outcome_correct = (
@@ -1387,6 +1432,7 @@ async def main() -> None:
                 state_manager, feature_bar, discovery_engine,
                 layer1, hyp_gen, twin_sim, trust_updater,
                 ledger, executor, comparator, ml1, ml2, regime, current_phase,
+                decision_queue=decision_queue,
             ),
             _shutdown_watcher(feed),
             return_exceptions=True,

@@ -73,9 +73,12 @@ export default function LedgerPage() {
               {decisions.map(d => {
                 const tp  = d.tuned_params || {}
                 const out = d.outcome
-                const action = d.strategy_name === 'CausalAgent'
+                const action = tp.predicted_direction
                   ? (tp.predicted_direction === 'up' ? 'BUY' : 'SELL')
-                  : d.status
+                  : (tp.signal || d.status)   // tp.signal for new RL records; d.status fallback
+                const actionColor = action === 'BUY' ? 'var(--ok)'
+                  : action === 'SELL' ? 'var(--bad)'
+                  : 'var(--text-secondary)'
                 const pnl = out?.actual_pnl || 0
                 return (
                   <tr key={d.id} style={{borderLeft:`3px solid ${ARM_COLORS[d.strategy_name]||'transparent'}`}}>
@@ -88,8 +91,10 @@ export default function LedgerPage() {
                       }}>{d.strategy_name?.replace('ppo_','PPO-').replace('CausalAgent','ARIVU')}</span>
                     </td>
                     <td>{d.timestamp_committed ? new Date(d.timestamp_committed).toLocaleTimeString() : '—'}</td>
-                    <td style={{ color: action==='BUY'?'var(--ok)':action==='SELL'?'var(--bad)':'var(--text-secondary)', fontWeight:700 }}>{action}</td>
-                    <td style={{ maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', color:'var(--text-secondary)' }}>{tp.chain_summary || '—'}</td>
+                    <td style={{ color: actionColor, fontWeight:700 }}>{action}</td>
+                    <td style={{ maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', color:'var(--text-secondary)' }}>
+                      {tp.chain_summary || (tp.arm ? `PPO-${tp.arm} step ${tp.step ?? '—'}` : '—')}
+                    </td>
                     <td><span className={`sbadge ${d.status}`}>{d.status}</span></td>
                     <td style={{color:'var(--text-secondary)'}}>{d.phase}</td>
                     <td style={{fontFamily:'var(--font-mono)'}}>{tp.composite_score?.toFixed(4) ?? '—'}</td>

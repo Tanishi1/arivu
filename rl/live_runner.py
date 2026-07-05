@@ -231,6 +231,8 @@ class RLLiveRunner:
                 "position_fraction": POSITION_FRACTION,
                 "arm": self._arm,
                 "step": self._step_count,
+                "signal": signal,               # BUY or SELL — shown in ledger UI
+                "predicted_direction": "up" if signal == "BUY" else "down",
             },
             market_state_snapshot=state.model_dump(
                 mode="json",
