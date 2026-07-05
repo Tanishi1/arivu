@@ -1641,25 +1641,34 @@ export default function LiveGraph({
         return CCOLS[scores[0].ci]
       }
 
-      // Current particle position — slow, smooth, non-looping feel (wraps at end)
+      // Current particle position — interpolated between data points for silky smooth motion
       const totalPts = displayScores.length
-      const pFrac    = (sT * 0.18) % 1           // slow constant speed, loops cleanly
-      const pIdx     = Math.min(totalPts-1, Math.floor(pFrac * totalPts))
-      const pScore   = displayScores[pIdx]
+      const pFrac    = (sT * 0.18) % 1              // slow constant speed, loops cleanly
+      const pFracPt  = pFrac * (totalPts - 1)       // float index 0 → totalPts-1
+      const pIdxLo   = Math.floor(pFracPt)
+      const pIdxHi   = Math.min(totalPts-1, pIdxLo+1)
+      const pT       = pFracPt - pIdxLo             // interpolation factor 0..1
+      const pScore   = displayScores[pIdxLo]*(1-pT) + displayScores[pIdxHi]*pT  // lerp
       const pCol     = colorForScore(pScore)
-      const ppx      = toX(pIdx)
+      const ppx      = toX(pIdxLo)*(1-pT) + toX(pIdxHi)*pT  // lerp x too
       const ppy      = toY(pScore)
 
       // Comet trail — draw backwards from current position
       ctx.save()
-      for(let ti=TRAIL_LEN;ti>0;ti--){
-        const trIdx = Math.max(0, pIdx - ti)
-        const trS   = displayScores[trIdx]
-        const trCol = colorForScore(trS)
-        const alpha = (1 - ti/TRAIL_LEN) * 0.65
+      const TRAIL_STEPS = 60   // sub-steps — fills gaps even in sparse histories
+      for(let ti=TRAIL_STEPS;ti>0;ti--){
+        const trFracPt = Math.max(0, pFracPt - (ti/TRAIL_STEPS) * Math.min(pFracPt, TRAIL_LEN))
+        const trLo  = Math.floor(trFracPt)
+        const trHi  = Math.min(totalPts-1, trLo+1)
+        const trT   = trFracPt - trLo
+        const trSc  = displayScores[trLo]*(1-trT) + displayScores[trHi]*trT
+        const trX   = toX(trLo)*(1-trT) + toX(trHi)*trT
+        const trY   = toY(trSc)
+        const trCol = colorForScore(trSc)
+        const alpha = (1 - ti/TRAIL_STEPS) * 0.65
         ctx.globalAlpha = alpha
         ctx.beginPath()
-        ctx.arc(toX(trIdx), toY(trS), 1.8 + (1-ti/TRAIL_LEN)*1.2, 0, Math.PI*2)
+        ctx.arc(trX, trY, 1.5 + (1-ti/TRAIL_STEPS)*1.8, 0, Math.PI*2)
         ctx.fillStyle = trCol
         ctx.fill()
       }
