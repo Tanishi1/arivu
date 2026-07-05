@@ -1622,56 +1622,79 @@ export default function LiveGraph({
       ctx.font='500 6px JetBrains Mono,monospace'; ctx.fillStyle='#94a3b8'; ctx.textAlign='center'
       ctx.fillText('hill-climb steps →',lX+lW/2,lY+lH-6)
 
-      // ── 3 CANDIDATE PARTICLES moving through the score history curve ──
-      // Each rides the displayScores curve at speed ∝ k_runs (same logic as right panel).
-      // They loop continuously, leaving a fading comet trail. The curve is sampled
-      // by index so the particle literally follows the actual score history.
-      const TRAIL_LEN = 28
+      // ── SINGLE PARTICLE riding the score history, color = closest candidate ──
+      // Moves smoothly left→right through every point in the curve.
+      // At each step the particle takes the color of whichever candidate's
+      // recent_score is closest to that history value — revealing which
+      // candidate "owns" each region. Trail preserves the color history.
+      const TRAIL_LEN = 40
+
+      // Helper: color for a given score value (nearest candidate)
+      const colorForScore = (scoreVal)=>{
+        const scores = candList.map((c,ci)=>({
+          ci,
+          dist: Math.abs((c.recent_score??
+            // fallback: use simulated peak for mock
+            (0.20+Math.min(1,Math.max(0,(c.threshold||0.02)/0.10))*0.60)) - scoreVal)
+        }))
+        scores.sort((a,b)=>a.dist-b.dist)
+        return CCOLS[scores[0].ci]
+      }
+
+      // Current particle position — slow, smooth, non-looping feel (wraps at end)
+      const totalPts = displayScores.length
+      const pFrac    = (sT * 0.18) % 1           // slow constant speed, loops cleanly
+      const pIdx     = Math.min(totalPts-1, Math.floor(pFrac * totalPts))
+      const pScore   = displayScores[pIdx]
+      const pCol     = colorForScore(pScore)
+      const ppx      = toX(pIdx)
+      const ppy      = toY(pScore)
+
+      // Comet trail — draw backwards from current position
+      ctx.save()
+      for(let ti=TRAIL_LEN;ti>0;ti--){
+        const trIdx = Math.max(0, pIdx - ti)
+        const trS   = displayScores[trIdx]
+        const trCol = colorForScore(trS)
+        const alpha = (1 - ti/TRAIL_LEN) * 0.65
+        ctx.globalAlpha = alpha
+        ctx.beginPath()
+        ctx.arc(toX(trIdx), toY(trS), 1.8 + (1-ti/TRAIL_LEN)*1.2, 0, Math.PI*2)
+        ctx.fillStyle = trCol
+        ctx.fill()
+      }
+      ctx.restore(); ctx.globalAlpha=1
+
+      // Outer glow
+      const pulse = Math.sin(sT*Math.PI*6)*0.15+0.85
+      ctx.save()
+      ctx.shadowColor=pCol; ctx.shadowBlur=28
+      ctx.globalAlpha=pulse*0.22
+      ctx.beginPath(); ctx.arc(ppx,ppy,18,0,Math.PI*2); ctx.fillStyle=pCol; ctx.fill()
+      // Core
+      ctx.shadowBlur=14; ctx.globalAlpha=pulse
+      ctx.beginPath(); ctx.arc(ppx,ppy,6,0,Math.PI*2); ctx.fillStyle=pCol; ctx.fill()
+      ctx.shadowBlur=0; ctx.restore(); ctx.globalAlpha=1
+
+      // Floating chip: which candidate colour + current score
+      const chipW=76, chipH=16
+      const chipX=Math.min(toX(totalPts-1)-chipW, Math.max(spX, ppx-chipW/2))
+      const chipY=ppy-26
+      const ownerCi=CCOLS.indexOf(pCol)
+      ctx.save()
+      ctx.fillStyle='rgba(255,255,255,0.95)'; ctx.strokeStyle=pCol; ctx.lineWidth=1.2
+      ctx.beginPath(); ctx.roundRect(chipX,chipY,chipW,chipH,4); ctx.fill(); ctx.stroke()
+      ctx.font='700 7.5px JetBrains Mono,monospace'; ctx.fillStyle=pCol; ctx.textAlign='center'
+      ctx.fillText(`C${ownerCi>=0?ownerCi:'?'}  ${pScore.toFixed(4)}`, chipX+chipW/2, chipY+11)
+      ctx.restore()
+
+      // Candidate colour legend (small dots + labels, bottom of left panel)
       candList.forEach((cand,ci)=>{
-        const col   = CCOLS[ci]
-        const kN    = Math.min(1,Math.max(0,(cand.k_runs||20)/60))
-        const speed = 0.18+kN*0.82          // same formula as right panel
-        const fracX = ((sT*speed*0.7+ci*0.28)%1)  // looping 0→1 position along curve
-
-        // Map fracX to a displayScores index
-        const idx   = Math.min(displayScores.length-1, Math.floor(fracX*(displayScores.length)))
-        const s     = displayScores[idx]
-        const px    = toX(idx)
-        const py    = toY(s)
-
-        // Fading trail (sample backwards from current index)
-        ctx.save()
-        for(let ti=TRAIL_LEN;ti>0;ti--){
-          const trIdx = Math.max(0, idx - Math.floor(ti/TRAIL_LEN*idx*0.5))
-          const trS   = displayScores[trIdx]
-          ctx.globalAlpha = (1-ti/TRAIL_LEN)*0.55
-          ctx.beginPath()
-          ctx.arc(toX(trIdx), toY(trS), 2, 0, Math.PI*2)
-          ctx.fillStyle = col; ctx.fill()
-        }
-        ctx.restore(); ctx.globalAlpha=1
-
-        // Outer glow halo
-        const pulse = Math.sin(sT*Math.PI*7+ci*2.1)*0.15+0.85
-        ctx.save()
-        ctx.shadowColor=col; ctx.shadowBlur=26
-        ctx.globalAlpha=pulse*0.25
-        ctx.beginPath(); ctx.arc(px,py,18,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
-        // Inner particle
-        ctx.shadowBlur=14; ctx.globalAlpha=pulse
-        ctx.beginPath(); ctx.arc(px,py,6.5,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
-        ctx.shadowBlur=0; ctx.restore(); ctx.globalAlpha=1
-
-        // Chip label floating above particle — shows candidate id + score at this point
-        const chipW=72, chipH=16
-        const chipX=Math.min(spX+spW-chipW, Math.max(spX, px-chipW/2))
-        const chipY=py-26
-        ctx.save()
-        ctx.fillStyle='rgba(255,255,255,0.95)'; ctx.strokeStyle=col; ctx.lineWidth=1.2
-        ctx.beginPath(); ctx.roundRect(chipX,chipY,chipW,chipH,4); ctx.fill(); ctx.stroke()
-        ctx.font='700 7.5px JetBrains Mono,monospace'; ctx.fillStyle=col; ctx.textAlign='center'
-        ctx.fillText(`C${ci}  ${s.toFixed(4)}`, chipX+chipW/2, chipY+11)
-        ctx.restore()
+        const col=CCOLS[ci]
+        const lx=lX+14+ci*78, ly=lY+lH-14
+        ctx.beginPath(); ctx.arc(lx+4,ly-3,4,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
+        ctx.font='600 7px JetBrains Mono,monospace'; ctx.fillStyle=col; ctx.textAlign='left'
+        ctx.fillText(`C${ci} k=${cand.k_runs??'—'}`,lx+12,ly)
       })
 
       // Latest score badge (top-right of panel)
