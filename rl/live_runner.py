@@ -72,6 +72,7 @@ class RLLiveRunner:
         self._in_position = False
         self._entry_price: float = 0.0
         self._steps_since_entry: int = 0   # live min-hold enforcement (mirrors TradingEnv)
+        self._steps_since_exit: int = 999  # cooldown after SELL before BUY allowed
         self._min_hold_bars: int = 10      # 10 bars = 100s at 10s per bar
 
         logger.info(
@@ -117,11 +118,13 @@ class RLLiveRunner:
             obs = self._build_obs(state)
             # Live action masking mirroring TradingEnv.action_masks()
             # SELL masked within min-hold period to prevent churn
+            # BUY masked within cooldown period after SELL to prevent immediate re-entry
             can_sell = self._in_position and self._steps_since_entry >= self._min_hold_bars
+            can_buy  = not self._in_position and self._steps_since_exit >= self._min_hold_bars
             live_masks = np.array([
-                True,                     # HOLD always valid
-                not self._in_position,    # BUY only when flat
-                can_sell,                 # SELL only when long AND past min hold
+                True,      # HOLD always valid
+                can_buy,   # BUY only when flat AND past post-sell cooldown
+                can_sell,  # SELL only when long AND past min hold
             ])
             action, _ = await asyncio.to_thread(
                 self._model.predict, obs, deterministic=True, action_masks=live_masks
@@ -130,9 +133,11 @@ class RLLiveRunner:
 
             signal = ["HOLD", "BUY", "SELL"][action]
 
-            # Increment steps_since_entry every step when in position
+            # Increment counters every step
             if self._in_position:
                 self._steps_since_entry += 1
+            else:
+                self._steps_since_exit += 1
 
             if signal == "HOLD":
                 return
@@ -303,6 +308,7 @@ class RLLiveRunner:
                 self._in_position = True
                 self._entry_price = state.price
                 self._steps_since_entry = 0
+                self._steps_since_exit = 999  # not in cooldown while in position
             elif signal == "SELL":
                 # Compute P&L from tracked entry price vs current exit price.
                 # Do NOT use unrealized_pl from Alpaca — it reads 0 after position is closed.
@@ -319,6 +325,7 @@ class RLLiveRunner:
                 self._in_position = False
                 self._entry_price = 0.0
                 self._steps_since_entry = 0
+                self._steps_since_exit = 0   # start post-sell cooldown
 
                 # Write the OutcomeRecord to close the active BUY trade
                 if active_buy_id:
@@ -327,7 +334,7 @@ class RLLiveRunner:
                     record = OutcomeRecord(
                         decision_object_id=UUID(active_buy_id),
                         actual_pnl=actual_pnl,
-                        outcome_delta=0.0,       # RL doesn't project PnL
+                        outcome_delta=actual_pnl,  # projected=0 for RL, so delta=actual-0=actual
                         assumptions_held=[],
                         assumptions_breached=[],
                         breach_timestamps={},

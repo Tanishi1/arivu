@@ -82,12 +82,7 @@ class TradingEnv(gym.Env):
         self._entry_price: float = 0.0
         self._episode_pnl: float = 0.0
         self._steps_since_entry: int = 0   # for MIN_HOLD_BARS enforcement
-        # BUG6 FIX: Reconstruct cumulative price from per-bar returns.
-        # Previously _get_price() returned price_return directly (e.g. 0.0004),
-        # not an actual price level. PnL = (0.0004 - 0.0003) / 0.0003 = 33% per trade —
-        # or worse, negative price_return bars give division by near-zero → \u00b1500% rewards.
-        # PPO learns HOLD=safe because BUY almost always gives catastrophic reward.
-        # Fix: track a reconstructed price starting at 100.0.
+        self._steps_since_exit: int = 999  # cooldown after SELL before BUY allowed
         self._current_price: float = 100.0
 
         logger.debug(
@@ -116,6 +111,7 @@ class TradingEnv(gym.Env):
         self._entry_price = 0.0
         self._episode_pnl = 0.0
         self._steps_since_entry = 0
+        self._steps_since_exit = 999
         self._current_price = 100.0  # BUG6 FIX: reset reconstructed price each episode
 
         obs = self._get_obs()
@@ -141,6 +137,7 @@ class TradingEnv(gym.Env):
             self._in_position = True
             self._entry_price = price
             self._steps_since_entry = 0
+            self._steps_since_exit = 999  # reset exit timer while in position
 
         elif action == ACTION_SELL and self._in_position:
             pnl_pct = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
@@ -149,6 +146,7 @@ class TradingEnv(gym.Env):
             self._in_position = False
             self._entry_price = 0.0
             self._steps_since_entry = 0
+            self._steps_since_exit = 0   # start post-sell cooldown
 
         elif self._in_position:
             self._steps_since_entry += 1
@@ -156,6 +154,9 @@ class TradingEnv(gym.Env):
             unrealised_pnl = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
             if unrealised_pnl < 0:
                 reward = STEP_PENALTY_NEGATIVE
+        else:
+            # Flat, not buying: increment exit cooldown
+            self._steps_since_exit += 1
 
         self._current_step += 1
 
@@ -200,16 +201,16 @@ class TradingEnv(gym.Env):
 
         Masks:
           - BUY  (action 1) when already in position
+          - BUY  (action 1) within MIN_HOLD_BARS steps after a SELL (post-sell cooldown)
           - SELL (action 2) when not in position
           - SELL (action 2) also masked within MIN_HOLD_BARS of entry to prevent churn
-        This eliminates wasted exploration of invalid actions so the agent
-        focuses on HOLD vs BUY (no position) and HOLD vs SELL (in position).
         """
         can_sell = self._in_position and self._steps_since_entry >= MIN_HOLD_BARS
+        can_buy  = not self._in_position and self._steps_since_exit >= MIN_HOLD_BARS
         return [
-            True,                      # HOLD always valid
-            not self._in_position,     # BUY only valid when flat
-            can_sell,                  # SELL only valid when long AND past min hold
+            True,      # HOLD always valid
+            can_buy,   # BUY only when flat AND past post-sell cooldown
+            can_sell,  # SELL only when long AND past min hold
         ]
 
     # ------------------------------------------------------------------
