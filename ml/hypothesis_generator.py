@@ -131,29 +131,39 @@ class HypothesisGenerator:
             ESCAPE_VALVE_MIN_STABILITY = 0.10  # edge must appear in at least 10% of runs
 
             if n_runs >= ESCAPE_VALVE_MIN_RUNS:
-                # Find best edge pointing to price_return by raw stability
-                best_edge = None
-                best_score = 0.0
+                # Score ALL edges above min stability using the full composite
+                # (L1 × L2 × magnitude), not just raw stability.
+                # This lets Layer 2 trust influence which escape valve edge fires —
+                # a less stable but consistently-correct edge can outscore a stable
+                # but repeatedly-wrong edge.
+                escape_hyps = []
                 for edge in price_edges:
-                    score = self._layer1.get_stability_score(
+                    stability = self._layer1.get_stability_score(
                         edge.source, edge.target, edge.lag, regime
                     )
-                    if score > best_score:
-                        best_score = score
-                        best_edge = edge
+                    if stability >= ESCAPE_VALVE_MIN_STABILITY:
+                        hyp = self._score_chain([edge], snapshot.version_id, regime)
+                        hyp.is_escape_valve = True
+                        escape_hyps.append((stability, hyp))
 
-                if best_edge is not None and best_score >= ESCAPE_VALVE_MIN_STABILITY:
+                if escape_hyps:
+                    escape_hyps.sort(key=lambda x: x[1].composite_score, reverse=True)
+                    hypotheses = [h for _, h in escape_hyps]
+                    best = hypotheses[0]
+                    best_edge = best.chain[0]
+                    best_stability = escape_hyps[0][0]
                     logger.warning(
                         "HypothesisGenerator: ESCAPE_VALVE | "
-                        "runs=%d best_edge=%s->%s stability=%.3f "
-                        "threshold=%.2f | firing low-confidence hypothesis",
-                        n_runs, best_edge.source, best_edge.target,
-                        best_score,
+                        "runs=%d candidates=%d best_edge=%s->%s "
+                        "stability=%.3f composite=%.4f threshold=%.2f | "
+                        "firing %d low-confidence hypothesis(es)",
+                        n_runs, len(hypotheses),
+                        best_edge.source, best_edge.target,
+                        best_stability, best.composite_score,
                         self._layer1._optimizer.get_params(regime).threshold,
+                        len(hypotheses),
                     )
-                    hyp = self._score_chain([best_edge], snapshot.version_id, regime)
-                    hyp.is_escape_valve = True
-                    return [hyp]
+                    return hypotheses
 
             # Normal HOLD path
             logger.warning(
