@@ -1622,46 +1622,55 @@ export default function LiveGraph({
       ctx.font='500 6px JetBrains Mono,monospace'; ctx.fillStyle='#94a3b8'; ctx.textAlign='center'
       ctx.fillText('hill-climb steps →',lX+lW/2,lY+lH-6)
 
-      // ── 3 CANDIDATE PARTICLES on the history graph ──────────────
-      // Each candidate is placed at x = their relative position (C0 early, C1 mid, C2 latest)
-      // Y = their recent_score mapped onto the graph scale
+      // ── 3 CANDIDATE PARTICLES moving through the score history curve ──
+      // Each rides the displayScores curve at speed ∝ k_runs (same logic as right panel).
+      // They loop continuously, leaving a fading comet trail. The curve is sampled
+      // by index so the particle literally follows the actual score history.
+      const TRAIL_LEN = 28
       candList.forEach((cand,ci)=>{
-        const col = CCOLS[ci]
-        // X: stagger so they don't stack — C0=33%, C1=66%, C2=95% along x axis
-        const fracX = [0.33,0.66,0.95][ci]
-        const px = spX + fracX*spW
+        const col   = CCOLS[ci]
+        const kN    = Math.min(1,Math.max(0,(cand.k_runs||20)/60))
+        const speed = 0.18+kN*0.82          // same formula as right panel
+        const fracX = ((sT*speed*0.7+ci*0.28)%1)  // looping 0→1 position along curve
 
-        // Y: use recent_score if real, else sample the curve at fracX
-        const candScore = (cand.recent_score!=null)
-          ? cand.recent_score
-          : displayScores[Math.floor(fracX*(displayScores.length-1))]
-        // Clamp to graph range for display
-        const clampedScore = Math.min(mx*1.1, Math.max(mn*0.9, candScore))
-        const py = spTop + spH - ((clampedScore-mn)/rng)*spH
+        // Map fracX to a displayScores index
+        const idx   = Math.min(displayScores.length-1, Math.floor(fracX*(displayScores.length)))
+        const s     = displayScores[idx]
+        const px    = toX(idx)
+        const py    = toY(s)
 
-        // Draw vertical dashed guide line from x-axis to particle
+        // Fading trail (sample backwards from current index)
         ctx.save()
-        ctx.setLineDash([2,3]); ctx.strokeStyle=col+'55'; ctx.lineWidth=0.8
-        ctx.beginPath(); ctx.moveTo(px,spTop+spH); ctx.lineTo(px,py+12); ctx.stroke()
-        ctx.setLineDash([]); ctx.restore()
+        for(let ti=TRAIL_LEN;ti>0;ti--){
+          const trIdx = Math.max(0, idx - Math.floor(ti/TRAIL_LEN*idx*0.5))
+          const trS   = displayScores[trIdx]
+          ctx.globalAlpha = (1-ti/TRAIL_LEN)*0.55
+          ctx.beginPath()
+          ctx.arc(toX(trIdx), toY(trS), 2, 0, Math.PI*2)
+          ctx.fillStyle = col; ctx.fill()
+        }
+        ctx.restore(); ctx.globalAlpha=1
 
-        // Glow halo
-        const pulse=Math.sin(sT*Math.PI*6+ci*2.1)*0.18+0.82
+        // Outer glow halo
+        const pulse = Math.sin(sT*Math.PI*7+ci*2.1)*0.15+0.85
         ctx.save()
-        ctx.shadowColor=col; ctx.shadowBlur=24
-        ctx.globalAlpha=pulse*0.28
-        ctx.beginPath(); ctx.arc(px,py,16,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
+        ctx.shadowColor=col; ctx.shadowBlur=26
+        ctx.globalAlpha=pulse*0.25
+        ctx.beginPath(); ctx.arc(px,py,18,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
+        // Inner particle
         ctx.shadowBlur=14; ctx.globalAlpha=pulse
-        ctx.beginPath(); ctx.arc(px,py,6,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
+        ctx.beginPath(); ctx.arc(px,py,6.5,0,Math.PI*2); ctx.fillStyle=col; ctx.fill()
         ctx.shadowBlur=0; ctx.restore(); ctx.globalAlpha=1
 
-        // Label chip: "C0 · 0.4231"
-        const chipW=70, chipH=16, chipX=px-chipW/2, chipY=py-28
+        // Chip label floating above particle — shows candidate id + score at this point
+        const chipW=72, chipH=16
+        const chipX=Math.min(spX+spW-chipW, Math.max(spX, px-chipW/2))
+        const chipY=py-26
         ctx.save()
         ctx.fillStyle='rgba(255,255,255,0.95)'; ctx.strokeStyle=col; ctx.lineWidth=1.2
         ctx.beginPath(); ctx.roundRect(chipX,chipY,chipW,chipH,4); ctx.fill(); ctx.stroke()
         ctx.font='700 7.5px JetBrains Mono,monospace'; ctx.fillStyle=col; ctx.textAlign='center'
-        ctx.fillText(`C${ci}  ${candScore!=null?candScore.toFixed(4):'—'}`,px,chipY+11)
+        ctx.fillText(`C${ci}  ${s.toFixed(4)}`, chipX+chipW/2, chipY+11)
         ctx.restore()
       })
 
