@@ -82,13 +82,7 @@ from core.comparator import OutcomeComparator
 # ---------------------------------------------------------------------------
 _shutdown = asyncio.Event()
 
-# Maps queue event types to valid OutcomeRecord.close_reason Literal values
-_CLOSE_REASON_MAP = {
-    "threshold_crossed": "assumption_breach",
-    "assumption_breach": "assumption_breach",
-    "horizon_expired": "horizon_expired",
-    "system_shutdown": "system_shutdown",
-}
+
 
 # ---------------------------------------------------------------------------
 # Causal agent configuration
