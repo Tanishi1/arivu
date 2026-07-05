@@ -115,6 +115,11 @@ async def assumption_monitor_loop(
     """
     logger.info("Assumption monitor started | interval=%ds", MONITOR_INTERVAL_S)
 
+    # Track DOs that already have a pending breach event in the queue.
+    # Cleared when the DO closes (get_active returns a different ID or None).
+    _pending_breach_do_ids: set[str] = set()
+    _last_active_do_id: str | None = None
+
     while stop_event is None or not stop_event.is_set():
         if _is_feed_stale(state_manager):
             logger.warning("Monitor paused | feed stale > %ds", STALE_THRESHOLD_S)
@@ -124,9 +129,17 @@ async def assumption_monitor_loop(
         active = await asyncio.to_thread(ledger_writer.get_active)
 
         if active is None:
+            _pending_breach_do_ids.clear()
+            _last_active_do_id = None
             logger.debug("Monitor | no active DecisionObject")
             await asyncio.sleep(MONITOR_INTERVAL_S)
             continue
+
+        # Clear pending set when a new DO becomes active
+        current_do_id = str(active.id)
+        if current_do_id != _last_active_do_id:
+            _pending_breach_do_ids.discard(_last_active_do_id)
+            _last_active_do_id = current_do_id
 
         # Compute dynamic interval — continuous linear interpolation over [2, 10] seconds.
         if active.assumptions:
@@ -188,14 +201,22 @@ async def assumption_monitor_loop(
                 )
 
         if breached_this_cycle:
-            try:
-                decision_queue.put_nowait({
-                    "type": "assumption_breach",
-                    "assumptions": breached_this_cycle,
-                    "decision_object_id": str(active.id),
-                })
-            except asyncio.QueueFull:
-                logger.warning(
-                    "Decision queue full — assumption_breach trigger discarded "
-                    "(will retry next monitor cycle)"
+            do_id = str(active.id)
+            if do_id in _pending_breach_do_ids:
+                logger.debug(
+                    "Monitor | breach event already queued for DO %s — skipping duplicate",
+                    do_id[:8],
                 )
+            else:
+                try:
+                    decision_queue.put_nowait({
+                        "type": "assumption_breach",
+                        "assumptions": breached_this_cycle,
+                        "decision_object_id": do_id,
+                    })
+                    _pending_breach_do_ids.add(do_id)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Decision queue full \u2014 assumption_breach trigger discarded "
+                        "(will retry next monitor cycle)"
+                    )

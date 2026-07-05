@@ -953,17 +953,29 @@ async def causal_agent_loop(
                 #   operator=lt, threshold=0.0 (breach when current_val ≥ 0)
                 # - But for very small-magnitude vars (|val| < 1e-4), use a ±20% band
                 #   around 0 to avoid hair-trigger breaches from noise.
-                if abs(current_val) < 1e-4 and current_val != 0:
+                if current_val == 0.0:
+                    # Driver is exactly zero at commit time — no directional signal.
+                    # A threshold=0 assumption would breach immediately (0.0 <= 0.0).
+                    # Use a tiny band so the assumption only fires when the variable
+                    # moves meaningfully in the wrong direction.
+                    if edge_coeff > 0:
+                        operator = "gt"
+                        threshold = -1e-5   # breach only if goes negative beyond noise
+                    else:
+                        operator = "lt"
+                        threshold = 1e-5    # breach only if goes positive beyond noise
+                    logger.debug(
+                        "CausalAgent: zero-driver assumption | var=%s using band threshold=%.1e",
+                        source_var, threshold,
+                    )
+                elif abs(current_val) < 1e-4:
                     # Tiny-magnitude variable (e.g. micro-return): use sign-flip with noise band
                     # Breach if variable moves 3σ in the opposite direction.
-                    # Use |current_val| * 3 as the band half-width.
                     band = max(abs(current_val) * 3.0, 1e-5)
                     if edge_coeff > 0:
-                        # Positive driver: breach if drops below -band
                         operator = "gt"
                         threshold = -band
                     else:
-                        # Negative driver: breach if rises above +band
                         operator = "lt"
                         threshold = band
                 elif edge_coeff > 0:
@@ -971,8 +983,7 @@ async def causal_agent_loop(
                     operator = "gt"
                     threshold = 0.0
                 else:
-                    # Negative causal driver: was sending a negative signal.
-                    # Breach if it flips positive (regime change).
+                    # Negative causal driver: breach if it flips positive (regime change)
                     operator = "lt"
                     threshold = 0.0
 
