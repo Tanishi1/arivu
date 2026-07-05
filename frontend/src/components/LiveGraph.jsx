@@ -1531,7 +1531,7 @@ export default function LiveGraph({
         : pop.slice(0,3)
 
       // ── Layout ──────────────────────────────────────────────────
-      const SPLIT  = Math.floor(W * 0.42)   // left meta-history panel
+      const SPLIT  = Math.floor(W * 0.58)   // left meta-history panel
       const RGAP   = 10
       const VPAD   = 10
       const BOT    = 28
