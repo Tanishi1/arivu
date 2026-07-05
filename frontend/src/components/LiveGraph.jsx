@@ -867,13 +867,13 @@ export default function LiveGraph({
 
         ctx.save(); ctx.globalAlpha=pulse
 
-        ctx.font='800 22px JetBrains Mono,monospace'; ctx.fillStyle='#16a34a'; ctx.textAlign='center'
+        ctx.font='800 20px JetBrains Mono,monospace'; ctx.fillStyle='#16a34a'; ctx.textAlign='center'
 
-        ctx.fillText('✓  BAR CLOSED  —  19 VARIABLES COMPUTED',W/2,H*0.18)
+        ctx.fillText('✓  BAR CLOSED  —  19 VARIABLES COMPUTED',W/2,H*0.09)
 
         ctx.restore(); ctx.globalAlpha=1
 
-        const colW=(W-30)/5, colH=H*0.74, colY=H*0.13
+        const colW=(W-30)/5, colH=H*0.68, colY=H*0.16
 
         GROUPS.forEach((g,gi)=>{
 
