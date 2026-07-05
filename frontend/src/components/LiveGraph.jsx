@@ -42,11 +42,11 @@ const VDUR = {
 
 
 
-  STREAMS:   8000,
+  STREAMS:   28000,
 
 
 
-  BARS:      14000,
+  BARS:      40000,
 
 
 
@@ -1270,11 +1270,95 @@ export default function LiveGraph({
 
     if(vsName==='STREAMS'){
 
+      // ── ACT 1 (sT 0→0.32): big stream source cards ──────────────────────────
+      if(sT < 0.32){
+        const p = sT / 0.32
 
+        const bigCardS = (ctx, cx, cy, cW, cH, col, name, title, rows, out, alpha) => {
+          if(alpha <= 0.01) return
+          const HDR = 26
+          ctx.save(); ctx.globalAlpha = alpha
+          ctx.fillStyle = col + '11'; ctx.strokeStyle = col + '66'; ctx.lineWidth = 1.5
+          ctx.beginPath(); ctx.roundRect(cx, cy, cW, cH, 9); ctx.fill(); ctx.stroke()
+          ctx.fillStyle = col
+          ctx.beginPath(); ctx.roundRect(cx, cy, cW, HDR, [9,9,0,0]); ctx.fill()
+          ctx.font = '700 10px JetBrains Mono,monospace'; ctx.fillStyle = '#fff'; ctx.textAlign = 'left'
+          ctx.fillText(name, cx + 10, cy + HDR - 7)
+          ctx.font = '600 9px JetBrains Mono,monospace'; ctx.fillStyle = col
+          ctx.fillText(title, cx + 10, cy + HDR + 14)
+          ctx.strokeStyle = col + '33'; ctx.lineWidth = 0.8
+          ctx.beginPath(); ctx.moveTo(cx+10,cy+HDR+19); ctx.lineTo(cx+cW-10,cy+HDR+19); ctx.stroke()
+          ctx.font = '500 8.5px JetBrains Mono,monospace'; ctx.fillStyle = '#374151'
+          rows.forEach((r,ri) => ctx.fillText(r, cx+10, cy+HDR+31+ri*13))
+          ctx.font = '700 8px JetBrains Mono,monospace'; ctx.fillStyle = col
+          ctx.fillText(out, cx + 10, cy + cH - 8)
+          ctx.restore(); ctx.globalAlpha = 1
+        }
 
-      const stageAlpha=sT<0.85?1:ease(Math.max(0,(1-sT)/0.15))
+        const SC = [
+          { name:'kline_1m',         col:'#7c3aed', title:'Binance 1-minute OHLCV candle',
+            rows:['Open   — price of the very first tick in the window',
+                  'High   — highest tick price seen during the minute',
+                  'Low    — lowest tick price seen during the minute',
+                  'Close  — price of the very last tick in the window',
+                  'Volume — total SOL quantity traded across all fills'],
+            out:'→ price_return  volume  volatility  rsi  bollinger_width' },
+          { name:'bookTicker',        col:'#4f46e5', title:'Best Bid / Ask stream (real-time)',
+            rows:['Best bid price — highest price any buyer is willing to pay',
+                  'Best bid qty  — SOL available at the best bid right now',
+                  'Best ask price — lowest price any seller will accept',
+                  'Best ask qty  — SOL available at the best ask right now',
+                  'Updates on every change — often many times per second'],
+            out:'→ spread  ema_spread  price_in_band' },
+          { name:'aggTrade',          col:'#2563eb', title:'Aggregate Trades (every matched fill)',
+            rows:['Price      — price at which the trade was executed',
+                  'Quantity   — SOL traded in this single fill',
+                  'Direction  — buyer_maker=false → buy aggressor',
+                  '           — buyer_maker=true  → sell aggressor'],
+            out:'→ trade_intensity  order_book_imbalance' },
+          { name:'depth5@100ms',      col:'#0891b2', title:'L2 Order Book Snapshot (top 5)',
+            rows:['5 Bid levels — [price, qty] for top 5 buy orders',
+                  '5 Ask levels — [price, qty] for top 5 sell orders',
+                  'Imbalance   — bid_vol / (bid_vol + ask_vol)',
+                  'Refreshed every 100 milliseconds continuously'],
+            out:'→ order_book_imbalance' },
+          { name:'btcusdt@aggTrade',  col:'#f59e0b', title:'Bitcoin macro feed',
+            rows:['BTC/USDT trade price on every matched fill',
+                  'Sampled once at the close of each 10-second bar',
+                  'btc_return = log( P_t / P_{t-1} )  for stationarity',
+                  'BTC moves often lead or correlate with SOL moves'],
+            out:'→ btc_return' },
+          { name:'ethusdt@aggTrade',  col:'#ef4444', title:'Ethereum macro feed',
+            rows:['ETH/USDT trade price on every matched fill',
+                  'Sampled once at the close of each 10-second bar',
+                  'eth_return = log( P_t / P_{t-1} )  for stationarity',
+                  'ETH and SOL are often co-integrated in practice'],
+            out:'→ eth_return' },
+        ]
 
+        const GAP = 10
+        const cW = (W - GAP * 4) / 3
+        const cH = Math.min(H * 0.40, 200)
+        const gridY = (H - (cH * 2 + GAP)) / 2 - 10
+        const cardsFade = p < 0.70 ? 1.0 : ease(1 - (p - 0.70) / 0.22)
 
+        SC.forEach((c, ci) => {
+          const cx  = GAP + (ci%3) * (cW + GAP)
+          const cy  = gridY + Math.floor(ci/3) * (cH + GAP)
+          const cP  = ease(Math.min(1, Math.max(0, (p - ci*0.10) / 0.15)))
+          bigCardS(ctx, cx, cy, cW, cH, c.col, c.name, c.title, c.rows, c.out, cP * cardsFade)
+        })
+
+        ctx.font = '600 9px JetBrains Mono,monospace'; ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'center'
+        ctx.globalAlpha = Math.min(1, p * 5)
+        ctx.fillText('6 LIVE BINANCE STREAMS — feeding Arivu every 10 seconds', W/2, gridY - 14)
+        ctx.globalAlpha = 1
+        stageLabel(ctx, W, H, 'STREAMS — Live Data Sources', sT)
+
+      // ── ACT 2 (sT ≥0.32): existing stream-flow animation ───────────────────
+      } else {
+        const sT2 = (sT - 0.32) / 0.68   // remap 0.32→1.0 → 0→1.0 for existing code
+        const stageAlpha = sT2 < 0.85 ? 1 : ease(Math.max(0,(1-sT2)/0.15))
 
       ctx.save(); ctx.globalAlpha=stageAlpha
 
@@ -1300,7 +1384,7 @@ export default function LiveGraph({
 
 
 
-        const alpha=ease(Math.min(1,Math.max(0,(sT-i*0.06)/0.18)))
+        const alpha=ease(Math.min(1,Math.max(0,(sT2-i*0.06)/0.18)))
 
 
 
@@ -1412,7 +1496,7 @@ export default function LiveGraph({
 
 
 
-            const t=((sT*1.3+i*0.14+pi/3)%1)
+            const t=((sT2*1.3+i*0.14+pi/3)%1)
 
 
 
@@ -1452,7 +1536,7 @@ export default function LiveGraph({
 
 
 
-      const mA=ease(Math.min(1,sT*4-0.8))
+      const mA=ease(Math.min(1,sT2*4-0.8))
 
 
 
@@ -1612,7 +1696,11 @@ export default function LiveGraph({
 
 
 
-      stageLabel(ctx,W,H,'STREAMS ΓÇö Binance WebSocket Feeds',sT)
+      stageLabel(ctx,W,H,'STREAMS — Binance WebSocket Feeds',sT2)
+
+
+
+      } // end ACT 2 else
 
 
 
@@ -1632,299 +1720,277 @@ export default function LiveGraph({
 
 
 
+
     else if(vsName==='BARS'){
 
+      // ═══════════════════════════════════════════════════════════════════════
+      // BARS STAGE — 3 phases
+      //
+      //  Phase 1  sT 0.00–0.40  : tick dot-stream + progress bar
+      //  Phase 2  sT 0.40–0.70  : feature recipe cards (big, how vars are made)
+      //  Phase 3  sT 0.70–1.00  : nodes appear inside bucket containers
+      // ═══════════════════════════════════════════════════════════════════════
 
+      const NODE_R = 14, BPAD = 18, BHDR = 20
 
-      const barW=Math.min(W-200,480), barX=(W-barW)/2, barY=H*0.30
+      // ── shared helpers ─────────────────────────────────────────────────────
 
+      // Draw a big elaborated card. Returns card bottom Y.
+      const bigCard = (ctx, cx, cy, cW, cH, col, name, title, rows, out, alpha) => {
+        if(alpha <= 0.01) return
+        const HDR = 26
+        ctx.save(); ctx.globalAlpha = alpha
 
+        // Background
+        ctx.fillStyle = col + '11'
+        ctx.strokeStyle = col + '66'
+        ctx.lineWidth = 1.5
+        ctx.beginPath(); ctx.roundRect(cx, cy, cW, cH, 9); ctx.fill(); ctx.stroke()
 
-      if(sT<0.32){
+        // Clip to card bounds so text never overflows into adjacent cards
+        ctx.beginPath(); ctx.roundRect(cx, cy, cW, cH, 9); ctx.clip()
 
+        // Colored top bar
+        ctx.fillStyle = col
+        ctx.beginPath()
+        ctx.roundRect(cx, cy, cW, HDR, [9, 9, 0, 0])
+        ctx.fill()
 
+        // Stream name in header
+        ctx.font = '700 10px JetBrains Mono,monospace'
+        ctx.fillStyle = '#ffffff'
+        ctx.textAlign = 'left'
+        ctx.fillText(name, cx + 10, cy + HDR - 7)
 
-        // ACT A: tick accumulation progress bar
+        // Title line
+        ctx.font = '600 9px JetBrains Mono,monospace'
+        ctx.fillStyle = col
+        ctx.fillText(title, cx + 10, cy + HDR + 14)
 
+        // Divider
+        ctx.strokeStyle = col + '33'; ctx.lineWidth = 0.8
+        ctx.beginPath(); ctx.moveTo(cx+10, cy+HDR+19); ctx.lineTo(cx+cW-10, cy+HDR+19); ctx.stroke()
 
+        // Body rows
+        ctx.font = '500 8.5px JetBrains Mono,monospace'
+        ctx.fillStyle = '#374151'
+        rows.forEach((r, ri) => {
+          ctx.fillText(r, cx + 10, cy + HDR + 31 + ri * 13)
+        })
 
-        const p=sT/0.32
+        // Output line at bottom
+        ctx.font = '700 8px JetBrains Mono,monospace'
+        ctx.fillStyle = col
+        ctx.fillText(out, cx + 10, cy + cH - 8)
 
+        ctx.restore(); ctx.globalAlpha = 1
+      }
 
+      // ── Phase 1 : tick dot-stream + progress bar ───────────────────────────
+      if(sT < 0.22){
 
-        ctx.fillStyle='#f1f5f9'; ctx.beginPath(); ctx.roundRect(barX,barY,barW,22,11); ctx.fill()
+        const p = ease(sT / 0.22)
 
+        const barW = Math.min(W - 120, 520)
+        const barX = (W - barW) / 2
+        const barY = H * 0.36
 
+        // Track bar
+        ctx.fillStyle = '#f1f5f9'
+        ctx.beginPath(); ctx.roundRect(barX, barY, barW, 24, 12); ctx.fill()
+        ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1; ctx.stroke()
 
-        ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1; ctx.stroke()
+        // Fill
+        const grad = ctx.createLinearGradient(barX, 0, barX + barW, 0)
+        grad.addColorStop(0, '#7c3aed'); grad.addColorStop(1, '#4f46e5')
+        ctx.fillStyle = grad
+        ctx.beginPath(); ctx.roundRect(barX, barY, barW * p, 24, 12); ctx.fill()
 
+        // Timer label
+        ctx.font = '700 11px JetBrains Mono,monospace'
+        ctx.fillStyle = '#1e1b4b'
+        ctx.textAlign = 'center'
+        ctx.fillText(`${(p * 10).toFixed(1)}s \u00b7 ACCUMULATING TICKS`, W / 2, barY - 16)
 
-
-        const grad=ctx.createLinearGradient(barX,0,barX+barW,0)
-
-        grad.addColorStop(0,'#7c3aed'); grad.addColorStop(1,'#4f46e5')
-
-
-
-
-
-        ctx.fillStyle=grad; ctx.beginPath(); ctx.roundRect(barX,barY,barW*p,22,11); ctx.fill()
-
-
-
-        ctx.font='700 10px JetBrains Mono,monospace'; ctx.fillStyle='#1e1b4b'; ctx.textAlign='center'
-
-
-
-        ctx.fillText(`${(p*10).toFixed(1)}s / 10s  ┬╖  ACCUMULATING TICKS`,W/2,barY-14)
-
-
-
-        const nDots=Math.floor(p*36)+2
-
-
-
-        for(let di=0;di<Math.min(nDots,36);di++){
-
-
-
-          const dotX=barX+10+(di/36)*(barW-20)
-
-
-
-          const dotY=barY+44+Math.sin(di*1.4)*10
-
-
-
-          drawAtom(ctx,dotX,dotY,WS_STREAMS[di%6].col,2.5)
-
-
-
+        // Coloured tick dots
+        const nDots = Math.floor(p * 40) + 2
+        for(let di = 0; di < Math.min(nDots, 40); di++){
+          const dotX = barX + 8 + (di / 40) * (barW - 16)
+          const dotY = barY + 40 + Math.sin(di * 1.3) * 12
+          drawAtom(ctx, dotX, dotY, WS_STREAMS[di % 6].col, 3)
         }
 
-
-
-        ctx.font='600 9px JetBrains Mono,monospace'; ctx.fillStyle='#64748b'; ctx.textAlign='center'
-
-
-
-        ctx.fillText(`${nDots} ticks from 6 streams \u2192 OHLCV + L2 + macro`,W/2,barY+68)
-
-        stageLabel(ctx,W,H,'BARS \u2014 Tick Accumulation',sT)
-
-
-
-      } else if(sT<0.72){
-
-        // ACT B: bar closed -> 19 variable names appear in their column buckets
-
-
-
-        const p=ease((sT-0.28)/0.44)
-
-
-
-        const pulse=Math.sin(sT*Math.PI*8)*0.08+0.93
-
-
-
-        ctx.save(); ctx.globalAlpha=pulse
-
-
-
-        ctx.font='800 20px JetBrains Mono,monospace'; ctx.fillStyle='#16a34a'; ctx.textAlign='center'
-
-
-
-        ctx.fillText('\u2713  BAR CLOSED  \u2014  19 VARIABLES COMPUTED',W/2,H*0.09)
-
-
-
-        ctx.restore(); ctx.globalAlpha=1
-
-
-
-        const colW=(W-30)/5, colH=H*0.68, colY=H*0.16
-
-
-
-        GROUPS.forEach((g,gi)=>{
-
-
-
-          const gx=40+gi*colW+colW/2
-
-
-
-          const colAlpha=ease(Math.min(1,Math.max(0,(p-gi*0.18)/0.22)))
-
-
-
-          if(colAlpha<=0) return
-
-
-
-          ctx.globalAlpha=Math.min(1,colAlpha)
-
-
-
-          ctx.save()
-
-
-
-          ctx.fillStyle=g.col+'14'; ctx.strokeStyle=g.col+'66'; ctx.lineWidth=1.5
-
-
-
-          ctx.beginPath(); ctx.roundRect(gx-colW/2+4,colY,colW-8,colH,8); ctx.fill(); ctx.stroke()
-
-
-
-          ctx.fillStyle=g.col; ctx.fillRect(gx-colW/2+4,colY,colW-8,16)
-
-
-
-          ctx.font='700 9px JetBrains Mono,monospace'; ctx.fillStyle='#fff'; ctx.textAlign='center'
-
-
-
-          ctx.fillText(g.label,gx,colY+15)
-
-
-
-          ctx.restore(); ctx.globalAlpha=1
-
-
-
-          const varStart=gi*0.18+0.18
-
-
-
-          const varP=Math.max(0,(p-varStart)/0.70)
-
-
-
-          const nShow=Math.ceil(g.vars.length*Math.min(1,varP*1.4))|0
-
-
-
-          if(nShow>0){
-
-
-
-            ctx.globalAlpha=Math.min(1,colAlpha)
-
-
-
-            ctx.font='600 11px JetBrains Mono,monospace'; ctx.fillStyle=g.col; ctx.textAlign='center'
-
-
-
-            g.vars.slice(0,nShow).forEach((v,vi)=>{
-
-
-
-              const vAlpha=ease(Math.min(1,Math.max(0,(varP*g.vars.length-vi)/1.0)))
-
-
-
-              ctx.globalAlpha=Math.min(1,colAlpha)*vAlpha
-
-
-
-              ctx.fillText(v,gx,colY+34+vi*18)
-
-
-
-            })
-
-
-
-            ctx.globalAlpha=1
-
-
-
-          }
-
-
-
+        // Stream key below dots
+        const keyY = barY + 74
+        ctx.font = '600 8px JetBrains Mono,monospace'; ctx.textAlign = 'left'
+        WS_STREAMS.forEach((s, si) => {
+          const kx = barX + si * (barW / 6)
+          drawAtom(ctx, kx + 5, keyY, s.col, 3)
+          ctx.fillStyle = '#64748b'
+          ctx.fillText(s.name.split('@')[0].slice(0, 10), kx + 11, keyY + 4)
         })
 
+        ctx.font = '600 9px JetBrains Mono,monospace'
+        ctx.fillStyle = '#64748b'
+        ctx.textAlign = 'center'
+        ctx.fillText(`${nDots} ticks captured \u2192 bar closes when timer hits 10s`, W / 2, barY + 100)
 
+        stageLabel(ctx, W, H, 'BARS \u2014 Tick Accumulation', sT)
 
-        const totalShown=GROUPS.reduce((acc,g,gi)=>{
+      // ── Phase 2 : feature recipe cards (how variables are computed) ──────
+      } else if(sT < 0.60){
+        const p = ease((sT - 0.22) / 0.38)
 
+        // Header
+        const hA = Math.min(1, p * 6)
+        ctx.save(); ctx.globalAlpha = hA
+        ctx.font = '700 11px JetBrains Mono,monospace'
+        ctx.fillStyle = '#1e1b4b'
+        ctx.textAlign = 'center'
+        ctx.fillText('\u2713  10s BAR CLOSED  \u2014  computing 19 variables', W / 2, H * 0.07)
+        ctx.restore(); ctx.globalAlpha = 1
 
+        const RECIPES = [
+          { l:'macro', col:'#7c3aed',
+            title:'Macro variables  —  BTC / ETH returns + session clock',
+            rows:['btc_return   = log( BTC_close_t / BTC_close_{t-1} )',
+                  'eth_return   = log( ETH_close_t / ETH_close_{t-1} )',
+                  'session_sin  = sin( 2π · hour_of_day / 24 )',
+                  'session_cos  = cos( 2π · hour_of_day / 24 )'],
+            out:'4 variables → fed into PCMCI feature matrix' },
 
-          const varStart=gi*0.18+0.18
+          { l:'market', col:'#4f46e5',
+            title:'Market variables  —  derived from OHLCV + bid-ask spread',
+            rows:['price_return   = ( close - prev_close ) / prev_close',
+                  'volatility     = rolling std of price_return over 20 bars',
+                  'spread         = ask - bid  (from bookTicker stream)',
+                  'rsi            = Wilder RSI(14)  on close prices',
+                  'ema_spread     = EMA(9) - EMA(21)  on close prices',
+                  'bollinger_wdth = upper_band - lower_band  (20 bars, 2σ)',
+                  'price_in_band  = ( close - lower ) / ( upper - lower )'],
+            out:'7 variables → fed into PCMCI feature matrix' },
 
+          { l:'microstructure', col:'#2563eb',
+            title:'Microstructure  —  from aggTrade + depth5 streams',
+            rows:['trade_intensity  = matched fills per 10s bar  (aggTrade)',
+                  'order_book_imbal = bid_volume / ( bid_volume + ask_volume )',
+                  '                   volumes sourced from depth5@100ms snapshot'],
+            out:'2 variables → fed into PCMCI feature matrix' },
 
+          { l:'health', col:'#475569',
+            title:'Algo health  —  ML1 Random Forest regime classifier',
+            rows:['algo_health_p_normal   = P( market is in normal regime )',
+                  'algo_health_p_stressed = P( market is in stressed regime )',
+                  'algo_health_p_degraded = P( market is in degraded regime )',
+                  'ML1 is trained on volatility · spread · trend rolling features'],
+            out:'3 variables → fed into PCMCI feature matrix' },
 
-          const varP=Math.max(0,(p-varStart)/0.70)
+          { l:'target', col:'#16a34a',
+            title:'Target variable  —  what PCMCI is asked to predict',
+            rows:['price_return = ( close_t - close_{t-1} ) / close_{t-1}',
+                  'This variable sits at the END of every causal chain.',
+                  'PCMCI discovers which upstream variables Granger-cause it.',
+                  'Stationary by construction — no unit root.'],
+            out:'1 variable → PCMCI target node' },
+        ]
 
+        // 2-column layout: left = MACRO + MARKET + MICRO, right = HEALTH + TARGET
+        // This gives each card enough height to show all content rows.
+        const colGap = 12
+        const rX_L  = W * 0.02
+        const rX_R  = W * 0.51
+        const colW  = W * 0.47
+        const topY  = H * 0.13
+        const botY  = H * 0.94
+        const usableH = botY - topY
 
+        // Left column: 3 cards
+        const leftCards   = RECIPES.slice(0, 3)
+        const rGapL       = 8
+        const rHL         = (usableH - 2 * rGapL) / 3
 
-          return acc + (Math.ceil(g.vars.length*Math.min(1,varP*1.4))|0)
+        // Right column: 2 cards
+        const rightCards  = RECIPES.slice(3)
+        const rGapR       = 12
+        const rHR         = (usableH - 1 * rGapR) / 2
 
+        leftCards.forEach((r, ri) => {
+          const rowP   = ease(Math.min(1, Math.max(0, (p - ri * 0.15) / 0.22)))
+          const fadeOut = p > 0.86 ? ease(1-(p-0.86)/0.12) : 1.0
+          const ry     = topY + ri * (rHL + rGapL)
+          bigCard(ctx, rX_L, ry, colW, rHL, r.col, r.l.toUpperCase(), r.title, r.rows, r.out, rowP * fadeOut)
+        })
 
+        rightCards.forEach((r, ri) => {
+          const rowP   = ease(Math.min(1, Math.max(0, (p - (ri + 3) * 0.15) / 0.22)))
+          const fadeOut = p > 0.86 ? ease(1-(p-0.86)/0.12) : 1.0
+          const ry     = topY + ri * (rHR + rGapR)
+          bigCard(ctx, rX_R, ry, colW, rHR, r.col, r.l.toUpperCase(), r.title, r.rows, r.out, rowP * fadeOut)
+        })
 
-        },0)
+        stageLabel(ctx, W, H, 'BARS \u2014 Feature Computation', sT)
 
-
-
-        ctx.font='600 9px JetBrains Mono,monospace'; ctx.fillStyle='#64748b'; ctx.textAlign='center'
-
-
-
-        ctx.fillText(`${Math.min(totalShown,19)} / 19 variables computed`,W/2,H*0.90)
-
-
-
-        stageLabel(ctx,W,H,'BARS \u2014 Features Computed',sT)
-
+      // ── Phase 3 : nodes appear inside bucket containers ───────────────────
       } else {
+        const p = ease((sT - 0.60) / 0.40)
 
-        // ACT C: variables shown statically in their 5 column bucket positions
-        const p=ease((sT-0.72)/0.28)
-        Object.values(nodes).forEach(n=>drawNode(ctx,n,p*0.9))
+        const LAYER_ORDER = ['macro','market','microstructure','health','target']
 
-        const colW=(W-30)/5, colH=H*0.74, colY=H*0.13
+        LAYER_ORDER.forEach((l, li) => {
+          const col       = LC[l]
+          const layerNodes = Object.values(nodes).filter(n => n.l === l)
+          if(!layerNodes.length) return
 
-        // Draw column buckets
-        GROUPS.forEach((g,gi)=>{
-          const gx=40+gi*colW
-          ctx.save()
-          ctx.globalAlpha=0.85*p
-          ctx.fillStyle=g.col+'14'; ctx.strokeStyle=g.col+'66'; ctx.lineWidth=1.2
-          ctx.beginPath(); ctx.roundRect(gx+4,colY,colW-8,colH,8); ctx.fill(); ctx.stroke()
-          ctx.fillStyle=g.col; ctx.fillRect(gx+4,colY,colW-8,16)
-          ctx.font='700 8px JetBrains Mono,monospace'; ctx.fillStyle='#fff'; ctx.textAlign='center'
-          ctx.fillText(g.label,gx+colW/2,colY+13)
-          ctx.restore(); ctx.globalAlpha=1
-        })
+          const cx   = layerNodes.reduce((a, n) => a + n.x, 0) / layerNodes.length
+          const ys   = layerNodes.map(n => n.y)
+          const minY = Math.min(...ys)
+          const maxY = Math.max(...ys)
 
-        // Draw variables statically in their column at their row position
-        GROUPS.forEach((g,gi)=>{
-          const gx=40+gi*colW+colW/2
-          g.vars.forEach((vname,vi)=>{
-            const rowY=colY+28+vi*18
-            ctx.save()
-            ctx.globalAlpha=Math.min(1,p*2)*0.9
-            ctx.font='600 9px JetBrains Mono,monospace'
-            const tw=ctx.measureText(abbr(vname)).width+10
-            ctx.fillStyle='rgba(255,255,255,0.95)'
-            ctx.beginPath(); ctx.roundRect(gx-tw/2,rowY-7,tw,14,7); ctx.fill()
-            ctx.strokeStyle=g.col+'99'; ctx.lineWidth=1; ctx.stroke()
-            ctx.fillStyle=g.col; ctx.textAlign='center'
-            ctx.fillText(abbr(vname),gx,rowY+4)
-            ctx.restore(); ctx.globalAlpha=1
+          const bW = NODE_R * 2 + BPAD * 2 + 20
+          const bX = cx - bW / 2
+          const bY = minY - NODE_R - BPAD - BHDR
+          const bH = (maxY - minY) + NODE_R * 2 + BPAD * 2 + BHDR
+
+          const layerStart = li * 0.16
+          const layerA = ease(Math.min(1, Math.max(0, (p - layerStart) / 0.20)))
+          if(layerA <= 0) return
+
+          // Bucket box
+          ctx.save(); ctx.globalAlpha = layerA
+          ctx.fillStyle = col + '12'; ctx.strokeStyle = col + '88'; ctx.lineWidth = 1.5
+          ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 8); ctx.fill(); ctx.stroke()
+          ctx.fillStyle = col
+          ctx.beginPath()
+          ctx.roundRect(bX, bY, bW, BHDR, {upperLeft:8,upperRight:8,lowerLeft:0,lowerRight:0})
+          ctx.fill()
+          ctx.font = '700 8px JetBrains Mono,monospace'
+          ctx.fillStyle = '#fff'
+          ctx.textAlign = 'center'
+          ctx.fillText(l.toUpperCase().slice(0, 5), cx, bY + BHDR - 4)
+          ctx.restore(); ctx.globalAlpha = 1
+
+          // Nodes staggered inside bucket
+          layerNodes.forEach((n, ni) => {
+            const nodeStart = layerStart + (ni / Math.max(1, layerNodes.length)) * 0.14
+            const nodeA = ease(Math.min(1, Math.max(0, (p - nodeStart) / 0.10)))
+            if(nodeA <= 0) return
+            drawNode(ctx, n, nodeA * 0.88)
           })
         })
 
-        stageLabel(ctx,W,H,'BARS \u2014 Variables \u2192 Graph Nodes',sT)
+        const total = Object.values(nodes).length
+        const visible = LAYER_ORDER.reduce((acc, l, li) => {
+          const la = Math.min(1, Math.max(0, (p - li*0.16) / 0.20))
+          return acc + (la > 0 ? Object.values(nodes).filter(n => n.l === l).length : 0)
+        }, 0)
 
+        ctx.font = '600 9px JetBrains Mono,monospace'
+        ctx.fillStyle = '#64748b'
+        ctx.textAlign = 'center'
+        ctx.fillText(`${visible} / ${total} variables \u2192 causal graph`, W / 2, H * 0.96)
+
+        stageLabel(ctx, W, H, sT > 0.92 ? 'BARS \u2014 Graph Nodes Ready' : 'BARS \u2014 Variables Computed', sT)
       }
-
 
 
     }

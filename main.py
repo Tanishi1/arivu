@@ -88,14 +88,43 @@ _shutdown = asyncio.Event()
 # Causal agent configuration
 # ---------------------------------------------------------------------------
 
-GRAPH_REFRESH_S: int = 300          # 5-minute base interval between PCMCI runs
+GRAPH_REFRESH_S: int = 150          # 2.5-minute base interval between PCMCI runs
+# Reduced from 300s: at 150s we get 24 runs/hour → Layer1 reaches 15 validation
+# runs in 37.5 min (vs 75 min at 300s). CPU overhead ~2% (3s PCMCI / 150s cycle).
+
 ADAPTIVE_VOL_WINDOW: int = 20       # rolling window for volatility-based refresh adaptation
-CAPITAL_CAUSAL_AGENT: float = 100_000.0   # $100k label (never used for P&L — actual equity fetched at runtime)
+CAPITAL_CAUSAL_AGENT: float = 1_000_000.0   # paper account size (cosmetic label — actual sizing uses live equity)
+
 CAPITAL_LEGACY_ARM: float = 1_000_000.0   # $1M for legacy strategies (run synthetically)
 # Whether the exchange account supports short-selling (crypto paper = no margin shorts by default).
 # When False, DOWN hypotheses are filtered out before trade execution — they would
 # become SELL signals with no existing position, silently converting to HOLD with pnl=0.
 SUPPORTS_SHORT: bool = False
+
+# Minimum expected return before a trade is committed.
+# Round-trip cost for SOL is ~0.10% (maker fee each way).
+# Anything below 0.15% is a guaranteed loser on fees alone.
+# Uses abs() so both BUY (positive) and CLOSE (negative) signals are gated.
+MIN_EXPECTED_RETURN: float = 0.0015
+
+
+# Variables that are always >= 0 by construction — sign-flip assumptions
+# (threshold=0, operator=gt) can never fire for these because they cannot go
+# negative. Used in causal_agent_loop when building DO assumptions.
+# See assumption-building block for full rationale.
+_ALWAYS_NON_NEGATIVE: frozenset[str] = frozenset({
+    "trade_intensity",       # trade count per bar, always >= 0
+    "bollinger_width",       # Bollinger band width, always >= 0
+    "volatility",            # std dev of returns, always >= 0
+    "volume",                # mean tick volume, always >= 0
+    "price_in_band",         # fraction [0, 1]
+    "regime_volatile",       # binary 0 or 1
+    "regime_trending",       # binary 0 or 1
+    "rsi",                   # bar-level RSI [0, 100]
+    "algo_health_p_normal",  # probability [0, 1]
+    "algo_health_p_stressed",
+    "algo_health_p_degraded",
+})
 
 
 def _handle_sigint(*_):
@@ -448,10 +477,12 @@ async def causal_agent_loop(
     _last_graph_refresh: float = 0.0
     _current_graph = None
     _active_hyp = None        # CausalHypothesis for current open trade
-    _active_traj = None       # SimulatedTrajectory for current open trade
+    _active_traj = None       # SimulatorResult for current open trade
+    _active_do_id: str | None = None      # DecisionObject ID for current open trade
     _active_entry_price: float = 0.0
-    _active_do_id: str | None = None
     _active_entry_time: float = 0.0
+    _last_breach_graph_id: str | None = None  # graph version_id that produced last breach
+                                              # blocks immediate re-entry on same stale graph
     _prev_regime: str | None = None
     _vol_history: list[float] = []  # rolling window for adaptive refresh
     effective_refresh: int = GRAPH_REFRESH_S   # updated each iteration from adaptive logic
@@ -551,6 +582,8 @@ async def causal_agent_loop(
                         )
                         await asyncio.to_thread(layer1.record_run, _current_graph, current_regime)
                         _last_graph_refresh = now
+                        # New graph = new causal structure. Allow re-entry after previous breach.
+                        _last_breach_graph_id = None
                         logger.info(
                             "CausalAgent: graph refreshed | %s", _current_graph.summary()
                         )
@@ -691,14 +724,19 @@ async def causal_agent_loop(
                         except Exception as exc:
                             logger.error("CausalAgent: failed to close breach trade | %s", exc)
                         finally:
+                            # Record the breached graph so we don't immediately re-enter
+                            # on the same stale causal structure.
+                            _last_breach_graph_id = _current_graph.version_id if _current_graph else None
                             _active_hyp = None
                             _active_traj = None
                             _active_do_id = None
                             _active_entry_price = 0.0
                             _active_entry_time = 0.0
 
-                # Check mathematical horizon expiry for causal agent trades
-                if _active_traj and elapsed >= _active_traj.time_horizon_s:
+                # Check mathematical horizon expiry for causal agent trades.
+                # Guard: skip if price is 0 (stale feed) — would record -100% return.
+                # The check will re-run on the next tick once the feed recovers.
+                if _active_traj and elapsed >= _active_traj.time_horizon_s and state.price > 0:
                     logger.info(
                         "CausalAgent: horizon expired | id=%s | elapsed=%ds | target=%ds",
                         _active_do_id[:8] if _active_do_id else "?", elapsed, _active_traj.time_horizon_s,
@@ -807,16 +845,45 @@ async def causal_agent_loop(
                 _obs_write(obs_log_path, state, None, [], None, "no_graph_yet", effective_refresh=effective_refresh, adaptive_fast=adaptive_fast)
                 continue
 
-            params = layer1._optimizer.get_params(current_regime)
+            # get_params_for_trade() rolls the epsilon-greedy dice ONCE per cycle.
+            # The returned params object is passed all the way into generate() so
+            # every edge is validated under the same threshold — and the DO records
+            # the threshold that actually ran (correct attribution for MetaOptimizer).
+            params = layer1._optimizer.get_params_for_trade(current_regime)
             logger.info(
                 "Causal Agent evaluating hypotheses | regime=%s | Active Params: k_runs=%d, min_runs=%d, threshold=%.2f",
                 current_regime, params.k_runs, params.min_runs, params.threshold
             )
 
-            hypotheses = await asyncio.to_thread(hyp_gen.generate, _current_graph, current_regime)
-            
+            # Block re-entry on the same graph that produced the last breach.
+            # Using the same causal structure immediately after it failed is circular.
+            # _last_breach_graph_id is cleared when a new PCMCI run completes.
+            if _last_breach_graph_id and _current_graph and _current_graph.version_id == _last_breach_graph_id:
+                logger.info(
+                    "CausalAgent: HOLD | reason=same_graph_as_last_breach | "
+                    "graph=%s | waiting for next PCMCI run",
+                    _current_graph.version_id[:8],
+                )
+                continue
+
+            hypotheses = await asyncio.to_thread(hyp_gen.generate, _current_graph, current_regime, params)
+
             if not hypotheses:
                 continue
+
+            # Log total count (diagnostic: very high = k_runs too loose) then slice
+            # to top MAX_HYPOTHESES_ML2 before ML2 annotation.
+            # Hypotheses are already sorted by composite_score descending.
+            # Annotating all 1240 when only top-1 gets traded is pure waste.
+            MAX_HYPOTHESES_ML2 = 30
+            n_total_hyps = len(hypotheses)
+            hypotheses = hypotheses[:MAX_HYPOTHESES_ML2]
+            if n_total_hyps > MAX_HYPOTHESES_ML2:
+                logger.info(
+                    "CausalAgent: hypothesis pool | total=%d (sliced to top %d for ML2) | "
+                    "k_runs=%d threshold=%.2f | high count may indicate loose params",
+                    n_total_hyps, MAX_HYPOTHESES_ML2, params.k_runs, params.threshold,
+                )
 
             from core.schemas import Assumption
             from core.decision_utils import annotate_proximity
@@ -859,7 +926,7 @@ async def causal_agent_loop(
                     # We don't call annotate_proximity() here because threshold=0 lt —>
                     # prox=1.0 always, which is wrong. We already computed the real proximity.
                     proxy_assumptions.append(Assumption(
-                        name=f"edge_{edge.source}_{edge.target}_lag{edge.lag}",
+                        name=f"causal_edge|{edge.source}|{edge.target}|{edge.lag}",
                         variable=source_var,
                         operator=op,
                         threshold=0.0,
@@ -932,6 +999,40 @@ async def causal_agent_loop(
                            effective_refresh=effective_refresh, adaptive_fast=adaptive_fast)
                 continue
 
+            # Gate: reject trades where expected return is below the fee floor.
+            # Round-trip cost ~0.10%; MIN_EXPECTED_RETURN = 0.15% ensures every
+            # committed trade has positive expected value after fees.
+            # abs() catches both BUY (positive) and CLOSE (negative) signals.
+            #
+            # ESCAPE VALVE EXEMPTION: escape valve trades are fired specifically
+            # to generate closed-trade outcome records so Layer2, MetaOptimizer,
+            # and RegimeClassifier get training signal during low-hypothesis periods.
+            # Their purpose is NOT profit — it's learning. At 1% capital the fee
+            # cost is trivial vs. the learning value of the outcome record.
+            # Blocking them here defeats the entire reason the escape valve exists.
+            if abs(trajectory.predicted_price_return) < MIN_EXPECTED_RETURN and not selected_hyp.is_escape_valve:
+                logger.info(
+                    "CausalAgent: HOLD | reason=below_fee_floor | "
+                    "expected_return=%.4f%% min=%.4f%% | chain=%s",
+                    trajectory.predicted_price_return * 100,
+                    MIN_EXPECTED_RETURN * 100,
+                    selected_hyp.chain_summary(),
+                )
+                _obs_write(obs_log_path, state, _current_graph, hypotheses, selected_hyp,
+                           f"below_fee_floor:{trajectory.predicted_price_return:.6f}",
+                           effective_refresh=effective_refresh, adaptive_fast=adaptive_fast)
+                continue
+            elif abs(trajectory.predicted_price_return) < MIN_EXPECTED_RETURN and selected_hyp.is_escape_valve:
+                logger.info(
+                    "CausalAgent: escape valve bypassing fee floor | "
+                    "expected_return=%.4f%% (below %.4f%%) | chain=%s | "
+                    "firing 1%% position to generate Layer2/MetaOptimizer training signal",
+                    trajectory.predicted_price_return * 100,
+                    MIN_EXPECTED_RETURN * 100,
+                    selected_hyp.chain_summary(),
+                )
+
+
             # --- Step 6: Commit Decision Object ---
             # Only BUY signals reach here (SUPPORTS_SHORT=False filters DOWN above).
             trade_signal = "BUY" if selected_hyp.predicted_direction == "up" else "CLOSE"
@@ -985,13 +1086,29 @@ async def causal_agent_loop(
                 proximity = 1.0 - selected_hyp.layer1_score
                 edge_coeff = getattr(edge, 'coeff', 1.0) or 1.0
 
-                # Build a semantically meaningful threshold:
-                # - Positive coeff: driver should stay positive → breach if it goes ≤ 0
-                #   operator=gt, threshold=0.0 (breach when current_val ≤ 0)
-                # - Negative coeff: driver was pointing negative → breach if it goes ≥ 0
-                #   operator=lt, threshold=0.0 (breach when current_val ≥ 0)
-                # - But for very small-magnitude vars (|val| < 1e-4), use a ±20% band
-                #   around 0 to avoid hair-trigger breaches from noise.
+                # ----------------------------------------------------------
+                # Determine operator and threshold for this causal assumption.
+                #
+                # The goal: "if this driver moves in the wrong direction, the
+                # causal hypothesis is likely invalid — close the trade."
+                #
+                # For BIPOLAR variables (can be negative: price_return, ema_spread,
+                # btc_return, eth_return, order_book_imbalance, session_sin):
+                #   Positive coeff → driver must stay positive → breach at zero.
+                #   Negative coeff → driver must stay negative → breach at zero.
+                #
+                # For ALWAYS-POSITIVE variables (trade_intensity, bollinger_width,
+                # volatility, volume, rsi, price_in_band, regime_*, algo_health_*):
+                #   Sign-flip never fires (they can't go negative).
+                #   Instead: use 2-sigma collapse from the 200-bar historical mean.
+                #   Threshold = max(feature_mean - 2×feature_std, 0)
+                #   This is the only principled choice — it uses the distribution
+                #   PCMCI was trained on, so below-threshold means the market
+                #   condition that produced the edge no longer exists.
+                #
+                # ----------------------------------------------------------
+
+
                 if current_val == 0.0:
                     # Driver is exactly zero at commit time — no directional signal.
                     # A threshold=0 assumption would breach immediately (0.0 <= 0.0).
@@ -1017,14 +1134,69 @@ async def causal_agent_loop(
                     else:
                         operator = "lt"
                         threshold = band
-                elif edge_coeff > 0:
-                    # Strong positive causal driver: breach the moment it flips sign
+                elif edge_coeff > 0 and source_var in _ALWAYS_NON_NEGATIVE:
+                    # Always-positive variable with positive coefficient.
+                    # Sign-flip (threshold=0) can never fire — use 2-sigma collapse instead.
+                    # Threshold = max(feature_mean - 2×std, 0).
+                    # If the historical distribution is wide (high std), the threshold is
+                    # lower — sensible since volatile features have wider normal swings.
+                    feat_mean = (_current_graph.feature_means or {}).get(source_var, current_val)
+                    feat_std  = (_current_graph.feature_stds  or {}).get(source_var, current_val * 0.5)
+                    two_sigma_floor = max(feat_mean - 2.0 * feat_std, 0.0)
+                    # Safety: if 2-sigma floor is 0 (very high variance), use 20% of
+                    # current value so there's always a non-trivial breach level.
+                    threshold = two_sigma_floor if two_sigma_floor > 1e-6 else current_val * 0.20
                     operator = "gt"
-                    threshold = 0.0
-                else:
-                    # Negative causal driver: breach if it flips positive (regime change)
+                    logger.debug(
+                        "CausalAgent: always-positive assumption | var=%s "
+                        "feat_mean=%.4f feat_std=%.4f threshold=%.4f",
+                        source_var, feat_mean, feat_std, threshold,
+                    )
+                elif edge_coeff < 0 and source_var in _ALWAYS_NON_NEGATIVE:
+                    # Always-positive variable with NEGATIVE coefficient.
+                    # e.g. volatility->spread with coeff=-0.3: higher vol -> lower spread.
+                    # The hypothesis breaks when vol spikes (opposite direction).
+                    # Threshold=0 would breach instantly whenever vol is 0 at commit time.
+                    # Approach B: if current_val is 0 at commit time (cold start, no data),
+                    # skip the assumption — we cannot compute a meaningful threshold.
+                    # When val > 0, breach if it spikes to 3x commit value (regime change).
+                    if current_val == 0.0 or abs(current_val) < 1e-6:
+                        logger.debug(
+                            "CausalAgent: skipping always-positive negative-coeff assumption | "
+                            "var=%s current_val=%.6f (zero at commit time, no threshold computable)",
+                            source_var, current_val,
+                        )
+                        continue  # skip — don't build a threshold=0 time-bomb
                     operator = "lt"
-                    threshold = 0.0
+                    threshold = current_val * 3.0  # breach if spikes to 3x commit value
+                    logger.debug(
+                        "CausalAgent: always-positive negative-coeff assumption | "
+                        "var=%s current=%.4f threshold=%.4f (spike detection)",
+                        source_var, current_val, threshold,
+                    )
+                elif edge_coeff > 0:
+                    operator = "gt"
+                    if current_val >= 0:
+                        # Positive bipolar driver pointing up (e.g. order_book_imbalance=+0.3).
+                        # Hypothesis invalidated when driver flips negative → sign-flip check.
+                        threshold = 0.0
+                    else:
+                        # Positive driver currently negative (e.g. ema_spread=-0.002).
+                        # Breach if it collapses 3× further negative — large directional move.
+                        threshold = current_val * 3.0
+                else:
+                    operator = "lt"
+                    if current_val <= 0:
+                        # Negative bipolar driver pointing down (e.g. ema_spread=-0.002).
+                        # Hypothesis invalidated when driver flips positive → sign-flip check.
+                        threshold = 0.0
+                    else:
+                        # Negative driver currently positive (e.g. spread=0.01, vol=0.002).
+                        # These variables are ALWAYS positive — threshold=0.0 would ALWAYS
+                        # breach instantly (0.01 >= 0.0 is trivially true).
+                        # Instead: breach if variable spikes to 3× commit value (regime change).
+                        threshold = current_val * 3.0
+
 
                 logger.debug(
                     "CausalAgent: assumption | var=%s current=%.6f coeff=%.3f "
@@ -1165,7 +1337,8 @@ async def causal_agent_loop(
                 hill_climb_iterations=0,  # causal agent doesn't hill-climb
                 phase=current_phase[0],  # will upgrade later when Layer 2 matures
                 meta_params={
-                    **layer1._optimizer.get_params(current_regime).to_dict(),
+                    **params.to_dict(),   # reuse params fetched above (line 812) — prevents epsilon-greedy mis-attribution
+
                     "is_escape_valve": selected_hyp.is_escape_valve,
                     "edge_stability": selected_hyp.layer1_score,
                     "avg_breach_risk": avg_breach_risk,
@@ -1199,11 +1372,12 @@ async def causal_agent_loop(
             # The loop polls every 10 s, so without this guard it re-enters and tries to
             # place a concurrent second order while the first is still executing, causing
             # the file lock to time out and marking the second trade EXECUTION_FAILED.
-            _active_do_id = str(do.id)   # lock the slot immediately
+            _active_do_id = str(do.id)   # lock the slot immediately — prevents duplicate orders
             _active_hyp = selected_hyp
             _active_traj = trajectory
-            _active_entry_price = state.price
-            _active_entry_time = time.monotonic()
+            # NOTE: _active_entry_time and _active_entry_price are set AFTER execute() returns.
+            # Setting them here (pre-fill) would start the horizon clock at submission, meaning
+            # 15-40 s of fill latency eats into a 10-30 s horizon before monitoring begins.
             try:
                 # Detect escape valve trade
                 is_escape_valve = selected_hyp.is_escape_valve
@@ -1227,10 +1401,17 @@ async def causal_agent_loop(
                 await state_manager.update_algo_health(new_vector)
 
                 await asyncio.to_thread(ledger.update_status, str(do.id), "ACTIVE")
+
+                # Stamp fill time NOW — horizon countdown starts from actual fill,
+                # not from order submission (15-40 s earlier due to Alpaca latency).
+                _active_entry_time = time.monotonic()
+                _active_entry_price = state.price
+
                 logger.info(
                     "CausalAgent: trade ACTIVE | id=%s signal=%s price=%.4f",
                     str(do.id)[:8], trade_signal, state.price,
                 )
+
 
                 # Check if ML1 should retrain
                 ml1_retrained, ml1_oob = await asyncio.to_thread(ml1.maybe_retrain)
@@ -1254,7 +1435,13 @@ async def causal_agent_loop(
                     "CausalAgent: cooling down for 90s after EXECUTION_FAILED "
                     "to avoid lock contention with RL arms"
                 )
-                _active_do_id = None  # clear slot so horizon check won't re-close
+                # Clear all active-trade state so the horizon check and breach check
+                # don't fire against a DO that never executed.
+                _active_do_id = None
+                _active_hyp = None
+                _active_traj = None
+                _active_entry_price = 0.0
+                _active_entry_time = 0.0
                 await asyncio.sleep(90)
 
             # Observability log

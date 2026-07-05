@@ -30,13 +30,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 BAR_WIDTH_S: int = 10          # seconds per bar
-WINDOW_BARS: int = 200         # rolling history for PCMCI (200 × 10s = ~33 min)
+WINDOW_BARS: int = 100         # rolling history for PCMCI (100 × 10s = ~16.7 min)
+# Reduced from 200: 200 bars (33 min) spans multiple regimes (stationarity breaks).
+# 100 bars = df=94 for ParCorr tests (RELIABLE), stays within ~1 regime.
 EMA_FAST_PERIOD: int = 9
 EMA_SLOW_PERIOD: int = 21
 BOLLINGER_PERIOD: int = 20
 BOLLINGER_STD: float = 2.0
 RSI_PERIOD: int = 14
-MIN_BARS_FOR_DISCOVERY: int = 60   # tau_max * 2 + 20 safety margin
+MIN_BARS_FOR_DISCOVERY: int = 40   # statistical floor for Granger (df_den=31, RELIABLE)
+# Reduced from 60: Granger at 40 bars has df_den=31 which is statistically reliable.
+# This allows first graph at ~6.7 min instead of 10 min. PCMCI still waits for 80 bars.
 
 # Variables that are NEVER included in the causal graph input.
 # See implementation_plan.md §Self-Referential Leakage for full rationale.
@@ -254,7 +258,7 @@ class FeatureBarBuilder:
                 # Fire async callback if registered (runs on the event loop)
                 if self._on_bar_closed is not None:
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         if loop.is_running():
                             asyncio.ensure_future(
                                 self._on_bar_closed(self._last_bar_features)

@@ -50,9 +50,24 @@ from core.constants import (
     SCALER_MODEL_PATH,
 )
 
-# Bootstrap regime thresholds
-VOLATILE_THRESHOLD = 0.04
-TRENDING_SLOPE_THRESHOLD = 0.005
+# Bootstrap regime thresholds — calibrated to CausalState feature scale.
+#
+# CausalState.volatility  = rolling std of log price_return over 20 bars.
+#   Typical range: 0.000005 – 0.0002.  Old threshold (0.04) was 823× too high.
+#
+# CausalState.trend_strength = abs(ema_slope) / SLOPE_NORMALISER.
+#   Typical range: 0.000 – 0.075.  Old threshold (0.35) was 11× too high.
+#
+# With the old values EVERY bar was classified calm — regime learning was
+# completely broken for the first 5 days of live operation.
+#
+# New values = p80 of each feature from 68 closed live entries (2026-07-06).
+# This gives a realistic ~70% calm / 20% trending / 10% volatile split.
+# These should be re-tuned once KMeans has enough data (40+ closed entries)
+# and takes over from the bootstrap classifier.
+VOLATILE_THRESHOLD       = 0.000049   # was 0.04  (p80 of live volatility data)
+TRENDING_SLOPE_THRESHOLD = 0.031579   # was 0.005 (p80 of live trend_strength data)
+
 
 
 class RegimeClassifier:
@@ -199,15 +214,21 @@ class RegimeClassifier:
     ) -> list[str]:
         """Assign human-readable regime names to cluster IDs.
 
-        For each cluster, compute mean volatility and trend_strength.
-        Highest volatility cluster → 'volatile'
-        Highest trend_strength (not volatile) → 'trending'
-        Remaining → 'calm'
+        Assignment rules (work for any K):
+          - Highest volatility cluster           → 'volatile'
+          - Highest trend (among non-volatile)   → 'trending'
+          - Lowest of all remaining              → 'calm'
+          - Every intermediate cluster (K >= 4)  → 'regime_1', 'regime_2', ...
+            indexed in descending trend order
 
-        Manual review recommended: a team member should inspect centroids
-        and confirm the assignment makes intuitive sense.
+        Examples:
+          K=2: volatile, calm  (or trending if high trend)
+          K=3: volatile, trending, calm
+          K=4: volatile, trending, regime_1, calm
+          K=5: volatile, trending, regime_1, regime_2, calm
+          K=6: volatile, trending, regime_1, regime_2, regime_3, calm
         """
-        cluster_ids = list(set(labels))
+        cluster_ids = sorted(set(labels))
         stats: dict[int, dict] = {}
 
         for cid in cluster_ids:
@@ -218,32 +239,51 @@ class RegimeClassifier:
                 "trend": np.mean([e["trend_strength"] for e in subset]),
             }
 
-        # Sort by volatility descending
+        # Sort all clusters by volatility descending
         sorted_by_vol = sorted(cluster_ids, key=lambda c: stats[c]["vol"], reverse=True)
 
-        regime_map = {}
-        regime_map[sorted_by_vol[0]] = "volatile"
-        if len(sorted_by_vol) > 2:
-            # Secondary: sort remaining by trend
-            remaining = sorted_by_vol[1:]
-            sorted_by_trend = sorted(remaining, key=lambda c: stats[c]["trend"], reverse=True)
-            regime_map[sorted_by_trend[0]] = "trending"
-            for c in sorted_by_trend[1:]:
-                regime_map[c] = "calm"
-        elif len(sorted_by_vol) == 2:
-            # With K=2 there is no room for all three regime labels.
-            # Promote the second cluster to "trending" if its mean trend_strength is
-            # meaningfully positive; otherwise label it "calm".
-            # Without this, EMAStrategy can NEVER receive a regime boost when K=2,
-            # breaking the regime-aware architecture during the early accumulation phase
-            # (Weeks 5–7 when only 40–60 entries exist and K=2 is the best-fit K).
-            second_cid = sorted_by_vol[1]
-            if stats[second_cid]["trend"] > 0.4:
-                regime_map[second_cid] = "trending"
-            else:
-                regime_map[second_cid] = "calm"
+        regime_map: dict[int, str] = {}
 
-        return [regime_map.get(label, "calm") for label in labels]
+        if len(sorted_by_vol) == 1:
+            regime_map[sorted_by_vol[0]] = "volatile"
+
+        elif len(sorted_by_vol) == 2:
+            regime_map[sorted_by_vol[0]] = "volatile"
+            second = sorted_by_vol[1]
+            regime_map[second] = "trending" if stats[second]["trend"] > 0.4 else "calm"
+
+        else:
+            # K >= 3
+            # Step 1: Most volatile → "volatile"
+            regime_map[sorted_by_vol[0]] = "volatile"
+
+            # Step 2: Sort remaining by trend descending
+            remaining = sorted_by_vol[1:]
+            sorted_by_trend = sorted(
+                remaining, key=lambda c: stats[c]["trend"], reverse=True
+            )
+
+            # Step 3: Highest trend → "trending", lowest → "calm"
+            # Everything in between → "regime_1", "regime_2", ...
+            for i, cid in enumerate(sorted_by_trend):
+                if i == 0:
+                    regime_map[cid] = "trending"
+                elif i == len(sorted_by_trend) - 1:
+                    regime_map[cid] = "calm"
+                else:
+                    # Intermediate: regime_1, regime_2, ...
+                    regime_map[cid] = f"regime_{i}"
+
+        named = [regime_map.get(label, "calm") for label in labels]
+        logger.info(
+            "K-Means label assignment | k=%d | map=%s",
+            len(cluster_ids),
+            {regime_map[cid]: cid for cid in cluster_ids},
+        )
+        return named
+
+
+
 
     def _bootstrap_classify(
         self, volatility: float, trend_strength: float, trend_slope: float = 0.0

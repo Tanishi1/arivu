@@ -52,14 +52,18 @@ SPREAD_PROPAGATION_FACTOR = 5
 # K-Means regime discovery
 # ---------------------------------------------------------------------------
 K_CANDIDATES = [2, 3, 4]
-MIN_ENTRIES_FOR_KMEANS = 40
+MIN_ENTRIES_FOR_KMEANS = 30
+# Reduced from 40: 30 samples = 10/cluster (silhouette floor), enough for depth-2 DT
+# classifying 3 regimes. Below 30: silhouette <5/cluster, DT overfits.
 
 # Strategy window
 STRATEGY_HORIZON_MINUTES = 30
 
 # ML retraining triggers
-ML1_RETRAIN_AFTER = 100   # ExecutionTelemetry samples
-ML2_RETRAIN_AFTER = 20    # closed OutcomeRecord entries
+ML1_RETRAIN_AFTER = 100   # ExecutionTelemetry samples (RF needs 33/class for reliable OOB)
+ML2_RETRAIN_AFTER = 10    # closed OutcomeRecord entries
+# Reduced from 20: safe because MIN_SAMPLES=30 guard inside ml2.py is the real gate.
+# Counter checks happen more often but retrain only fires once 30 total samples exist.
 
 # Per-instrument assumption thresholds
 INSTRUMENTS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
