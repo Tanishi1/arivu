@@ -101,7 +101,7 @@ class OutcomeRecordRow(Base):
     breach_timestamps = Column(Text, nullable=True)    # JSON dict
     hill_climb_iterations = Column(Integer, nullable=False)
     phase = Column(String, nullable=False, default="bootstrap")  # mirrors DecisionObject.phase
-    close_reason = Column(String, nullable=False, default="horizon_expired")  # must be a valid OutcomeRecord.close_reason Literal
+    close_reason = Column(String, nullable=False, default="incomplete")  # sentinel: must be overwritten by writer.close() — if still 'incomplete' in DB, the write crashed
     schema_version = Column(Integer, nullable=False, default=1)
 
 

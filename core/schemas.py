@@ -304,6 +304,13 @@ class OutcomeRecord(BaseModel):
     assumptions_breached: list[str]         # assumption names that breached
     breach_timestamps: dict                 # {assumption_name: iso_timestamp}
     hill_climb_iterations: int
-    close_reason: Literal["horizon_expired", "assumption_breach", "trajectory_breach", "system_shutdown", "manual"]
+    close_reason: Literal[
+        "horizon_expired",
+        "assumption_breach",
+        "trajectory_breach",
+        "system_shutdown",
+        "manual",
+        "incomplete",   # sentinel: DB row written but close_reason never set (crash mid-write)
+    ]
     phase: Literal["bootstrap", "trained"]  # carried from DecisionObject
     schema_version: int = 1
