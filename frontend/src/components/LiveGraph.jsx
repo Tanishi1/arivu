@@ -1708,19 +1708,15 @@ export default function LiveGraph({
 
 
 
-        ctx.fillText(`${nDots} ticks from 6 streams ΓåÆ OHLCV + L2 + macro`,W/2,barY+68)
+        ctx.fillText(`${nDots} ticks from 6 streams \u2192 OHLCV + L2 + macro`,W/2,barY+68)
 
-
-
-        stageLabel(ctx,W,H,'BARS ΓÇö Tick Accumulation',sT)
+        stageLabel(ctx,W,H,'BARS \u2014 Tick Accumulation',sT)
 
 
 
       } else if(sT<0.72){
 
-
-
-        // ACT B: bar closed ΓåÆ 19 variable names cascade in groups
+        // ACT B: bar closed -> 19 variable names appear in their column buckets
 
 
 
@@ -1740,7 +1736,7 @@ export default function LiveGraph({
 
 
 
-        ctx.fillText('Γ£ô  BAR CLOSED  ΓÇö  19 VARIABLES COMPUTED',W/2,H*0.09)
+        ctx.fillText('\u2713  BAR CLOSED  \u2014  19 VARIABLES COMPUTED',W/2,H*0.09)
 
 
 
@@ -1884,109 +1880,48 @@ export default function LiveGraph({
 
 
 
-        stageLabel(ctx,W,H,'BARS ΓÇö Features Computed',sT)
-
-
+        stageLabel(ctx,W,H,'BARS \u2014 Features Computed',sT)
 
       } else {
 
-
-
-        // ACT C: variable pills fly to graph node positions
-
-
-
+        // ACT C: variables shown statically in their 5 column bucket positions
         const p=ease((sT-0.72)/0.28)
-
-
-
-        Object.values(nodes).forEach(n=>drawNode(ctx,n,p*0.8))
-
-
+        Object.values(nodes).forEach(n=>drawNode(ctx,n,p*0.9))
 
         const colW=(W-30)/5, colH=H*0.74, colY=H*0.13
 
-
-
-        VARIABLE_NAMES.forEach((vname,vi)=>{
-
-
-
-          const g=GROUPS.find(gr=>gr.vars.includes(vname))||GROUPS[1]
-
-
-
-          const gi=GROUPS.indexOf(g)
-
-
-
-          const gx=40+gi*colW+colW/2
-
-
-
-          const gvy=colY+30+g.vars.indexOf(vname)*15
-
-
-
-          const tn=nodes[vname]; if(!tn) return
-
-
-
-          const vp=ease(Math.min(1,Math.max(0,(p*VARIABLE_NAMES.length-vi*0.55)/2.8)))
-
-
-
-          if(vp>=0.97) return
-
-
-
-          const cx2=gx+(tn.x-gx)*vp
-
-
-
-          const cy2=gvy+(tn.y-gvy)*vp
-
-
-
-          ctx.save(); ctx.globalAlpha=1-vp*0.4
-
-
-
-          ctx.font='600 9px JetBrains Mono,monospace'
-
-
-
-          const tw=ctx.measureText(abbr(vname)).width+12
-
-
-
-          ctx.fillStyle='rgba(255,255,255,0.95)'
-
-
-
-          ctx.beginPath(); ctx.roundRect(cx2-tw/2,cy2-8,tw,16,8); ctx.fill()
-
-
-
-          ctx.strokeStyle=g.col; ctx.lineWidth=1.5; ctx.stroke()
-
-
-
-          ctx.fillStyle=g.col; ctx.textAlign='center'; ctx.fillText(abbr(vname),cx2,cy2+4)
-
-
-
+        // Draw column buckets
+        GROUPS.forEach((g,gi)=>{
+          const gx=40+gi*colW
+          ctx.save()
+          ctx.globalAlpha=0.85*p
+          ctx.fillStyle=g.col+'14'; ctx.strokeStyle=g.col+'66'; ctx.lineWidth=1.2
+          ctx.beginPath(); ctx.roundRect(gx+4,colY,colW-8,colH,8); ctx.fill(); ctx.stroke()
+          ctx.fillStyle=g.col; ctx.fillRect(gx+4,colY,colW-8,16)
+          ctx.font='700 8px JetBrains Mono,monospace'; ctx.fillStyle='#fff'; ctx.textAlign='center'
+          ctx.fillText(g.label,gx+colW/2,colY+13)
           ctx.restore(); ctx.globalAlpha=1
-
-
-
         })
 
+        // Draw variables statically in their column at their row position
+        GROUPS.forEach((g,gi)=>{
+          const gx=40+gi*colW+colW/2
+          g.vars.forEach((vname,vi)=>{
+            const rowY=colY+28+vi*18
+            ctx.save()
+            ctx.globalAlpha=Math.min(1,p*2)*0.9
+            ctx.font='600 9px JetBrains Mono,monospace'
+            const tw=ctx.measureText(abbr(vname)).width+10
+            ctx.fillStyle='rgba(255,255,255,0.95)'
+            ctx.beginPath(); ctx.roundRect(gx-tw/2,rowY-7,tw,14,7); ctx.fill()
+            ctx.strokeStyle=g.col+'99'; ctx.lineWidth=1; ctx.stroke()
+            ctx.fillStyle=g.col; ctx.textAlign='center'
+            ctx.fillText(abbr(vname),gx,rowY+4)
+            ctx.restore(); ctx.globalAlpha=1
+          })
+        })
 
-
-        stageLabel(ctx,W,H,'BARS ΓÇö Variables ΓåÆ Graph Nodes',sT)
-
-
+        stageLabel(ctx,W,H,'BARS \u2014 Variables \u2192 Graph Nodes',sT)
 
       }
 
