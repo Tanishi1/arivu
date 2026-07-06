@@ -1264,8 +1264,9 @@ async def causal_agent_loop(
             layer2_multiplier = min(1.0, l2_trust * 2.0)  # 0.5→1.0, 0.3→0.6, 0.7→1.0
 
             adjusted_params = {
-                "position_fraction": round(
-                    original_fraction * risk_multiplier * layer2_multiplier, 4
+                "position_fraction": max(
+                    0.00002,
+                    round(original_fraction * risk_multiplier * layer2_multiplier, 7)
                 )
             }
 
