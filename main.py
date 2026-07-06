@@ -1026,7 +1026,7 @@ async def causal_agent_loop(
                 logger.info(
                     "CausalAgent: escape valve bypassing fee floor | "
                     "expected_return=%.4f%% (below %.4f%%) | chain=%s | "
-                    "firing 1%% position to generate Layer2/MetaOptimizer training signal",
+                    "firing 0.01% position to generate Layer2/MetaOptimizer training signal",
                     trajectory.predicted_price_return * 100,
                     MIN_EXPECTED_RETURN * 100,
                     selected_hyp.chain_summary(),
@@ -1248,7 +1248,7 @@ async def causal_agent_loop(
 
             risk_multiplier = max(0.10, 1.0 - avg_breach_risk)
 
-            original_fraction = 0.01 if selected_hyp.is_escape_valve else 0.10
+            original_fraction = 0.0001 if selected_hyp.is_escape_valve else 0.10
 
             # --- Layer 2 trust multiplier (continuous, no hard gate) ---
             # Layer 2 trust is a Bayesian Beta posterior over directional accuracy.
@@ -1385,7 +1385,7 @@ async def causal_agent_loop(
                 if is_escape_valve:
                     logger.warning(
                         "CausalAgent: escape valve trade | "
-                        "chain=%s | position capped at 1%% of normal",
+                        "chain=%s | position capped at 0.01% of normal",
                         selected_hyp.chain_summary(),
                     )
 
