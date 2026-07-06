@@ -1026,7 +1026,7 @@ async def causal_agent_loop(
                 logger.info(
                     "CausalAgent: escape valve bypassing fee floor | "
                     "expected_return=%.4f%% (below %.4f%%) | chain=%s | "
-                    "firing 0.01% position to generate Layer2/MetaOptimizer training signal",
+                    "firing 0.01%% position to generate Layer2/MetaOptimizer training signal",
                     trajectory.predicted_price_return * 100,
                     MIN_EXPECTED_RETURN * 100,
                     selected_hyp.chain_summary(),
@@ -1386,7 +1386,7 @@ async def causal_agent_loop(
                 if is_escape_valve:
                     logger.warning(
                         "CausalAgent: escape valve trade | "
-                        "chain=%s | position capped at 0.01% of normal",
+                        "chain=%s | position capped at 0.01%% of normal",
                         selected_hyp.chain_summary(),
                     )
 
