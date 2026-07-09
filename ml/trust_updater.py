@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 LEARNING_RATE: float = 0.10         # how fast trust scores update
 INITIAL_TRUST: float = 0.50         # neutral starting point
 MIN_OBS_FOR_TRUST: int = 15         # trust is "meaningful" above this count
+NEUTRAL_BAND: float = 0.00005       # |return| below this (~0.005% at $80 SOL = ~1 tick) → skip update
 
 
 class Layer2TrustUpdater:
@@ -53,6 +54,8 @@ class Layer2TrustUpdater:
         self._lock = threading.Lock()
         # In-memory cache: edge_key → {"trust": float, "n_observations": int}
         self._scores: dict[str, dict] = {}
+        # Chain trust cache
+        self._chain_scores: dict[str, dict] = {}
         self._ensure_schema()
         self._load_from_db()
 
@@ -74,7 +77,19 @@ class Layer2TrustUpdater:
             outcome_correct:         True if actual direction matched predicted.
             actual_price_return:     real price_return over the trade horizon.
             predicted_price_return:  what the hypothesis predicted.
+
+        Note: if |actual_price_return| < NEUTRAL_BAND the market didn't move
+        meaningfully — counting it as WRONG would unfairly penalise the edge.
+        We skip the update entirely and leave trust unchanged.
         """
+        if abs(actual_price_return) < NEUTRAL_BAND:
+            logger.debug(
+                "Layer2: skip trust update — flat close | "
+                "actual_return=%.7f < neutral_band=%.5f | chain=%s",
+                actual_price_return, NEUTRAL_BAND, hypothesis.chain_summary(),
+            )
+            return
+
         outcome = 1.0 if outcome_correct else 0.0
 
         for edge in hypothesis.chain:
@@ -102,12 +117,19 @@ class Layer2TrustUpdater:
                 
                 rec["trust"] = round(new_trust, 6)
 
+                # Capture consistent snapshot inside the lock — prevents a race
+                # where another thread modifies rec between lock release and _persist_update.
+                _n_obs   = rec["n_observations"]
+                _succ    = rec["successes"]
+                _fail    = rec["failures"]
+                _trust   = new_trust
+
             self._persist_update(
                 edge_key=key,
-                trust=new_trust,
-                n_observations=rec["n_observations"],
-                successes=rec["successes"],
-                failures=rec["failures"],
+                trust=_trust,
+                n_observations=_n_obs,
+                successes=_succ,
+                failures=_fail,
                 hypothesis_id=hypothesis.id,
                 outcome_correct=outcome_correct,
                 actual_return=actual_price_return,
@@ -120,6 +142,44 @@ class Layer2TrustUpdater:
                 key, "correct" if outcome_correct else "wrong",
                 old_trust, new_trust, rec["n_observations"],
             )
+            
+    def update_chain_trust(self, chain_key: str, outcome_correct: bool) -> None:
+        """Update trust score for an entire chain using Bayesian Beta update."""
+        with self._lock:
+            if chain_key not in self._chain_scores:
+                self._chain_scores[chain_key] = {
+                    "trust": INITIAL_TRUST,
+                    "n_observations": 0,
+                    "successes": 0,
+                    "failures": 0,
+                }
+            rec = self._chain_scores[chain_key]
+            
+            if outcome_correct:
+                rec["successes"] += 1
+            else:
+                rec["failures"] += 1
+                
+            n = rec["successes"] + rec["failures"]
+            trust = rec["successes"] / n if n > 0 else INITIAL_TRUST
+            rec["trust"] = trust
+            rec["n_observations"] = n
+            
+            _n = n
+            _succ = rec["successes"]
+            _fail = rec["failures"]
+            _trust = trust
+            
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO layer2_chain_trust "
+                    "(chain_key, trust, n_observations, successes, failures) VALUES (?, ?, ?, ?, ?)",
+                    (chain_key, _trust, _n, _succ, _fail)
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error("Layer2: failed to persist chain trust: %s", exc)
 
     # ------------------------------------------------------------------
     # Reading trust scores (called by HypothesisGenerator)
@@ -139,6 +199,12 @@ class Layer2TrustUpdater:
     def get_all_scores(self) -> dict[str, dict]:
         with self._lock:
             return {k: dict(v) for k, v in self._scores.items()}
+
+    def get_chain_trust(self, chain_key: str) -> tuple[float, int]:
+        """Return trust score + observation count for a chain."""
+        with self._lock:
+            entry = self._chain_scores.get(chain_key, {"trust": 0.5, "n_observations": 0})
+            return entry["trust"], entry["n_observations"]
 
     # ------------------------------------------------------------------
     # Persistence
@@ -177,6 +243,15 @@ class Layer2TrustUpdater:
                     timestamp TEXT NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS layer2_chain_trust (
+                    chain_key TEXT PRIMARY KEY,
+                    trust REAL NOT NULL DEFAULT 0.5,
+                    n_observations INTEGER NOT NULL DEFAULT 0,
+                    successes INTEGER NOT NULL DEFAULT 0,
+                    failures INTEGER NOT NULL DEFAULT 0
+                )
+            """)
             conn.commit()
 
     def _load_from_db(self) -> None:
@@ -194,6 +269,21 @@ class Layer2TrustUpdater:
                         "failures": fail if fail is not None else 0,
                     }
             logger.info("Layer2: loaded %d trust scores from DB", len(self._scores))
+            
+            with sqlite3.connect(self._db_path) as conn:
+                chain_rows = conn.execute(
+                    "SELECT chain_key, trust, n_observations, successes, failures FROM layer2_chain_trust"
+                ).fetchall()
+            with self._lock:
+                for ck, trust, n_obs, succ, fail in chain_rows:
+                    self._chain_scores[ck] = {
+                        "trust": trust,
+                        "n_observations": n_obs,
+                        "successes": succ,
+                        "failures": fail
+                    }
+            logger.info("Layer2: loaded %d chain trust scores from DB", len(self._chain_scores))
+            
         except Exception as exc:
             logger.warning("Layer2: could not load from DB: %s", exc)
 

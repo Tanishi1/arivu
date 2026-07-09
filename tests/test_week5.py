@@ -333,21 +333,21 @@ def test_bootstrap_classify_downtrend_is_not_trending():
     """Strong downtrend must be 'calm', not 'trending' — HIGH-4 fix."""
     rc = RegimeClassifier()
     rc._is_trained = False
-    result = rc._bootstrap_classify(volatility=0.01, trend_strength=0.8, trend_slope=-0.02)
+    result = rc._bootstrap_classify(volatility=0.00001, trend_strength=0.8, trend_slope=-0.02)
     assert result == "calm", f"downtrend should be calm, got '{result}'"
 
 
 def test_bootstrap_classify_uptrend_is_trending():
     rc = RegimeClassifier()
     rc._is_trained = False
-    result = rc._bootstrap_classify(volatility=0.01, trend_strength=0.8, trend_slope=0.02)
+    result = rc._bootstrap_classify(volatility=0.00001, trend_strength=0.8, trend_slope=0.02)
     assert result == "trending"
 
 
 def test_bootstrap_classify_flat_is_calm():
     rc = RegimeClassifier()
     rc._is_trained = False
-    result = rc._bootstrap_classify(volatility=0.01, trend_strength=0.8, trend_slope=0.0)
+    result = rc._bootstrap_classify(volatility=0.00001, trend_strength=0.8, trend_slope=0.0)
     assert result == "calm"   # slope=0.0 is not > 0 → calm
 
 

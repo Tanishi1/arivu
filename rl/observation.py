@@ -27,67 +27,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fields excluded from observation (non-float or non-scalar)
-# ---------------------------------------------------------------------------
-_OBS_EXCLUDED: frozenset[str] = frozenset({
-    "timestamp",
-    "active_strategy",
-    "price_history",
-    "last_tick_timestamp",
-    "algo_health_vector",   # handled explicitly as 3 separate dims
-    
-    # ---------------------------------------------------------
-    # Exclude the 16 bar-level graph features added recently to
-    # keep BASE_OBS_DIM = 13, which is required for the currently
-    # saved PPO zip models (trained on the older schema).
-    # ---------------------------------------------------------
-    "price_return",
-    "rsi",
-    "trade_intensity",
-    "order_book_imbalance",
-    "ema_spread",
-    "bollinger_width",
-    "price_in_band",
-    "regime_volatile",
-    "regime_trending",
-    "btc_return",
-    "eth_return",
-    "algo_health_p_normal",
-    "algo_health_p_stressed",
-    "algo_health_p_degraded",
-    "session_sin",
-    "session_cos",
-})
+# BASE_OBS_DIM matches the 19 features in the historical dataset.
 
-# Compute base obs dim at import time so TradingEnv can use it
-# without needing a live CausalState instance.
-def _compute_base_obs_dim() -> int:
-    """Introspect CausalState to count scalar float fields + 3 for algo_health."""
-    from core.schemas import CausalState
-    import typing
-
-    count = 0
-    for name, field_info in CausalState.model_fields.items():
-        if name in _OBS_EXCLUDED:
-            continue
-        ann = field_info.annotation
-        # Accept plain float; also accept Optional[float]
-        origin = getattr(ann, "__origin__", None)
-        if ann is float:
-            count += 1
-        elif origin is type(None):
-            pass
-        # Handle Optional[float] → Union[float, None]
-        elif origin is not None:
-            args = getattr(ann, "__args__", ())
-            if float in args:
-                count += 1
-    # Add 3 for algo_health_vector dimensions
-    count += 3
-    return count
-
-
-BASE_OBS_DIM: int = _compute_base_obs_dim()
+BASE_OBS_DIM: int = 19
 
 # Causal feature dimensions appended for Arm 3:
 #   3 hypothesis EV scores + 3 hypothesis breach risk + 1 edge stability + regime one-hot
@@ -133,52 +75,34 @@ def get_causal_obs_dim() -> int:
 def build_base_obs(state: "CausalState") -> np.ndarray:
     """Build the base observation vector from a CausalState snapshot.
 
-    Dynamically reads all scalar float fields from CausalState, excluding
-    non-float or compound fields defined in _OBS_EXCLUDED.
-    algo_health_vector is flattened as 3 separate dimensions appended at end.
+    Maps features in the exact order of VARIABLE_NAMES to match historical training.
 
     Returns:
         float32 array of shape (BASE_OBS_DIM,)
     """
-    values: list[float] = []
-    import typing
-
-    for name, field_info in type(state).model_fields.items():
-        if name in _OBS_EXCLUDED:
-            continue
-        ann = field_info.annotation
-        val = getattr(state, name, 0.0)
-        is_float = ann is float
-        if not is_float:
-            args = getattr(ann, "__args__", ())
-            is_float = float in args
-        if is_float:
-            values.append(float(val) if val is not None else 0.0)
-
-    # Append algo_health_vector as 3 explicit dims
-    ahv = state.algo_health_vector
-    if len(ahv) == 3:
-        values.extend([float(ahv[0]), float(ahv[1]), float(ahv[2])])
-    else:
-        values.extend([1.0, 0.0, 0.0])
-
+    values = [
+        state.price_return,          # 0
+        state.volume,                # 1
+        state.spread,                # 2
+        state.volatility,            # 3
+        state.rsi,                   # 4
+        state.trade_intensity,       # 5
+        state.order_book_imbalance,  # 6
+        state.ema_spread,            # 7
+        state.bollinger_width,       # 8
+        state.price_in_band,         # 9
+        state.regime_volatile,       # 10
+        state.regime_trending,       # 11
+        state.btc_return,            # 12
+        state.eth_return,            # 13
+        state.algo_health_p_normal,  # 14
+        state.algo_health_p_stressed,# 15
+        state.algo_health_p_degraded,# 16
+        state.session_sin,           # 17
+        state.session_cos,           # 18
+    ]
     obs = np.array(values, dtype=np.float32)
-
-    # Guard against NaN/Inf — replace with 0 to protect training
-    obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if len(obs) != BASE_OBS_DIM:
-        # CausalState schema changed — log and zero-pad to maintain shape
-        logger.warning(
-            "observation.py: obs dim mismatch — expected %d, got %d. "
-            "CausalState may have changed. Zero-padding to maintain shape.",
-            BASE_OBS_DIM, len(obs),
-        )
-        padded = np.zeros(BASE_OBS_DIM, dtype=np.float32)
-        padded[:min(len(obs), BASE_OBS_DIM)] = obs[:BASE_OBS_DIM]
-        obs = padded
-
-    return obs
+    return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def build_causal_obs(

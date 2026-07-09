@@ -43,8 +43,8 @@ from core.constants import ML1_RETRAIN_AFTER
 
 logger = logging.getLogger(__name__)
 
-ML1_MODEL_PATH = Path("data/models/ml1.joblib")
-ML1_BUFFER_PATH = Path("data/models/ml1_buffer.json")  # persisted sample buffer
+ML1_MODEL_PATH = Path("data/models/ml1_causal_agent.joblib")
+ML1_BUFFER_PATH = Path("data/models/ml1_causal_agent_buffer.json")  # persisted sample buffer
 TELEMETRY_LOG_PATH = Path("data/telemetry_log.csv")    # human-readable log of all telemetry
 RETRAIN_THRESHOLD = ML1_RETRAIN_AFTER  # single source of truth: core/constants.py
 CLASSES = ["normal", "stressed", "degraded"]
@@ -218,19 +218,16 @@ class ML1BehaviourClassifier:
         import json
         if not ML1_BUFFER_PATH.exists():
             return
-        # Do not restore buffer if the model is already trained — the buffer
-        # was cleared after the successful retrain, so stale disk state is noise.
-        if self._is_trained:
-            return
+
         try:
             data = json.loads(ML1_BUFFER_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
+            if isinstance(data, list):
                 self._sample_buffer = data
                 logger.info(
                     "ML1 buffer restored from disk | samples=%d / %d needed",
                     len(self._sample_buffer), RETRAIN_THRESHOLD,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("ML1 buffer load failed | starting empty | %s", exc)
 
     def _load_model_if_exists(self) -> None:

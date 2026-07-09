@@ -177,7 +177,7 @@ async def assumption_monitor_loop(
             breached, proximity = _check_assumption(assumption, state)
             if breached:
                 logger.warning(
-                    "Assumption breached | name=%s variable=%s threshold=%.4f actual=%.4f",
+                    "Assumption breached | name=%s variable=%s threshold=%.6f actual=%.6f",
                     assumption.name,
                     assumption.variable,
                     assumption.threshold,

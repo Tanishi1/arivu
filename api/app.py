@@ -154,7 +154,11 @@ def get_state():
                     for line in reversed(lines_all[-50:]):
                         try:
                             rec = json.loads(line)
-                            if rec.get("hold_reason") in ("no_hypothesis", "score_too_low", "no_graph_yet", "ml2_breach_risk"):
+                            if rec.get("hold_reason") in (
+                                "no_hypothesis", "score_too_low", "no_graph_yet",
+                                "ml2_breach_risk", "same_graph_as_last_breach",
+                                "below_fee_floor",
+                            ):
                                 hold_count += 1
                             else:
                                 break
@@ -166,9 +170,11 @@ def get_state():
                         for l in lines_all[-20:]
                         if l.strip()
                     )
+                    EV_THRESHOLD = 25
                     result["escape_valve"] = {
                         "consecutive_holds": hold_count,
-                        "armed": hold_count >= 25,
+                        "threshold": EV_THRESHOLD,
+                        "armed": hold_count >= EV_THRESHOLD,
                         "fired": fired,
                     }
                 except Exception:

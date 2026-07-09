@@ -3,11 +3,11 @@ import React from 'react'
 
 // ── friendly labels for the 5 optimizer dimensions ──
 const PARAM_META = {
-  k_runs:      { label:'k',      unit:'',    desc:'Roll window',   group:'search' },
-  min_runs:    { label:'min_r',  unit:'',    desc:'Min samples',   group:'search' },
-  threshold:   { label:'thresh', unit:'',    desc:'Edge threshold', group:'search' },
-  tau_max:     { label:'τ_max',  unit:'bars',desc:'PCMCI max lag', group:'discovery' },
-  pcmci_alpha: { label:'α',      unit:'',    desc:'PCMCI p-cutoff', group:'discovery' },
+  k_runs:      { label:'k',      unit:'',    desc:'Roll window (≥15)',  group:'search' },
+  min_runs:    { label:'min_r',  unit:'',    desc:'Min samples',        group:'search' },
+  threshold:   { label:'thresh', unit:'',    desc:'Edge threshold',     group:'search' },
+  tau_max:     { label:'τ_max',  unit:'bars',desc:'PCMCI max lag',      group:'discovery' },
+  pcmci_alpha: { label:'α',      unit:'',    desc:'PCMCI p-cutoff',    group:'discovery' },
 }
 
 // Colour for search vs discovery params
@@ -115,20 +115,20 @@ export default function Optimizer({ optimizer, escapeValve = {}, state }) {
               {ev.fired
                 ? 'ESCAPE VALVE FIRED — forcing non-graph hypothesis'
                 : ev.armed
-                ? `ARMED — ${ev.consecutive_holds}/30 consecutive holds`
-                : `Inactive — ${ev.consecutive_holds??0}/30 holds`}
+                ? `ARMED — ${ev.consecutive_holds}/25 consecutive holds`
+                : `Inactive — ${ev.consecutive_holds??0}/25 holds`}
             </div>
             <div style={{marginTop:5}}>
               <div style={{height:5,background:'var(--bg-panel-2)',borderRadius:3,overflow:'hidden',width:'100%'}}>
                 <div style={{
                   height:'100%',borderRadius:3,
                   background: ev.fired ? 'var(--escape)' : ev.armed ? 'var(--warn)' : 'var(--border)',
-                  width:`${Math.min(100,((ev.consecutive_holds??0)/30)*100)}%`,
+                  width:`${Math.min(100,((ev.consecutive_holds??0)/25)*100)}%`,
                   transition:'width 0.5s',
                 }}/>
               </div>
               <div style={{fontFamily:'var(--font-mono)',fontSize:'0.60rem',color:'var(--text-secondary)',marginTop:3}}>
-                Fires at 30 consecutive HOLDs → forces an unconstrained hypothesis from graph neighbourhood
+                Fires at 25 consecutive HOLDs → forces an unconstrained hypothesis from graph neighbourhood
               </div>
             </div>
           </div>
@@ -147,7 +147,7 @@ export default function Optimizer({ optimizer, escapeValve = {}, state }) {
         </div>
         <div className="metric-cell" style={{flex:1}}>
           <div className="metric-label">Holds streak</div>
-          <div className={`metric-val ${(ev.consecutive_holds||0)>20?'bad':(ev.consecutive_holds||0)>10?'warn':''}`}>
+          <div className={`metric-val ${(ev.consecutive_holds||0)>18?'bad':(ev.consecutive_holds||0)>12?'warn':''}`}>
             {ev.consecutive_holds??0}
           </div>
         </div>
@@ -282,9 +282,11 @@ export default function Optimizer({ optimizer, escapeValve = {}, state }) {
         <strong style={{color:'var(--optimizer)'}}>Meta Optimizer (5-dim Hill-Climb):</strong>
         {' '}Hill-climbs 5 parameters per market regime.
         <br/>
-        <span style={{color:'var(--optimizer)'}}>Search (3):</span> k_runs, min_runs, threshold — control edge validation strictness.
+        <span style={{color:'var(--optimizer)'}}>Search (3):</span> k_runs (floor=15), min_runs, threshold — control edge validation strictness.
         <br/>
-        <span style={{color:'#7c3aed'}}>Discovery (2):</span> τ_max (PCMCI lag window), α (p-value cutoff) — control causal timescale found.
+        <span style={{color:'#7c3aed'}}>Discovery (2):</span> τ_max (PCMCI lag window, up to 12 bars), α (p-value cutoff) — control causal timescale found.
+        <br/>
+        <span style={{color:'var(--text-secondary)'}}>Trade gates:</span> fee floor (0.15% min return) · same-graph breach block · top-30 hypothesis pool.
         After 5 steps without improvement → <strong>random restart</strong>: full population resampled from prior.
         Separate populations for trending, volatile, and quiet regimes.
       </div>

@@ -40,7 +40,11 @@ BUFFER_COLUMNS = [
     "p_normal", "p_stressed", "p_degraded",
     "assumption_type", "breached",
     "phase", "close_reason",
+    "is_escape_valve",   # exclude escape valve trades from ML2 training
+    "breach_reason",     # new column tracking reason for audit and diagnostic analysis
+    "regime",            # market regime at decision time — allows regime-conditioned ML2 training
 ]
+
 
 
 class OutcomeComparator:
@@ -102,19 +106,25 @@ class OutcomeComparator:
                         ), None)
 
                         is_edge_breached = False
+                        edge_reason = "none"
                         if matching_edge is None:
                             is_edge_breached = True
+                            edge_reason = "missing_edge"
                         else:
                             # Check sign/direction of the coefficient
-                            hyp_sign = 1 if assumption.current_value >= 0 else -1
+                            hyp_sign = 1 if assumption.operator == "gt" else -1
                             act_sign = 1 if matching_edge.coeff >= 0 else -1
                             if hyp_sign != act_sign:
                                 is_edge_breached = True
+                                edge_reason = "coeff_flip"
 
                         if is_edge_breached:
                             if assumption.name not in breached_names:
                                 breached_names.append(assumption.name)
-                                breach_log[assumption.name] = datetime.now(timezone.utc).isoformat()
+                                breach_log[assumption.name] = {
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "reason": edge_reason,
+                                }
 
         held_names = [
             a.name for a in decision_object.assumptions
@@ -136,7 +146,7 @@ class OutcomeComparator:
         self._ledger.close(decision_object.id, record)
 
         logger.info(
-            "Ledger closed | id=%s delta=%.4f held=%s breached=%s",
+            "Ledger closed | id=%s delta=%.6f held=%s breached=%s",
             decision_object.id, outcome_delta, held_names, breached_names,
         )
 
@@ -230,8 +240,20 @@ class OutcomeComparator:
         [p_normal, p_stressed, p_degraded] = do.algo_health_vector
 
         rows = []
+        is_ev = int(bool((do.meta_params or {}).get("is_escape_valve", False)))
+
         for assumption in do.assumptions:
             breached_flag = 1 if assumption.name in record.assumptions_breached else 0
+            
+            # Extract breach reason
+            reason_val = "none"
+            if breached_flag:
+                entry = record.breach_timestamps.get(assumption.name)
+                if isinstance(entry, dict):
+                    reason_val = entry.get("reason", "limit_exceeded")
+                elif isinstance(entry, str):
+                    reason_val = "limit_exceeded"
+
             rows.append({
                 "volatility": market.get("volatility", 0.0),
                 "spread": market.get("spread", 0.0),
@@ -246,7 +268,11 @@ class OutcomeComparator:
                 "breached": breached_flag,
                 "phase": do.phase,
                 "close_reason": record.close_reason,
+                "is_escape_valve": is_ev,
+                "breach_reason": reason_val,
+                "regime": (do.meta_params or {}).get("regime", "unknown"),
             })
+
 
         with open(TRAINING_BUFFER_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=BUFFER_COLUMNS)

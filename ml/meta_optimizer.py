@@ -83,10 +83,14 @@ class RegimeType(str, Enum):
     If your classifier returns 'calm', 'volatile', 'trending' — leave as-is.
     If it returns e.g. 'CALM', 'RANGING' — update the values here only.
     """
-    CALM      = "calm"
-    VOLATILE  = "volatile"
-    TRENDING  = "trending"
-    UNKNOWN   = "unknown"   # fallback when regime is not yet determined
+    CALM           = "calm"
+    VOLATILE       = "volatile"
+    TRENDING       = "trending"
+    REGIME_1       = "regime_1"      # K=4 intermediate (second-highest trend)
+    REGIME_2       = "regime_2"      # K=5 intermediate
+    REGIME_3       = "regime_3"      # K=6 intermediate
+    UNKNOWN        = "unknown"       # fallback when regime is not yet determined
+
 
 
 @dataclass
@@ -135,9 +139,14 @@ class MetaParams:
         """
         Enforce hard mathematical constraints that must always hold.
         Agent: do not remove these — they prevent invalid states.
+
+        k_runs floor = 15: an edge must appear in at least 15 PCMCI runs (~2.5 min)
+        before its stability score is meaningful. k_runs < 15 validates essentially
+        every edge (4 runs → 2 appearances = 50% = threshold met), causing hypothesis
+        explosion (1240+ chains per cycle) and noise trades.
         """
-        self.k_runs    = max(3, int(self.k_runs))
-        self.min_runs  = max(2, min(int(self.min_runs), self.k_runs))
+        self.k_runs    = max(15, int(self.k_runs))
+        self.min_runs  = max(3, min(int(self.min_runs), self.k_runs))
         self.threshold = max(0.40, min(float(self.threshold), 0.95))
         self.step_k     = max(1, int(self.step_k))
         self.step_min_r = max(1, int(self.step_min_r))
@@ -258,26 +267,76 @@ class MetaParameterOptimizer:
     # Public API
     # ─────────────────────────────────────────────────────────────────────
 
+    def _get_best(self, key: str, bucket: dict) -> MetaParams:
+        """Deterministic best-params lookup. Caller must hold self._lock."""
+        if "history" not in bucket or not bucket["history"]:
+            return bucket["population"][0]
+        best_cand = None
+        best_score = -1.0
+        for cand in bucket["population"]:
+            score = self._score_config(cand.to_dict(), bucket["history"])
+            if score > best_score:
+                best_score = score
+                best_cand = cand
+        return best_cand
+
     def get_params(self, regime: str) -> MetaParams:
         """
-        Called by layer1_tracker on every validation check.
-        Returns the current best-known params for this regime.
-        Falls back to UNKNOWN if regime string is unrecognised.
+        Deterministic best-params lookup. NEVER applies epsilon-greedy.
+
+        Called by: layer1_tracker validation (is_validated, get_stability_score,
+        get_validated_edges), hypothesis_generator scoring, logging, escape valve.
+        Must be deterministic so that all edges in a single _find_chains() call
+        are evaluated against the SAME threshold — not random subsets of thresholds.
         """
         key = regime if regime in self._state else RegimeType.UNKNOWN.value
         with self._lock:
-            bucket = self._state[key]
-            if "history" not in bucket or not bucket["history"]:
-                return bucket["population"][0]
-            
-            best_cand = None
-            best_score = -1.0
-            for cand in bucket["population"]:
-                score = self._score_config(cand.to_dict(), bucket["history"])
-                if score > best_score:
-                    best_score = score
-                    best_cand = cand
-            return best_cand
+            return self._get_best(key, self._state[key])
+
+    def get_params_for_trade(self, regime: str) -> MetaParams:
+        """
+        Epsilon-greedy trade-decision lookup. Call ONCE per trade cycle in main.py.
+
+        The returned MetaParams object must be passed ALL THE WAY DOWN through
+        generate() → _find_chains() → is_validated() so that every edge in the
+        hypothesis is validated under the same threshold that will be recorded
+        in the DO's meta_params. This ensures MetaOptimizer.update() receives
+        correctly attributed history (exploration data credited to the threshold
+        that actually ran, not to the default best threshold).
+
+        10% of calls return a random threshold in [0.40, 0.70]. All other params
+        (k_runs, min_runs, tau_max, pcmci_alpha) stay unchanged — only threshold
+        is explored, since that's the parameter causing the circularity trap.
+        """
+        key = regime if regime in self._state else RegimeType.UNKNOWN.value
+        with self._lock:
+            best = self._get_best(key, self._state[key])
+
+            if random.random() < 0.10:
+                explore_thresh = round(random.uniform(0.40, 0.70), 2)
+                explore = MetaParams(
+                    k_runs      = best.k_runs,
+                    min_runs    = best.min_runs,
+                    threshold   = explore_thresh,
+                    regime      = best.regime,
+                    tau_max     = best.tau_max,
+                    pcmci_alpha = best.pcmci_alpha,
+                    step_k      = best.step_k,
+                    step_min_r  = best.step_min_r,
+                    step_thresh = best.step_thresh,
+                    step_tau    = best.step_tau,
+                    step_alpha  = best.step_alpha,
+                ).validate()
+                logger.info(
+                    "MetaOptimizer: epsilon-greedy explore | regime=%s | "
+                    "threshold %.2f -> %.2f (explore) | "
+                    "this threshold governs ALL edge validation this cycle",
+                    regime, best.threshold, explore_thresh,
+                )
+                return explore
+
+            return best
+
 
     def update(self, outcome: TradeOutcome) -> None:
         """
@@ -378,18 +437,17 @@ class MetaParameterOptimizer:
                             self._stagnation_counts[regime] = 0
                         self._last_scores[regime] = c_score
 
+                    new_population.append(current)
+
+                # Stagnation replacement check — run on the final candidate
+                if idx == len(candidate_scores) - 1:
                     stagnation_count = self._stagnation_counts.get(regime, 0)
                     immunity         = self._candidate_immunity.get(regime, 0)
-                    is_last          = idx == len(candidate_scores) - 1
 
-                    if is_last and stagnation_count >= STAGNATION_LIMIT and immunity == 0:
-                        # Replace the worst candidate with a fresh random to re-inject
-                        # diversity.  Log the STAGNANT candidate's (idx=0) step sizes —
-                        # those explain WHY replacement fired, not the worst candidate's
-                        # score.  Grant immunity so the new random isn't immediately
-                        # evicted before it has a chance to accumulate scoring history.
+                    if stagnation_count >= STAGNATION_LIMIT and immunity == 0:
+                        # Replace the worst candidate (which we just appended) with a fresh random one
                         new_params = self._random_init(regime)
-                        new_population.append(new_params)
+                        new_population[-1] = new_params
                         self._stagnation_counts[regime] = 0
                         self._candidate_immunity[regime] = IMMUNITY_CYCLES
                         logger.warning(
@@ -400,11 +458,8 @@ class MetaParameterOptimizer:
                             _stagnant_score, _stagnant_step_k, _stagnant_step_thresh,
                             stagnation_count, IMMUNITY_CYCLES,
                         )
-
-                    elif is_last and stagnation_count >= STAGNATION_LIMIT and immunity > 0:
-                        # Stagnation limit reached but the recently injected candidate
-                        # is still in its immunity window — wait until it has accumulated
-                        # enough history to be scored fairly before replacing again.
+                    elif stagnation_count >= STAGNATION_LIMIT and immunity > 0:
+                        # Stagnation limit reached but replacement suppressed due to immunity
                         logger.info(
                             "MetaOptimizer: Stagnation limit reached — replacement suppressed | "
                             "regime=%s | immunity=%d cycles remaining | "
@@ -412,10 +467,6 @@ class MetaParameterOptimizer:
                             regime, immunity,
                             _stagnant_score, _stagnant_step_k, _stagnant_step_thresh,
                         )
-                        new_population.append(current)
-
-                    else:
-                        new_population.append(current)
 
             bucket["population"] = new_population
 
@@ -436,9 +487,13 @@ class MetaParameterOptimizer:
           - chain_held: did the causal chain hold (no trajectory breach)?
           - ml2_calibration: how well did ML2 predict breaches?
           - l2_trust_quality: was the chain well-trusted by Layer 2 at entry?
-            This is the key signal: MetaOptimizer hill-climbs toward Layer 1
-            params that produce high-trust hypotheses, which indirectly filters
-            spurious edges without any hard-coded trust threshold.
+
+        CIRCULARITY FIX — escape valve penalty:
+          Escape valve trades fire because NO hypothesis meets the threshold.
+          If we score them neutrally (0.35-0.55), the optimizer learns that
+          threshold=0.84 (escape valve territory) is "OK" and never lowers it.
+          Hard-cap escape valve scores at 0.40 so the hill-climber is always
+          pushed toward lower thresholds where real hypotheses can fire.
         """
         # Direction correctness (binary but weighted heavily)
         direction_correct = (
@@ -467,15 +522,10 @@ class MetaParameterOptimizer:
         ml2_bonus = outcome.ml2_calibration
 
         # Layer 2 trust quality signal.
-        # l2_trust=0.5 (untested) → neutral contribution 0.5
-        # l2_trust=0.3 (proven loser) → pulls score down → optimizer avoids these params
-        # l2_trust=0.7 (proven winner) → pulls score up → optimizer seeks these params
-        # Scaled so 0.5 trust = 0.5 contribution (neutral), linear above/below.
-        # l2_n_obs=0 → fully neutral (no data yet, don't penalise bootstrap trades)
         if outcome.l2_n_obs > 0:
             l2_quality = outcome.l2_trust
         else:
-            l2_quality = 0.5  # untested chain: neutral, don't penalise exploration
+            l2_quality = 0.5  # untested chain: neutral
 
         # Penalty for high breach risk on a losing trade
         risk_penalty = 1.0
@@ -483,7 +533,6 @@ class MetaParameterOptimizer:
             risk_penalty = 0.6
 
         # Composite — weights sum to 1.0
-        # l2_quality added at 10%, ml2_bonus reduced from 15%→10%, chain_bonus 10%→5%
         raw = (
             direction_score * 0.35 +
             accuracy        * 0.25 +
@@ -492,6 +541,18 @@ class MetaParameterOptimizer:
             ml2_bonus       * 0.10 +
             l2_quality      * 0.10
         ) * risk_penalty
+
+        # CIRCULARITY BREAK: hard-cap escape valve scores.
+        # Escape valve = no real hypothesis passed threshold → these params
+        # are underperforming. Cap at 0.40 so any real-hypothesis config
+        # (which can score 0.50+) will always beat escape valve configs.
+        if outcome.is_escape_valve:
+            raw = min(raw, 0.40)
+            logger.debug(
+                "MetaOptimizer: escape valve score capped | raw=%.4f -> capped=%.4f",
+                raw, min(raw, 0.40),
+            )
+
         return round(raw, 6)
 
     def _score_config(
@@ -648,7 +709,17 @@ class MetaParameterOptimizer:
         """
         k     = random.randint(3, 50)
         min_r = random.randint(2, k)
-        thresh = round(random.uniform(0.40, 0.95), 2)
+
+        # CIRCULARITY FIX: bias restarts toward low thresholds (0.40-0.65).
+        # Without this, uniform(0.40, 0.95) means ~60% of restarts land above
+        # 0.65, which keeps landing in escape-valve territory where all history
+        # already lives and the kernel never explores the 0.40-0.65 region.
+        # 70% of restarts go low (explore), 30% go anywhere (exploit/verify).
+        if random.random() < 0.70:
+            thresh = round(random.uniform(0.40, 0.65), 2)
+        else:
+            thresh = round(random.uniform(0.40, 0.95), 2)
+
         tau   = random.randint(2, 10)
         alpha = round(random.uniform(0.01, 0.10), 3)
         return MetaParams(

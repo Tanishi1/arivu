@@ -129,11 +129,32 @@ async def rl_decision_loop(
                 logger.debug("RL [%s]: price=0.0, skipping step %d", arm_name, step_idx)
                 continue
 
-            # --- Build obs and predict ---
+            # --- Build obs and step-counter update ---
             import numpy as np
             obs = arm_runner._build_obs(state)
+
+            # Mirror run_step() / TradingEnv.action_masks(): increment per-step
+            # counters so min-hold and post-sell cooldown are enforced correctly.
+            if arm_runner._in_position:
+                arm_runner._steps_since_entry += 1
+            else:
+                arm_runner._steps_since_exit += 1
+
+            # Compute action masks from live counters.
+            # MaskablePPO.predict() respects these — standard PPO would ignore them.
+            can_sell = (
+                arm_runner._in_position and
+                arm_runner._steps_since_entry >= arm_runner._min_hold_bars
+            )
+            can_buy = (
+                not arm_runner._in_position and
+                arm_runner._steps_since_exit >= arm_runner._min_hold_bars
+            )
+            live_masks = np.array([True, can_buy, can_sell])
+
             model_action, _ = await asyncio.to_thread(
-                arm_runner._model.predict, obs, deterministic=True
+                arm_runner._model.predict, obs, deterministic=True,
+                action_masks=live_masks,
             )
             action_label = ["HOLD", "BUY", "SELL"][int(model_action)]
             action_counts[action_label] += 1
@@ -142,30 +163,30 @@ async def rl_decision_loop(
             if step_idx > 0 and step_idx % OBS_STATS_STEPS == 0:
                 logger.info(
                     "RL [%s] OBS STATS | step=%d | obs_len=%d | "
-                    "min=%.4f max=%.4f mean=%.4f std=%.4f | "
-                    "nan_count=%d inf_count=%d",
+                    "min=%.6f max=%.6f mean=%.6f std=%.6f | "
+                    "nan=%d inf=%d | since_entry=%d since_exit=%d min_hold=%d",
                     arm_name, step_idx, len(obs),
                     float(np.nanmin(obs)), float(np.nanmax(obs)),
                     float(np.nanmean(obs)), float(np.nanstd(obs)),
                     int(np.isnan(obs).sum()), int(np.isinf(obs).sum()),
+                    arm_runner._steps_since_entry, arm_runner._steps_since_exit,
+                    arm_runner._min_hold_bars,
                 )
 
-            # Action masking — prevent degenerate actions
-            # SELL is only valid when in_position; BUY only when not in_position.
-            # The policy can get stuck outputting SELL forever when not in position
-            # (common PPO failure mode with sparse rewards). Masking breaks this.
+            # Safety guard — masks should prevent these, kept for belt-and-suspenders
             if action_label == "SELL" and not arm_runner._in_position:
-                action_label = "HOLD"  # nothing to sell — suppress
+                action_label = "HOLD"
             elif action_label == "BUY" and arm_runner._in_position:
-                action_label = "HOLD"  # already in position — suppress
+                action_label = "HOLD"
 
             # --- Execute if not HOLD ---
             if action_label != "HOLD":
                 logger.info(
-                    "RL [%s] SIGNAL | step=%d | action=%s | price=%.4f | "
-                    "in_position=%s | obs_mean=%.4f",
+                    "RL [%s] SIGNAL | step=%d | action=%s | price=%.6f | "
+                    "in_position=%s | since_entry=%d since_exit=%d | obs_mean=%.6f",
                     arm_name, step_idx, action_label, state.price,
                     arm_runner._in_position,
+                    arm_runner._steps_since_entry, arm_runner._steps_since_exit,
                     float(np.nanmean(obs)),
                 )
                 await arm_runner._execute_signal(action_label, state)
@@ -186,7 +207,7 @@ async def rl_decision_loop(
                 total_actions = sum(action_counts.values()) or 1
                 logger.info(
                     "RL [%s] HEARTBEAT | step=%d | elapsed=%.1f min | "
-                    "price=%.4f | in_position=%s | "
+                    "price=%.6f | in_position=%s | "
                     "actions HOLD=%d(%.0f%%) BUY=%d(%.0f%%) SELL=%d(%.0f%%)",
                     arm_name, step_idx, elapsed_min,
                     state.price,

@@ -311,6 +311,7 @@ class TestExecutorCrossProcessLock:
         e = Executor()
         mock_acc = MagicMock()
         mock_acc.equity = 100000.0
+        mock_acc.buying_power = 100000.0
         monkeypatch.setattr(e._api, "get_account", lambda: mock_acc)
         
         state = CausalState(price=100.0, volatility=0.01, volume=1000.0)

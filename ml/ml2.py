@@ -63,6 +63,7 @@ class ML2BreachPredictor:
         state: CausalState,
         time_horizon: float,
         ml1_vector: list[float],
+        regime: str = "unknown",
     ) -> list[Assumption]:
         """Annotate each assumption with a breach_risk probability.
 
@@ -80,6 +81,7 @@ class ML2BreachPredictor:
             state: current CausalState snapshot (at decision time)
             time_horizon: strategy window duration in minutes
             ml1_vector: [p_normal, p_stressed, p_degraded] from ML1
+            regime: current market regime string (calm/trending/volatile/unknown)
 
         Returns:
             New list of Assumption objects with breach_risk fields populated.
@@ -89,18 +91,19 @@ class ML2BreachPredictor:
             if not self._is_trained:
                 risk = self._proximity_baseline(assumption)
             else:
-                risk = self._predict_trained(assumption, state, time_horizon, ml1_vector)
+                risk = self._predict_trained(assumption, state, time_horizon, ml1_vector, regime)
 
             # Assumption is frozen — must use model_copy, NOT direct assignment.
             # Direct assignment raises pydantic.ValidationError silently swallowed
             # by the decision cycle, leaving all breach_risk values at 0.5 forever.
             annotated.append(assumption.model_copy(update={"breach_risk": round(risk, 4)}))
 
-        logger.info(
+        logger.debug(
             "ML2 annotated | risks=%s",
             [f"{a.name}={a.breach_risk}" for a in annotated],
         )
         return annotated
+
 
     def maybe_retrain(self, ledger_writer, current_phase: str = "bootstrap") -> tuple[bool, float | None]:
         """Retrain if enough new closed entries have accumulated.
@@ -217,10 +220,23 @@ class ML2BreachPredictor:
         state: CausalState,
         time_horizon: float,
         ml1_vector: list[float],
+        regime: str = "unknown",
     ) -> float:
-        features = compute_ml2_features(state, assumption, time_horizon, ml1_vector)
+        features = compute_ml2_features(state, assumption, time_horizon, ml1_vector, regime)
         X = np.array([[v for v in features.values()]])
-        proba = self._model.predict_proba(X)[0]
+        try:
+            proba = self._model.predict_proba(X)[0]
+        except ValueError as exc:
+            # Model was trained on a different feature schema (e.g. pre-regime-column).
+            # Invalidate it immediately so the next retrain cycle replaces it.
+            logger.warning(
+                "ML2: feature mismatch — invalidating stale model and falling back to "
+                "proximity baseline | expected=%s got=%d | %s",
+                getattr(self._model, "n_features_in_", "?"), X.shape[1], exc,
+            )
+            self._model = None
+            self._is_trained = False
+            return self._proximity_baseline(assumption)
         # index 1 = P(breach=1)
         pos_idx = list(self._model.classes_).index(1) if 1 in self._model.classes_ else 1
         return float(proba[pos_idx])
@@ -253,7 +269,22 @@ class ML2BreachPredictor:
                     sorted(missing),
                 )
                 return []
-            return list(reader)
+            rows = list(reader)
+
+        # Exclude escape valve trades from ML2 training.
+        # Escape valve fires when no hypothesis cleared Layer 1 threshold —
+        # training on these rows teaches ML2 that specific edges always breach,
+        # when really it just means the threshold was too high at that moment.
+        # Rows from before this fix lack the column — treat missing as 0 (not EV).
+        clean = [r for r in rows if r.get("is_escape_valve", "0") != "1"]
+        if len(clean) < len(rows):
+            logger.debug(
+                "_load_buffer: excluded %d escape-valve rows from ML2 training "
+                "(%d clean rows remain)",
+                len(rows) - len(clean), len(clean),
+            )
+        return clean
+
 
     def _prepare_xy(self, data: list[dict]):
         feature_keys = [
@@ -261,6 +292,7 @@ class ML2BreachPredictor:
             "proximity", "time_horizon",
             "p_normal", "p_stressed", "p_degraded",
         ]
+        _REGIME_ENCODING = {"calm": 0, "trending": 1, "volatile": 2}
         # S3-2 FIX: Guard against malformed CSV rows (partial writes from crashes,
         # disk-full mid-append, Ctrl+C during CSV write). A single bad row previously
         # raised KeyError that propagated through maybe_retrain() — marking the active
@@ -268,18 +300,43 @@ class ML2BreachPredictor:
         rows_X, rows_y = [], []
         for row in data:
             try:
-                rows_X.append([float(row[k]) for k in feature_keys])
+                x = [float(row[k]) for k in feature_keys]
+                # Regime: optional column — old rows without it default to calm (0).
+                regime_str = row.get("regime", "calm")
+                x.append(float(_REGIME_ENCODING.get(regime_str, 0)))
+                rows_X.append(x)
                 rows_y.append(int(row["breached"]))
             except (KeyError, ValueError) as exc:
                 logger.warning("Skipping malformed training buffer row | %s | row=%s", exc, row)
-        X = np.array(rows_X) if rows_X else np.empty((0, len(feature_keys)))
+        n_features = len(feature_keys) + 1  # +1 for regime_encoded
+        X = np.array(rows_X) if rows_X else np.empty((0, n_features))
         y = np.array(rows_y)
         return X, y
 
     def _load_model_if_exists(self) -> None:
         if ML2_MODEL_PATH.exists():
             try:
-                self._model = joblib.load(ML2_MODEL_PATH)
+                model = joblib.load(ML2_MODEL_PATH)
+                # Feature count guard: reject models trained on a different schema.
+                # n_features_in_ is set by sklearn after fit() — always present on
+                # a trained LogisticRegression. Current schema = 10 features.
+                expected_n = len([
+                    "volatility", "spread", "trend_strength", "volume",
+                    "proximity", "time_horizon",
+                    "p_normal", "p_stressed", "p_degraded",
+                    "regime_encoded",  # added when regime column was introduced
+                ])
+                model_n = getattr(model, "n_features_in_", None)
+                if model_n is not None and model_n != expected_n:
+                    logger.warning(
+                        "ML2: stale model on disk has %d features, current schema needs %d — "
+                        "discarding and entering bootstrap mode. Will retrain on next cycle.",
+                        model_n, expected_n,
+                    )
+                    ML2_MODEL_PATH.unlink(missing_ok=True)
+                    return  # leave _is_trained=False
+
+                self._model = model
                 self._is_trained = True
                 # Estimate entries accumulated since last retrain so process
                 # restarts do not reset the counter to zero. CSV has 3 rows per
@@ -288,8 +345,8 @@ class ML2BreachPredictor:
                 cycle_count = max(len(data) // 3, 0)
                 self._new_entries_since_retrain = cycle_count % RETRAIN_THRESHOLD
                 logger.info(
-                    "ML2 model loaded from disk | path=%s | est_entries_since_retrain=%d",
-                    ML2_MODEL_PATH, self._new_entries_since_retrain,
+                    "ML2 model loaded from disk | path=%s | n_features=%d | est_entries_since_retrain=%d",
+                    ML2_MODEL_PATH, model_n or expected_n, self._new_entries_since_retrain,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ML2 model load failed | bootstrap mode | %s", exc)

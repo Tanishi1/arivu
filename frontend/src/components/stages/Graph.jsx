@@ -48,7 +48,11 @@ export default function Graph({ graph, hypotheses = [], selectedChain }) {
       <div className="stage-hdr">
         <span className="stage-tag t-graph">GRAPH</span>
         <span className="stage-title">Causal Graph</span>
-        <span className="stage-meta">v{graph.version_id?.slice(0,8)} · {graph.edge_count} edges · {graph.algorithm}</span>
+        <span className="stage-meta">
+          v{graph.version_id?.slice(0,8)} · {graph.edge_count} edges · {graph.algorithm}
+          {graph.tau_max_used != null ? ` · τ=${graph.tau_max_used}` : ''}
+          {graph.alpha_used   != null ? ` · α=${graph.alpha_used?.toFixed(3)}` : ''}
+        </span>
       </div>
 
       <div className="graph-filters">
@@ -75,6 +79,11 @@ export default function Graph({ graph, hypotheses = [], selectedChain }) {
         <span className="legend-item">
           <span className="legend-line" style={{ background:'#c2410c', borderTop:'2px dashed' }} />
           escape valve
+        </span>
+        <span className="legend-item" style={{gap:4}}>
+          <span style={{fontSize:'0.58rem',color:'#2563eb',fontFamily:'var(--font-mono)',fontWeight:700}}>lag 1-3</span>
+          <span style={{fontSize:'0.58rem',color:'#7c3aed',fontFamily:'var(--font-mono)',fontWeight:700}}>4-6</span>
+          <span style={{fontSize:'0.58rem',color:'#ea580c',fontFamily:'var(--font-mono)',fontWeight:700}}>7-12</span>
         </span>
       </div>
     </div>
@@ -144,7 +153,17 @@ function drawGraph(el, graph, hypotheses, selectedChain, filter) {
   if (filter === 'Micro')      edges = edges.filter(e => assignLayer(e.source) === 'microstructure')
   if (filter === 'Health')     edges = edges.filter(e => assignLayer(e.source) === 'health')
   if (filter === 'Target')     edges = edges.filter(e => e.target === 'price_return')
-  if (filter === 'Hyp Only')   edges = edges.filter(e => hypEdges.has(`${e.source}|${e.target}`) || selEdges.has(`${e.source}|${e.target}`))
+  if (filter === 'Hyp Only')   edges = edges.filter(e => {
+    // Chain strings have format "a->(lag=N)->b" — match source|target regardless of lag token
+    return hypEdges.has(`${e.source}|${e.target}`) || selEdges.has(`${e.source}|${e.target}`)
+  })
+
+  // Lag color scale: short=blue, medium=purple, long=orange (reflects tau_max up to 12)
+  function lagColor(lag) {
+    if (lag <= 3)  return '#2563eb'
+    if (lag <= 6)  return '#7c3aed'
+    return '#ea580c'  // 7-12: long-range lag, visually distinct
+  }
 
   const g = d3svg.append('g')
 
@@ -156,9 +175,10 @@ function drawGraph(el, graph, hypotheses, selectedChain, filter) {
     const isSel  = selEdges.has(`${e.source}|${e.target}`)
     const isHyp  = hypEdges.has(`${e.source}|${e.target}`)
     const isVal  = e.validated
+    const lc     = lagColor(e.lag ?? 1)
 
-    const stroke  = isSel ? '#2563eb' : isVal ? '#4f46e5' : isHyp ? '#6d9feb' : '#d4cfc8'
-    const opacity = isSel ? 0.95 : isVal ? 0.65 : isHyp ? 0.50 : 0.25
+    const stroke  = isSel ? '#2563eb' : isVal ? lc : isHyp ? lc : '#d4cfc8'
+    const opacity = isSel ? 0.95 : isVal ? 0.65 : isHyp ? 0.50 : 0.20
     const sw      = isSel ? 2.5 : isVal ? 1.8 : 1
 
     const mx = (s.x + t.x) / 2
@@ -166,17 +186,27 @@ function drawGraph(el, graph, hypotheses, selectedChain, filter) {
       .attr('d', `M${s.x},${s.y} C${mx},${s.y} ${mx},${t.y} ${t.x},${t.y}`)
       .attr('stroke', stroke).attr('stroke-width', sw)
       .attr('fill', 'none').attr('opacity', opacity)
+
+    // Tooltip with full edge detail
+    path.append('title')
+      .text(`${e.source} → ${e.target}\nlag=${e.lag} coeff=${e.coeff?.toFixed(3)} p=${e.p_value?.toFixed(4)}${e.validated?' ✓validated':''}`)
+
     if (e.is_escape_valve) path.attr('stroke-dasharray', '5,3')
 
-    // Animated dot along selected edges
+    // Lag label on validated or selected edges
+    if ((isVal || isSel) && s.x !== t.x) {
+      const midX = (s.x * 0.4 + t.x * 0.6)
+      const midY = (s.y + t.y) / 2
+      g.append('text')
+        .attr('x', midX).attr('y', midY - 4)
+        .attr('text-anchor', 'middle')
+        .attr('font-size', 7).attr('font-family', 'JetBrains Mono, monospace')
+        .attr('fill', stroke).attr('opacity', isSel ? 0.9 : 0.6)
+        .text(`ℓ${e.lag}`)
+    }
+
+    // Animated pulse on selected edges
     if (isSel) {
-      const totalLen = 200
-      g.append('circle')
-        .attr('r', 3).attr('fill', '#2563eb').attr('opacity', 0.8)
-        .append('animateMotion')
-        .attr('dur', '2s').attr('repeatCount', 'indefinite')
-        .append('mpath').attr('href', null) // fallback — simple transform animation
-      // Simpler: animate opacity pulsing on the path itself
       path.append('animate')
         .attr('attributeName', 'opacity')
         .attr('values', '0.95;0.3;0.95')

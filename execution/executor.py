@@ -138,15 +138,17 @@ class Executor:
         qty = precomputed_qty if precomputed_qty is not None else await self._compute_quantity(params, state)
 
         start_time = time.monotonic()
+        limit_timeout_s = params.get("limit_timeout_s", LIMIT_TIMEOUT_S)
+        
         if self._xlock:
             await asyncio.to_thread(self._xlock.acquire)
         try:
-            # RL arms pass order_type='market' to skip limit-order polling (avoid 7-32s latency)
+            # RL arms can pass order_type='market' or a short limit_timeout_s
             if params.get("order_type") == "market":
                 fill_price, filled = await self._place_market_order(side, qty)
             else:
                 fill_price, filled = await self._place_limit_with_fallback(
-                    side, qty, intended_price
+                    side, qty, intended_price, limit_timeout_s=limit_timeout_s
                 )
         finally:
             if self._xlock:
@@ -189,9 +191,9 @@ class Executor:
     # ------------------------------------------------------------------
 
     async def _place_limit_with_fallback(
-        self, side: str, qty: float, limit_price: float
+        self, side: str, qty: float, limit_price: float, limit_timeout_s: int = LIMIT_TIMEOUT_S
     ) -> tuple[float, bool]:
-        """Try limit order. Fall back to market order after LIMIT_TIMEOUT_S."""
+        """Try limit order. Fall back to market order after limit_timeout_s."""
         for attempt in range(MAX_RETRIES):
             try:
                 order = await asyncio.to_thread(
@@ -205,7 +207,7 @@ class Executor:
                 )
 
                 # Poll for fill
-                deadline = time.monotonic() + LIMIT_TIMEOUT_S
+                deadline = time.monotonic() + limit_timeout_s
                 while time.monotonic() < deadline:
                     await asyncio.sleep(2)
                     o = await asyncio.to_thread(self._api.get_order, order.id)
@@ -237,12 +239,12 @@ class Executor:
                 type="market",
                 time_in_force="gtc",
             )
-            # H_NEW_3 FIX: Poll until filled or 10-second timeout.
+            # H_NEW_3 FIX: Poll until filled or 30-second timeout (aligned with LIMIT_TIMEOUT_S).
             # Previously: sleep(3) then read once. If fill takes > 3s,
             # filled_avg_price is None → fill_price=0.0 → slippage=intended_price
             # (e.g. 150.0) → ML1 classifies as severely degraded. Silent corruption.
             fill_price = 0.0
-            for _ in range(10):
+            for _ in range(30):
                 await asyncio.sleep(1)
                 o = await asyncio.to_thread(self._api.get_order, order.id)
                 if o.status == "filled":
@@ -250,7 +252,7 @@ class Executor:
                     break
             else:
                 logger.error(
-                    "Market order not filled after 10s poll | "
+                    "Market order not filled after 30s poll | "
                     "fill_price=0.0 — ExecutionTelemetry slippage will be unreliable"
                 )
                 return 0.0, False

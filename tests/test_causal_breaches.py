@@ -11,6 +11,9 @@ import pytest
 from core.schemas import DecisionObject, Assumption
 from ml.causal_discovery import GraphSnapshot, CausalEdge
 from core.comparator import OutcomeComparator
+import core.comparator
+import pathlib
+core.comparator.TRAINING_BUFFER_PATH = pathlib.Path("data/temp_test_training_buffer.csv")
 
 
 def test_causal_edge_breach_detection():
@@ -39,7 +42,7 @@ def test_causal_edge_breach_detection():
             Assumption(
                 name="causal_edge|volatility|price_return|2",
                 variable="volatility",
-                operator="lt",
+                operator="gt",
                 threshold=1.0,
                 current_value=0.5,
                 proximity=0.5,

@@ -26,6 +26,7 @@ def compute_ml2_features(
     assumption: Assumption,
     time_horizon: float,
     ml1_vector: list[float],
+    regime: str = "unknown",
 ) -> dict:
     """Compute the feature dict for ML2 inference and training.
 
@@ -37,22 +38,29 @@ def compute_ml2_features(
         assumption:    the Assumption being scored
         time_horizon:  strategy window duration in minutes
         ml1_vector:    [p_normal, p_stressed, p_degraded] from ML1 at decision time
+        regime:        current market regime string (calm/trending/volatile/unknown)
 
     Returns:
-        dict with exactly 9 keys matching training_buffer.csv columns:
+        dict with exactly 10 keys matching training_buffer.csv columns:
         volatility, spread, trend_strength, volume, proximity,
-        time_horizon, p_normal, p_stressed, p_degraded
+        time_horizon, p_normal, p_stressed, p_degraded, regime_encoded
     """
     p_normal, p_stressed, p_degraded = ml1_vector[0], ml1_vector[1], ml1_vector[2]
 
+    # Encode regime as ordinal integer: calm=0, trending=1, volatile=2, unknown=0
+    # Logistic Regression handles this well given the natural volatility ordering.
+    _REGIME_ENCODING = {"calm": 0, "trending": 1, "volatile": 2}
+    regime_encoded = _REGIME_ENCODING.get(regime, 0)
+
     return {
-        "volatility":    causal_state.volatility,
-        "spread":        causal_state.spread,
+        "volatility":     causal_state.volatility,
+        "spread":         causal_state.spread,
         "trend_strength": causal_state.trend_strength,
-        "volume":        causal_state.volume,
-        "proximity":     assumption.proximity,
-        "time_horizon":  time_horizon,
-        "p_normal":      p_normal,
-        "p_stressed":    p_stressed,   # most informative ML1 feature for breach risk
-        "p_degraded":    p_degraded,
+        "volume":         causal_state.volume,
+        "proximity":      assumption.proximity,
+        "time_horizon":   time_horizon,
+        "p_normal":       p_normal,
+        "p_stressed":     p_stressed,   # most informative ML1 feature for breach risk
+        "p_degraded":     p_degraded,
+        "regime_encoded": regime_encoded,
     }

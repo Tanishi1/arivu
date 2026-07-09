@@ -60,7 +60,7 @@ def run_report() -> None:
 
     arm_stats = _compute_arm_stats(conn)
 
-    header = f"{'Arm':<22} {'Trades':>7} {'Win%':>8} {'Avg PnL':>10} {'Total Return':>14}"
+    header = f"{'Arm':<22} {'Trades':>7} {'Win%':>8} {'Avg Return':>12} {'Total Return %':>16} {'Total USD P&L':>15}"
     print(header)
     print("-" * len(header))
 
@@ -68,14 +68,15 @@ def run_report() -> None:
         stats = arm_stats.get(arm_key, {})
         trades    = stats.get("trades", 0)
         win_rate  = stats.get("win_rate", 0.0)
-        avg_pnl   = stats.get("avg_pnl", 0.0)
-        total_ret = stats.get("total_return", 0.0)
+        avg_ret   = stats.get("avg_return_pct", 0.0)
+        tot_ret   = stats.get("total_return_pct", 0.0)
+        tot_usd   = stats.get("total_pnl_usd", 0.0)
         if trades == 0:
             print(f"  {label:<20}  (no closed trades yet)")
         else:
             print(
                 f"  {label:<20}  {trades:>6}   {win_rate*100:>6.1f}%  "
-                f"  ${avg_pnl:>8.2f}   ${total_ret:>12.2f}"
+                f"   {avg_ret:>+9.4f}%   {tot_ret:>+13.4f}%   ${tot_usd:>+12.2f}"
             )
 
     # -------------------------------------------------------------------
@@ -141,9 +142,9 @@ def run_report() -> None:
 # ---------------------------------------------------------------------------
 
 def _compute_arm_stats(conn: sqlite3.Connection) -> dict:
-    """Compute per-arm win rate, avg PnL, total return from closed decisions."""
+    """Compute per-arm win rate, avg Return %, total Return %, and total USD P&L."""
     rows = conn.execute("""
-        SELECT d.strategy_name, o.actual_pnl
+        SELECT d.strategy_name, o.actual_pnl, d.tuned_params, d.meta_params
         FROM decision_objects d
         JOIN outcome_records o ON d.id = o.decision_object_id
         WHERE d.status = 'CLOSED'
@@ -153,10 +154,35 @@ def _compute_arm_stats(conn: sqlite3.Connection) -> dict:
     for row in rows:
         arm = row["strategy_name"]
         pnl = row["actual_pnl"]
+        
+        try:
+            tuned = json.loads(row["tuned_params"]) if row["tuned_params"] else {}
+            meta = json.loads(row["meta_params"]) if row["meta_params"] else {}
+        except Exception:
+            tuned = {}
+            meta = {}
+            
+        # Compute exposure
+        if arm == "CausalAgent":
+            cap = tuned.get("capital_allocated", 1000000.0)
+            frac = meta.get("position_fraction_adjusted")
+            if frac is None:
+                frac = tuned.get("position_fraction", 0.10)
+            exposure = frac * cap
+            if exposure <= 0.0:
+                exposure = 20.0
+        else:
+            # RL arms run on $10k base in live_runner.py
+            frac = tuned.get("position_fraction", 0.05)
+            exposure = frac * 10000.0
+            
+        ret_pct = (pnl / exposure) * 100 if exposure > 0 else 0.0
+
         if arm not in stats:
-            stats[arm] = {"trades": 0, "wins": 0, "total_pnl": 0.0}
+            stats[arm] = {"trades": 0, "wins": 0, "total_pnl_usd": 0.0, "total_return_pct": 0.0}
         stats[arm]["trades"] += 1
-        stats[arm]["total_pnl"] += pnl
+        stats[arm]["total_pnl_usd"] += pnl
+        stats[arm]["total_return_pct"] += ret_pct
         if pnl > 0:
             stats[arm]["wins"] += 1
 
@@ -166,8 +192,9 @@ def _compute_arm_stats(conn: sqlite3.Connection) -> dict:
         result[arm] = {
             "trades": n,
             "win_rate": s["wins"] / n if n > 0 else 0.0,
-            "avg_pnl": s["total_pnl"] / n if n > 0 else 0.0,
-            "total_return": s["total_pnl"],
+            "avg_return_pct": s["total_return_pct"] / n if n > 0 else 0.0,
+            "total_return_pct": s["total_return_pct"],
+            "total_pnl_usd": s["total_pnl_usd"],
         }
     return result
 

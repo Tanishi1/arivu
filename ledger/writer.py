@@ -198,6 +198,7 @@ class LedgerWriter:
         decision_object_id: str,
         assumption_name: str,
         breach_timestamp: str,
+        reason: str = "limit_exceeded",
     ) -> None:
         """Record a breach event. Called by the assumption monitor."""
         # H2 FIX: Only record the FIRST breach timestamp for each assumption.
@@ -205,9 +206,10 @@ class LedgerWriter:
         # timestamp every cycle. OutcomeRecord.breach_timestamps showed the LAST
         # detection, not the first. First breach time is the scientifically correct
         # record for lifecycle plots and breach proximity analysis.
+        entry = {"timestamp": breach_timestamp, "reason": reason}
         with self._state_lock:
             inner = self._breach_logs.setdefault(decision_object_id, {})
-            inner.setdefault(assumption_name, breach_timestamp)  # only writes if not already present
+            inner.setdefault(assumption_name, entry)  # only writes if not already present
 
         # DB write: only update if this assumption has not been logged before
         with SessionLocal() as session:
@@ -215,7 +217,7 @@ class LedgerWriter:
             if row:
                 log = json.loads(row.breach_log or "{}")
                 if assumption_name not in log:  # preserve first breach timestamp
-                    log[assumption_name] = breach_timestamp
+                    log[assumption_name] = entry
                     row.breach_log = json.dumps(log)
                     session.commit()
 

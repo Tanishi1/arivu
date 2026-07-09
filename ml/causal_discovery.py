@@ -100,6 +100,7 @@ class GraphSnapshot:
         feature_stds: dict[str, float] = None,
         tau_max_used: int = TAU_MAX,
         alpha_used: float = ALPHA,
+        regime_mode: str = "standard",
     ) -> None:
         self.version_id = version_id
         self.timestamp = timestamp
@@ -114,6 +115,7 @@ class GraphSnapshot:
         # produced each graph, enabling correct kernel scoring.
         self.tau_max_used = tau_max_used
         self.alpha_used = alpha_used
+        self.regime_mode = regime_mode
 
     def edges_to_target(self, target: str) -> list[CausalEdge]:
         """Return all edges whose target is `target`."""
@@ -121,6 +123,13 @@ class GraphSnapshot:
 
     def edges_from_source(self, source: str) -> list[CausalEdge]:
         return [e for e in self.edges if e.source == source]
+
+    def has_edge(self, source: str, target: str, lag: int) -> bool:
+        """Return True if this graph contains the specified edge."""
+        return any(
+            e.source == source and e.target == target and e.lag == lag
+            for e in self.edges
+        )
 
     def summary(self) -> str:
         return (
@@ -156,6 +165,7 @@ class CausalDiscoveryEngine:
         variable_names: list[str],
         tau_max: int = TAU_MAX,
         alpha: float = ALPHA,
+        regime: str = "standard",
     ) -> GraphSnapshot:
         """Run causal discovery and return a versioned GraphSnapshot.
 
@@ -167,6 +177,7 @@ class CausalDiscoveryEngine:
                             Defaults to module constant TAU_MAX.
             alpha:          PCMCI significance threshold. Also MetaOptimizer-driven.
                             Defaults to module constant ALPHA.
+            regime:         current market regime (e.g. "calm", "trending").
 
         Returns:
             GraphSnapshot with all significant edges, storing tau_max and alpha used.
@@ -177,6 +188,26 @@ class CausalDiscoveryEngine:
 
         # Sanitise: replace any NaN/Inf with 0 (should not occur, but guard it)
         matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Subset variables if regime is calm or an intermediate calm regime (regime_1, regime_2, etc.)
+        # EXPANDED from 6 to 9 variables: original set was only microstructure indicators
+        # (rsi, volume, trade_intensity, bollinger_width, price_in_band, price_return) which
+        # caused PCMCI to find spurious autocorrelation edges that lack directional predictability.
+        # Adding spread, volatility, ema_spread provides market-state context that genuinely
+        # predicts price_return direction even in calm regimes.
+        # session_sin/cos are deliberately EXCLUDED from all subsets (see FORBIDDEN_SOURCES).
+        if regime == "calm" or regime.startswith("regime_"):
+            calm_vars = [
+                "rsi", "volume", "trade_intensity",
+                "bollinger_width", "price_in_band",
+                "spread", "volatility", "ema_spread",
+                "price_return",
+            ]
+            indices = [variable_names.index(v) for v in calm_vars if v in variable_names]
+            if indices:
+                matrix = matrix[:, indices]
+                variable_names = [variable_names[i] for i in indices]
+            n_vars = len(variable_names)
 
         # Calculate means and stds for normalization in the Twin Simulator
         means = np.mean(matrix, axis=0)
@@ -211,6 +242,7 @@ class CausalDiscoveryEngine:
             feature_stds=feature_stds,
             tau_max_used=tau_max,
             alpha_used=alpha,
+            regime_mode=regime,
         )
 
         self._persist(snapshot)
@@ -287,8 +319,27 @@ class CausalDiscoveryEngine:
         if p_matrix is None or val_matrix is None:
             return edges
 
+        # FORBIDDEN_TARGETS: variables that cannot be caused by anything.
+        # session_sin/cos are deterministic (clock) — nothing causes the clock to tick.
+        # algo_health_* are ML model outputs — they describe the algorithm's internal state,
+        # not market dynamics, and would create a feedback loop if targeted.
+        # rsi is excluded as a target because it is computed directly FROM price; allowing
+        # something to "cause" rsi is equivalent to allowing indirect price autocorrelation.
         FORBIDDEN_TARGETS = {
-            "session_sin", "session_cos", "rsi", 
+            "session_sin", "session_cos", "rsi",
+            "algo_health_p_normal", "algo_health_p_stressed", "algo_health_p_degraded"
+        }
+
+        # FORBIDDEN_SOURCES: variables that must never drive any causal chain.
+        # session_sin/cos: time-of-day features are CONFOUNDS, not causes.
+        #   They correlate with volume/spread because of trading session patterns,
+        #   but the clock ticking does not CAUSE price to move — the underlying
+        #   human behaviour does. Including them as sources poisons downstream
+        #   chains (session_cos->volume->price_return looks causal but isn't).
+        # algo_health_*: ML model internal state should never drive trade decisions
+        #   via a separate causal path — it would create uncontrolled feedback.
+        FORBIDDEN_SOURCES = {
+            "session_sin", "session_cos",
             "algo_health_p_normal", "algo_health_p_stressed", "algo_health_p_degraded"
         }
 
@@ -303,6 +354,10 @@ class CausalDiscoveryEngine:
             
             for i in range(n_vars):   # source variable index
                 if i == j:
+                    continue
+                source_name = variable_names[i]
+                # Skip forbidden sources — clock features cannot causally drive markets
+                if source_name in FORBIDDEN_SOURCES:
                     continue
                 for tau in range(1, tau_max + 1):  # use runtime tau_max, not module constant
                     p_val = float(p_matrix[i, j, tau])
@@ -367,6 +422,11 @@ class CausalDiscoveryEngine:
             "session_sin", "session_cos", "rsi", 
             "algo_health_p_normal", "algo_health_p_stressed", "algo_health_p_degraded"
         }
+        # Mirror the PCMCI forbidden-sources filter — clock features cannot cause markets
+        FORBIDDEN_SOURCES = {
+            "session_sin", "session_cos",
+            "algo_health_p_normal", "algo_health_p_stressed", "algo_health_p_degraded"
+        }
 
         for j in range(n_vars):
             target = variable_names[j]
@@ -378,7 +438,11 @@ class CausalDiscoveryEngine:
                 if i == j:
                     continue
                 source = variable_names[i]
+                # Skip forbidden sources in Granger too
+                if source in FORBIDDEN_SOURCES:
+                    continue
                 x = matrix[:, i]
+
 
                 try:
                     data = np.column_stack([y, x])
@@ -391,11 +455,11 @@ class CausalDiscoveryEngine:
                         p_val = test_stats["ssr_ftest"][1]
                         f_stat = test_stats["ssr_ftest"][0]
                         if p_val < granger_alpha:
-                            # F-statistic is always positive and carries no directional
-                            # information. Use the lagged Pearson correlation to get
-                            # the sign of the causal relationship — positive means
-                            # source_t-lag rises → target_t rises ("up" hypothesis),
-                            # negative means the opposite ("down" hypothesis).
+                            # Use Pearson correlation as the coefficient so it sits
+                            # on the same scale as PCMCI partial correlations [−1, +1].
+                            # F-stat significance is already enforced by p_val < granger_alpha.
+                            # Skip edges where |corr| < 1e-4 — no directional information,
+                            # adding them with an arbitrary sign would pollute chain scoring.
                             if len(x) > lag:
                                 x_lagged = x[:-lag]
                                 y_future = y[lag:]
@@ -405,21 +469,29 @@ class CausalDiscoveryEngine:
                                     corr = 0.0
                             else:
                                 corr = 0.0
-                            # Scale by F-stat significance but keep sign from correlation
-                            signed_coeff = np.sign(corr) * float(f_stat) if corr != 0.0 else float(f_stat)
+
+                            if abs(corr) < 1e-4:
+                                logger.debug(
+                                    "Granger edge %s→%s lag=%d | F=%.3f p=%.4f | "
+                                    "skipped: |corr|=%.6f < 1e-4 (no directional signal)",
+                                    source, target, lag, f_stat, p_val, abs(corr),
+                                )
+                                continue
+
                             logger.debug(
-                                "Granger edge %s→%s lag=%d | F=%.3f corr=%.4f signed_coeff=%.4f",
-                                source, target, lag, f_stat, corr, signed_coeff,
+                                "Granger edge %s→%s lag=%d | F=%.3f corr=%.4f",
+                                source, target, lag, f_stat, corr,
                             )
                             edges.append(CausalEdge(
                                 source=source,
                                 target=target,
                                 lag=lag,
-                                coeff=signed_coeff,
+                                coeff=corr,
                                 p_value=float(p_val),
                                 conditioning_set=[],  # pairwise — no conditioning
                                 graph_version_id=version_id,
                             ))
+
                 except Exception:
                     continue
 

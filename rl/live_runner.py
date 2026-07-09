@@ -259,7 +259,7 @@ class RLLiveRunner:
             )
             if signal == "BUY":
                 self._in_position = True
-                self._entry_price = state.price
+                self._entry_price = state.price * (1.0 + (5.0 / 10000.0))  # 5 bps slippage
             elif signal == "SELL":
                 self._in_position = False
                 self._entry_price = 0.0
@@ -299,23 +299,33 @@ class RLLiveRunner:
                 signal=signal,
                 params={
                     "position_fraction": POSITION_FRACTION,
-                    "order_type": "market",   # RL uses market orders for instant fill
+                    "order_type": "limit",    # RL uses 5s limit orders to reduce slippage
+                    "limit_timeout_s": 5,     # Keep limit polling within 10s decision cycle
                 },
                 state=state,
                 decision_object_id=str(do.id),
             )
-            await asyncio.to_thread(self._ledger.update_status, str(do.id), "ACTIVE")
+            # BUY DOs represent open positions → ACTIVE until the matching SELL closes them.
+            # SELL DOs are exit decisions (not open positions) → INTERRUPTED immediately
+            # so they never appear in the "status=ACTIVE" query that looks for the BUY DO
+            # to close on the NEXT sell cycle.
+            if signal == "BUY":
+                await asyncio.to_thread(self._ledger.update_status, str(do.id), "ACTIVE")
+            else:
+                # SELL DO: mark INTERRUPTED (executed and done, no OutcomeRecord needed)
+                await asyncio.to_thread(self._ledger.update_status, str(do.id), "INTERRUPTED")
 
             if signal == "BUY":
                 self._in_position = True
-                self._entry_price = state.price
+                self._entry_price = state.price * (1.0 + (5.0 / 10000.0))  # 5 bps slippage
                 self._steps_since_entry = 0
                 self._steps_since_exit = 999  # not in cooldown while in position
             elif signal == "SELL":
-                # Compute P&L from tracked entry price vs current exit price.
+                # Compute P&L from tracked entry price vs current exit price with slippage.
                 # Do NOT use unrealized_pl from Alpaca — it reads 0 after position is closed.
                 if self._entry_price > 0:
-                    actual_pnl = (state.price - self._entry_price) / self._entry_price * POSITION_FRACTION * 10000.0
+                    exit_price = state.price * (1.0 - (5.0 / 10000.0))  # 5 bps slippage
+                    actual_pnl = (exit_price - self._entry_price) / self._entry_price * POSITION_FRACTION * 10000.0
                     # Scale: POSITION_FRACTION=5% of ~$10k = $500 exposure → P&L in USD
                     actual_pnl = round(actual_pnl, 4)
                 else:

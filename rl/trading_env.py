@@ -37,6 +37,7 @@ EPISODE_BARS: int = 240          # 4 hours at 1 bar/minute
 STEP_PENALTY_NEGATIVE: float = -0.0001   # per-step penalty when in a losing unrealised position
 POSITION_FRACTION: float = 0.05          # fixed for both RL arms
 MIN_HOLD_BARS: int = 10         # minimum bars to hold before SELL is allowed (10 bars = 100s)
+SLIPPAGE_BPS: float = 5.0       # slippage per side (5 bps = 0.05%)
 
 # Action encoding
 ACTION_HOLD = 0
@@ -135,12 +136,15 @@ class TradingEnv(gym.Env):
 
         if action == ACTION_BUY and not self._in_position:
             self._in_position = True
-            self._entry_price = price
+            slippage_factor = 1.0 + (SLIPPAGE_BPS / 10000.0)
+            self._entry_price = price * slippage_factor
             self._steps_since_entry = 0
             self._steps_since_exit = 999  # reset exit timer while in position
 
         elif action == ACTION_SELL and self._in_position:
-            pnl_pct = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
+            slippage_factor = 1.0 - (SLIPPAGE_BPS / 10000.0)
+            exit_price = price * slippage_factor
+            pnl_pct = (exit_price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
             reward = float(pnl_pct)
             self._episode_pnl += reward
             self._in_position = False
@@ -150,8 +154,9 @@ class TradingEnv(gym.Env):
 
         elif self._in_position:
             self._steps_since_entry += 1
-            # Shaped step penalty for unrealised losing position
-            unrealised_pnl = (price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
+            # Shaped step penalty for unrealised losing position (accounting for exit slippage)
+            unrealised_close = price * (1.0 - (SLIPPAGE_BPS / 10000.0))
+            unrealised_pnl = (unrealised_close - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
             if unrealised_pnl < 0:
                 reward = STEP_PENALTY_NEGATIVE
         else:
@@ -166,7 +171,7 @@ class TradingEnv(gym.Env):
                 # Force-close at final bar
                 price_return_last = float(self._data[min(self._start_idx + self._current_step - 1, self._n_bars - 1), 0])
                 self._current_price *= (1.0 + price_return_last)
-                close_price = self._current_price
+                close_price = self._current_price * (1.0 - (SLIPPAGE_BPS / 10000.0))
                 pnl_pct = (close_price - self._entry_price) / self._entry_price if self._entry_price > 0 else 0.0
                 reward += float(pnl_pct)
                 self._episode_pnl += float(pnl_pct)
@@ -233,25 +238,12 @@ class TradingEnv(gym.Env):
         )
         row = self._data[bar_idx]  # shape (19,) — VARIABLE_NAMES order
 
-        obs_dim = (
-            get_base_obs_dim() if self._mode == "standard"
-            else get_causal_obs_dim()
-        )
-
-        # Build a synthetic CausalState-compatible obs from the feature row.
-        # The feature row has 19 columns matching VARIABLE_NAMES.
-        # BASE_OBS_DIM includes the CausalState scalar fields + 3 algo_health dims.
-        # We directly map the 19 feature vars as the first 19 dims, then
-        # zero-pad to BASE_OBS_DIM for any CausalState fields not in the feature row.
-        from rl.observation import BASE_OBS_DIM, CAUSAL_EXTRA_DIMS
-
-        base = np.zeros(BASE_OBS_DIM, dtype=np.float32)
-        n_feature_cols = min(len(row), BASE_OBS_DIM)
-        base[:n_feature_cols] = row[:n_feature_cols].astype(np.float32)
+        base = row[:19].astype(np.float32)
 
         if self._mode == "standard":
             return base
 
+        from rl.observation import CAUSAL_EXTRA_DIMS
         # Causal dims: zeroed in Phase A (historical training)
         causal = np.zeros(CAUSAL_EXTRA_DIMS, dtype=np.float32)
         return np.concatenate([base, causal], axis=0)

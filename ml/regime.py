@@ -81,6 +81,7 @@ class RegimeClassifier:
         self._dt: DecisionTreeClassifier | None = None
         self._scaler: StandardScaler | None = None
         self._is_trained = False
+        self.last_retrain_count = 0
         self._load_models_if_exist()
 
     def classify(
@@ -156,11 +157,11 @@ class RegimeClassifier:
         scaler = StandardScaler()
         X = scaler.fit_transform(X_raw)
 
-        best_k, best_labels = self._select_k(X)
+        best_k, best_labels, best_km = self._select_k(X)
         logger.info("K-Means complete | best_k=%d", best_k)
 
         # Label assignment: name clusters by dominant strategy performance
-        named_labels = self._name_clusters(best_labels, closed_entries)
+        named_labels = self._name_clusters(best_labels, closed_entries, best_km)
 
         # Retrain Decision Tree on discovered labels
         dt = DecisionTreeClassifier(max_depth=5, random_state=42)
@@ -171,6 +172,7 @@ class RegimeClassifier:
 
         joblib.dump(dt, REGIME_MODEL_PATH)
         joblib.dump(scaler, SCALER_MODEL_PATH)
+        self.last_retrain_count = len(closed_entries)
         logger.info("Decision Tree and Scaler retrained | classes=%s", list(dt.classes_))
         return True
 
@@ -178,11 +180,12 @@ class RegimeClassifier:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _select_k(self, X: np.ndarray) -> tuple[int, np.ndarray]:
-        """Choose K via elbow method / silhouette score. Returns (K, labels)."""
+    def _select_k(self, X: np.ndarray) -> tuple[int, np.ndarray, KMeans]:
+        """Choose K via elbow method / silhouette score. Returns (K, labels, best_km)."""
         best_k = K_CANDIDATES[0]
         best_score = -1.0
         best_labels = None
+        best_km = None
 
         for k in K_CANDIDATES:
             if k >= len(X):
@@ -198,7 +201,7 @@ class RegimeClassifier:
                     best_labels = labels
                     best_km = km  # DF1 FIX: track the actual fitted object
 
-        if best_labels is None:
+        if best_labels is None or best_km is None:
             best_km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
             best_labels = best_km.fit_predict(X)
 
@@ -207,78 +210,66 @@ class RegimeClassifier:
         # With random_state=42 both fits are deterministic, but saving the wrong object
         # is architecturally incorrect and fragile if random_state is ever removed.
         joblib.dump(best_km, KMEANS_MODEL_PATH)
-        return best_k, best_labels
+        return best_k, best_labels, best_km
 
     def _name_clusters(
-        self, labels: np.ndarray, entries: list[dict]
+        self, labels: np.ndarray, entries: list[dict], best_km: KMeans
     ) -> list[str]:
-        """Assign human-readable regime names to cluster IDs.
+        """Assign target regime names to cluster IDs using Nearest-Anchor Centroid mapping."""
+        centers = best_km.cluster_centers_  # shape (K, n_features)
+        K = len(centers)
+        
+        # Feature indices in ["volatility", "spread", "trend_strength", "volume"]
+        vol_idx = 0
+        trend_idx = 2
 
-        Assignment rules (work for any K):
-          - Highest volatility cluster           → 'volatile'
-          - Highest trend (among non-volatile)   → 'trending'
-          - Lowest of all remaining              → 'calm'
-          - Every intermediate cluster (K >= 4)  → 'regime_1', 'regime_2', ...
-            indexed in descending trend order
+        # 1. Volatile anchor: highest volatility center
+        volatile_anchor = int(np.argmax(centers[:, vol_idx]))
 
-        Examples:
-          K=2: volatile, calm  (or trending if high trend)
-          K=3: volatile, trending, calm
-          K=4: volatile, trending, regime_1, calm
-          K=5: volatile, trending, regime_1, regime_2, calm
-          K=6: volatile, trending, regime_1, regime_2, regime_3, calm
-        """
-        cluster_ids = sorted(set(labels))
-        stats: dict[int, dict] = {}
-
-        for cid in cluster_ids:
-            mask = labels == cid
-            subset = [e for e, m in zip(entries, mask) if m]
-            stats[cid] = {
-                "vol": np.mean([e["volatility"] for e in subset]),
-                "trend": np.mean([e["trend_strength"] for e in subset]),
-            }
-
-        # Sort all clusters by volatility descending
-        sorted_by_vol = sorted(cluster_ids, key=lambda c: stats[c]["vol"], reverse=True)
-
+        remaining_indices = [i for i in range(K) if i != volatile_anchor]
         regime_map: dict[int, str] = {}
 
-        if len(sorted_by_vol) == 1:
-            regime_map[sorted_by_vol[0]] = "volatile"
-
-        elif len(sorted_by_vol) == 2:
-            regime_map[sorted_by_vol[0]] = "volatile"
-            second = sorted_by_vol[1]
-            regime_map[second] = "trending" if stats[second]["trend"] > 0.4 else "calm"
-
+        if len(remaining_indices) == 1:
+            # K=2 fallback
+            regime_map[volatile_anchor] = "volatile"
+            second = remaining_indices[0]
+            # Use raw stats to classify the second cluster
+            mean_trend = np.mean([e["trend_strength"] for e, l in zip(entries, labels) if l == second])
+            regime_map[second] = "trending" if mean_trend > 0.4 else "calm"
         else:
             # K >= 3
-            # Step 1: Most volatile → "volatile"
-            regime_map[sorted_by_vol[0]] = "volatile"
+            # Trending anchor: highest trend_strength among remaining
+            trending_anchor = int(remaining_indices[np.argmax(centers[remaining_indices, trend_idx])])
+            # Calm anchor: lowest trend_strength among remaining
+            calm_anchor = int(remaining_indices[np.argmin(centers[remaining_indices, trend_idx])])
 
-            # Step 2: Sort remaining by trend descending
-            remaining = sorted_by_vol[1:]
-            sorted_by_trend = sorted(
-                remaining, key=lambda c: stats[c]["trend"], reverse=True
-            )
-
-            # Step 3: Highest trend → "trending", lowest → "calm"
-            # Everything in between → "regime_1", "regime_2", ...
-            for i, cid in enumerate(sorted_by_trend):
-                if i == 0:
-                    regime_map[cid] = "trending"
-                elif i == len(sorted_by_trend) - 1:
-                    regime_map[cid] = "calm"
+            # Map every cluster to the nearest anchor
+            for c in range(K):
+                if c == volatile_anchor:
+                    regime_map[c] = "volatile"
+                elif c == trending_anchor:
+                    regime_map[c] = "trending"
+                elif c == calm_anchor:
+                    regime_map[c] = "calm"
                 else:
-                    # Intermediate: regime_1, regime_2, ...
-                    regime_map[cid] = f"regime_{i}"
+                    # Calculate Euclidean distance to the anchors in scaled space
+                    dist_to_vol = np.linalg.norm(centers[c] - centers[volatile_anchor])
+                    dist_to_trend = np.linalg.norm(centers[c] - centers[trending_anchor])
+                    dist_to_calm = np.linalg.norm(centers[c] - centers[calm_anchor])
+
+                    min_dist = min(dist_to_vol, dist_to_trend, dist_to_calm)
+                    if min_dist == dist_to_vol:
+                        regime_map[c] = "volatile"
+                    elif min_dist == dist_to_trend:
+                        regime_map[c] = "trending"
+                    else:
+                        regime_map[c] = "calm"
 
         named = [regime_map.get(label, "calm") for label in labels]
         logger.info(
             "K-Means label assignment | k=%d | map=%s",
-            len(cluster_ids),
-            {regime_map[cid]: cid for cid in cluster_ids},
+            K,
+            {regime_map[cid]: cid for cid in range(K)},
         )
         return named
 

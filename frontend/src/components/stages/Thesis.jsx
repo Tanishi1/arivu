@@ -5,14 +5,57 @@
 export default function Thesis({ live, activeDo }) {
   const hypotheses = live?.hypotheses || []
   const selected   = live?.selected_id || live?.selected_chain
-  const tp         = activeDo?.tuned_params || {}
+  const mp         = activeDo?.meta_params || {}   // meta_params is source of truth (not tuned_params)
+  const totalPool  = live?.hypothesis_pool_total ?? hypotheses.length  // pre-slice count if available
+  const holdReason = live?.hold_reason
+
+  // Human-readable hold reason labels
+  const HOLD_LABELS = {
+    no_hypothesis:             'No qualifying chains',
+    score_too_low:             'Score below threshold',
+    no_graph_yet:              'Waiting for PCMCI run',
+    ml2_breach_risk:           'ML2 breach risk too high',
+    same_graph_as_last_breach: 'Blocked — same graph as last breach',
+    below_fee_floor:           `Below fee floor (${((live?.min_expected_return ?? 0.0015)*100).toFixed(2)}%)`,
+    zero_expected_value:       'Zero expected value from simulator',
+    no_long_hypotheses:        'No long-direction hypotheses (short disabled)',
+  }
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
 
+      {/* ── Hold reason banner (when not trading) ── */}
+      {holdReason && holdReason !== 'traded' && (
+        <div style={{
+          padding:'7px 12px', borderRadius:5,
+          background: holdReason === 'same_graph_as_last_breach' ? '#fef3c720' :
+                      holdReason === 'below_fee_floor' ? '#fef9c320' : 'var(--bg-panel-2)',
+          border:`1px solid ${
+            holdReason === 'same_graph_as_last_breach' ? 'var(--warn)' :
+            holdReason === 'below_fee_floor' ? '#ca8a04' : 'var(--border-light)'}`,
+          display:'flex', alignItems:'center', gap:8,
+        }}>
+          <span style={{fontSize:'1rem'}}>
+            {holdReason === 'same_graph_as_last_breach' ? '⛔' :
+             holdReason === 'below_fee_floor' ? '💸' : '⏸'}
+          </span>
+          <div>
+            <div style={{fontFamily:'var(--font-mono)',fontSize:'0.68rem',fontWeight:700,
+              color: holdReason === 'same_graph_as_last_breach' ? 'var(--warn)' :
+                     holdReason === 'below_fee_floor' ? '#ca8a04' : 'var(--text-secondary)'}}>
+              HOLD — {HOLD_LABELS[holdReason] ?? holdReason}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Header counts ── */}
       <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-        <MetricChip label="Hypotheses" val={hypotheses.length} />
+        <MetricChip
+          label="Pool"
+          val={totalPool > hypotheses.length ? `${totalPool}→${hypotheses.length}` : hypotheses.length}
+          title={totalPool > hypotheses.length ? `${totalPool} generated, sliced to top ${hypotheses.length} for ML2` : undefined}
+        />
         <MetricChip label="Multi-hop"  val={hypotheses.filter(h => (h.hop_count||h.chain_edges?.length||0) > 1).length} color="#7c3aed" />
         <MetricChip label="Selected"   val={hypotheses.filter(h => h.id===selected||h.chain===selected).length > 0 ? '1' : '—'} color="var(--thesis)" />
       </div>
@@ -95,11 +138,11 @@ export default function Thesis({ live, activeDo }) {
                     {/* Visual chain */}
                     <ChainVisual chain={h.chain} edges={h.chain_edges} />
 
-                    {/* Score breakdown */}
+                    {/* Score breakdown — reads meta_params (source of truth since epsilon-greedy fix) */}
                     <div style={{display:'flex',gap:12,flexWrap:'wrap'}}>
-                      {tp.layer1_score != null && <ScorePair label="L1 Stability" val={tp.layer1_score?.toFixed(4)} color="var(--graph)" />}
-                      {tp.layer2_score != null && <ScorePair label="L2 Trust"     val={tp.layer2_score?.toFixed(4)} color="var(--trust)" />}
-                      {tp.composite_score != null && <ScorePair label="Composite" val={tp.composite_score?.toFixed(4)} color="var(--thesis)" />}
+                      {mp.edge_stability != null && <ScorePair label="L1 Stability" val={mp.edge_stability?.toFixed(4)} color="var(--graph)" />}
+                      {mp.l2_trust != null && <ScorePair label="L2 Trust"     val={mp.l2_trust?.toFixed(4)} color="var(--trust)" />}
+                      {mp.composite_score != null && <ScorePair label="Composite" val={mp.composite_score?.toFixed(4)} color="var(--thesis)" />}
                       {breachRisk != null && (
                         <ScorePair
                           label="Breach Risk"
@@ -126,7 +169,7 @@ export default function Thesis({ live, activeDo }) {
                           }}/>
                         </div>
                         <div style={{fontSize:'0.57rem',color:'var(--text-secondary)',marginTop:3}}>
-                          Proximity-based: 1/(1+|driver_z|) — near zero-crossing = high risk
+                          ML2-annotated bootstrap: proximity heuristic (1/(1+|driver|)) · transitions to LogisticRegression after 30 closed trades
                         </div>
                       </div>
                     )}

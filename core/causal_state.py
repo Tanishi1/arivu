@@ -121,26 +121,24 @@ class CausalStateManager:
             rsi = self._compute_rsi()
             divergence_span = self._compute_divergence_span()
 
-            self._state = CausalState(
-                timestamp=tick.timestamp,
-                price=tick.price,
-                volatility=volatility,
-                spread=propagated_spread,
-                trend_slope=trend_slope,
-                trend_strength=trend_strength,
-                volume=volume,
-                rsi_current=rsi,
-                divergence_candle_span=divergence_span,
-                algo_health_vector=self._state.algo_health_vector,
-                active_strategy=self._state.active_strategy,
-                position_size=self._state.position_size,
-                capital_deployed=self._state.capital_deployed,
-                last_tick_timestamp=datetime.now(timezone.utc),
-                price_history=list(self._prices),
+            self._state = self._state.model_copy(
+                update={
+                    "timestamp": tick.timestamp,
+                    "price": tick.price,
+                    "volatility": volatility,
+                    "spread": propagated_spread,
+                    "trend_slope": trend_slope,
+                    "trend_strength": trend_strength,
+                    "volume": volume,
+                    "rsi_current": rsi,
+                    "divergence_candle_span": divergence_span,
+                    "last_tick_timestamp": datetime.now(timezone.utc),
+                    "price_history": list(self._prices),
+                }
             )
 
             logger.debug(
-                "CausalState updated | price=%.4f vol=%.4f spread=%.4f trend=%.4f",
+                "CausalState updated | price=%.6f vol=%.6f spread=%.6f trend=%.6f",
                 tick.price, volatility, propagated_spread, trend_slope,
             )
 
@@ -185,7 +183,7 @@ class CausalStateManager:
             self._state = self._state.model_copy(update=features)
         logger.debug(
             "CausalState: graph features updated | btc_ret=%.6f eth_ret=%.6f "
-            "ema_spread=%.4f bollinger_w=%.4f price_ret=%.6f",
+            "ema_spread=%.6f bollinger_w=%.6f price_ret=%.6f",
             features.get("btc_return", 0.0),
             features.get("eth_return", 0.0),
             features.get("ema_spread", 0.0),
@@ -335,7 +333,7 @@ class CausalStateManager:
                     "reason": "volatility",
                     "value": volatility,
                 })
-                logger.info("Trigger fired | reason=volatility value=%.4f", volatility)
+                logger.info("Trigger fired | reason=volatility value=%.6f", volatility)
             except asyncio.QueueFull:
                 logger.warning("Decision queue full — volatility trigger discarded")
         self._prev_above_vol = above_vol
@@ -348,7 +346,7 @@ class CausalStateManager:
                     "reason": "spread",
                     "value": spread,
                 })
-                logger.info("Trigger fired | reason=spread value=%.4f", spread)
+                logger.info("Trigger fired | reason=spread value=%.6f", spread)
             except asyncio.QueueFull:
                 logger.warning("Decision queue full — spread trigger discarded")
         self._prev_above_spread = above_spread

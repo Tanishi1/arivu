@@ -134,19 +134,45 @@ class TwinSimulator:
                 "z_new_target_value": simulated_values[edge.target],
             })
 
-        # BUG4 FIX: Un-standardize the final predicted price_return back to raw percentage.
-        # Apply std floor (MIN_STD_FLOOR) to prevent zero-variance collapse where
-        # std_ret ≈ 0 causes all hypotheses to predict the same near-zero return,
-        # making selection arbitrary. Then clip to realistic SOL 30-min range.
+        # DIRECTION FIX: Use ONLY the Z-score signal component for direction and magnitude.
+        # DO NOT add mean_ret. The rolling mean of price_return is the long-run drift
+        # (e.g., +0.00005 in a calm market) — it has zero information about where
+        # price goes in the NEXT 10-40 seconds. Adding it causes mean_ret to dominate
+        # the sign of the prediction whenever the causal signal is small (calm markets),
+        # producing systematically biased direction — confirmed by 11.4% accuracy.
+        #
+        # The causal signal is: edge.coeff × z_score_of_driver → z_score_of_price_return.
+        # This is already in Z-score space. We un-standardize MAGNITUDE only (× std_ret)
+        # to convert to a realistic dollar-scale return, but the SIGN comes purely from
+        # the causal signal.
         z_predicted_return = simulated_values.get("price_return", 0.0)
-        mean_ret = snapshot.feature_means.get("price_return", 0.0)
         std_ret = max(snapshot.feature_stds.get("price_return", 1.0), MIN_STD_FLOOR)
 
-        predicted_return = (z_predicted_return * std_ret) + mean_ret
+        # Un-standardize magnitude only — direction is from z-score sign.
+        predicted_return = z_predicted_return * std_ret
         # Clamp to realistic range — prevents runaway projection from high-Z outlier bars
         predicted_return = max(-MAX_REALISTIC_RETURN, min(MAX_REALISTIC_RETURN, predicted_return))
         if not math.isfinite(predicted_return):
             predicted_return = 0.0
+
+        # Dead-zone guard: if z-signal is below the noise floor (|z| < 0.05 σ),
+        # the causal driver has no meaningful pull on price_return right now.
+        # Return zero so this hypothesis scores zero EV and is not selected.
+        Z_SIGNAL_FLOOR = 0.05
+        if abs(z_predicted_return) < Z_SIGNAL_FLOOR:
+            predicted_return = 0.0
+
+        steps_str = " | ".join(
+            f"{s['edge']} (coeff={s['coeff']:.4f}, z_src={s['z_source_value']:.4f}, eff={s['z_predicted_effect']:.6f})"
+            for s in steps
+        )
+        logger.info(
+            "TwinSimulator: simulated hypothesis | predicted_return=%.6f%% | direction=%s | chain=%s | steps=[ %s ]",
+            predicted_return * 100.0,
+            "up" if predicted_return > 0 else "down",
+            hypothesis.chain_summary(),
+            steps_str,
+        )
 
         hypothesis.predicted_direction = "up" if predicted_return > 0 else "down"
         confidence_band = max(
@@ -220,15 +246,41 @@ class TwinSimulator:
             logger.info("TwinSimulator: no hypothesis with non-zero risk-adjusted EV")
             return None, None
 
+        best_hyp = hypotheses[best_idx]
+        best_traj = trajectories[best_idx]
+
+        # TwinSimulator diagnosis logging
+        try:
+            chain_len = len(best_hyp.chain)
+            avg_lag = sum(e.lag for e in best_hyp.chain) / chain_len if chain_len > 0 else 0.0
+            coeff_product = 1.0
+            for e in best_hyp.chain:
+                coeff_product *= e.coeff
+            z_score_input = best_traj.steps[0]["z_source_value"] if best_traj.steps else 0.0
+            propagated_z = best_traj.steps[-1]["z_new_target_value"] if best_traj.steps else 0.0
+
+            logger.info(
+                "TwinSimulator diagnosis | hypothesis_id=%s | chain=%s | "
+                "raw_ev=%.6f | z_score_input=%.6f | propagated_z=%.6f | "
+                "unscored_return=%.6f | confidence_band_width=%.6f | "
+                "avg_lag=%.2f | chain_length=%d | coeff_product=%.6f",
+                best_hyp.id, best_hyp.chain_summary(),
+                best_traj.expected_value, z_score_input, propagated_z,
+                best_traj.predicted_price_return, best_traj.confidence_band,
+                avg_lag, chain_len, coeff_product
+            )
+        except Exception as log_exc:
+            logger.error("Failed to write TwinSimulator diagnosis log: %s", log_exc)
+
         logger.info(
             "TwinSimulator: selected | chain=%s | raw_ev=%.6f | "
             "breach_risk=%.3f | risk_adj_ev=%.6f",
-            hypotheses[best_idx].chain_summary(),
-            trajectories[best_idx].expected_value,
-            getattr(hypotheses[best_idx], "avg_breach_risk", 0.5),
+            best_hyp.chain_summary(),
+            best_traj.expected_value,
+            getattr(best_hyp, "avg_breach_risk", 0.5),
             best_ev,
         )
-        return hypotheses[best_idx], trajectories[best_idx]
+        return best_hyp, best_traj
 
     def check_breach(
         self,

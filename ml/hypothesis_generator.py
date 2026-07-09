@@ -64,6 +64,7 @@ class CausalHypothesis:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_escape_valve: bool = False
     avg_breach_risk: float = 0.5
+    chain_key: str = "unknown"
 
     def chain_summary(self) -> str:
         if not self.chain:
@@ -72,6 +73,16 @@ class CausalHypothesis:
         for e in self.chain:
             parts.append(f"{e.source}->(lag={e.lag})->{e.target}")
         return " | ".join(parts)
+        
+def compute_chain_key(chain: list[CausalEdge]) -> str:
+    if not chain:
+        return "empty"
+    parts = []
+    # Reverse to build string from root to target
+    for edge in reversed(chain):
+        parts.append(f"{edge.source}->(lag={edge.lag})")
+    parts.append(chain[0].target)
+    return "->".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +108,20 @@ class HypothesisGenerator:
         self._layer2 = layer2_store
         self._bar_width_s = bar_width_s
 
-    def generate(self, snapshot: GraphSnapshot, regime: str = "unknown") -> list[CausalHypothesis]:
+    def generate(
+        self,
+        snapshot: GraphSnapshot,
+        regime: str,
+        current_state: dict[str, float],
+        params=None,
+    ) -> list[CausalHypothesis]:
         """Generate and rank hypotheses from the current graph.
+
+        params: MetaParams from get_params_for_trade() — carries the cycle's
+                threshold (possibly epsilon-greedy explored). All edge validation
+                and stability scoring in this call will use this same threshold,
+                ensuring consistent attribution when MetaOptimizer.update() runs.
+                If None, validation falls back to deterministic get_params().
 
         Always returns all generated hypotheses (never empty if there are chains).
         If no edges point to price_return at all, returns one null hypothesis
@@ -117,8 +140,78 @@ class HypothesisGenerator:
             )
             return [self._null_hypothesis(snapshot.version_id, "no_edges_to_price_return")]
 
+        # ─────────────────────────────────────────────────────────────────
+        # PRIMARY EDGE VALIDATION
+        # Evidence-based exclusions confirmed by empirical data (80 natural
+        # trades across two independent runs) and microstructure literature.
+        # These exclusions apply ONLY to the primary (first) edge of a chain.
+        # All excluded variables remain in the causal graph and may appear
+        # as secondary edges in multi-hop chains.
+        # ─────────────────────────────────────────────────────────────────
+
+        # Cross-asset variables confirmed as statistical artifacts at
+        # 10-second bar resolution. Institutional arbitrage happens in
+        # milliseconds; lags of 40-100 seconds capture retail momentum
+        # which is directionally unreliable.
+        EXCLUDED_PRIMARY_SOURCES = {"eth_return", "btc_return"}
+
+        # Unsigned variables that carry magnitude/volatility/activity information
+        # but no directional (up/down) sign. Allowing them as the primary
+        # edge pointing directly to price_return mathematically forces the model
+        # to predict direction based on unsigned deviations (e.g. low volume -> down),
+        # which is a structural trap (breakout vs. mean reversion coin-flip).
+        UNSIGNED_VARIABLES = {
+            "volume", "spread", "volatility", "trade_intensity",
+            "bollinger_width", "regime_volatile", "regime_trending",
+            "algo_health_p_normal", "algo_health_p_stressed", "algo_health_p_degraded",
+            "session_sin", "session_cos"
+        }
+
+        # Lag caps per variable — beyond these lags the variable's
+        # predictive signal for price direction is empirically confirmed
+        # to degrade to noise or worse.
+        PRIMARY_LAG_CAPS = {
+            "volume": 5,            # execution pressure: 50s max
+            "trade_intensity": 11,  # order flow momentum: confirmed wins at lag 5,9,10
+            "order_book_imbalance": 8,  # LOB signal: confirmed at lag 1,3,7
+            "spread": 10,           # liquidity signal: medium duration
+            "volatility": 8,        # confirmed win lag=7, loss lag=9 borderline
+        }
+
+        def is_valid_primary_edge(edge, current_regime: str) -> bool:
+            """
+            Returns True if this edge is acceptable as the primary (first)
+            edge in a tradeable hypothesis chain.
+            """
+            if edge.source in EXCLUDED_PRIMARY_SOURCES:
+                return False
+
+            if edge.source in UNSIGNED_VARIABLES:
+                return False
+
+            if edge.source == "regime_volatile" and current_regime == "calm":
+                return False
+
+            if edge.source in PRIMARY_LAG_CAPS:
+                if edge.lag > PRIMARY_LAG_CAPS[edge.source]:
+                    return False
+
+            return True
+
         # Find all chains (up to MAX_HOP_DEPTH) ending at price_return
-        chains = self._find_chains(snapshot, TARGET_VARIABLE, MAX_HOP_DEPTH, regime)
+        raw_chains = self._find_chains(snapshot, TARGET_VARIABLE, MAX_HOP_DEPTH, regime, params=params)
+        
+        chains = []
+        for chain in raw_chains:
+            # chain[0] is the primary edge (closest to price_return)
+            if not is_valid_primary_edge(chain[0], regime):
+                logger.info(
+                    "HypothesisGenerator: primary edge rejected | "
+                    "source=%s lag=%d regime=%s | reason=primary_edge_exclusion",
+                    chain[0].source, chain[0].lag, regime
+                )
+                continue
+            chains.append(chain)
 
         if not chains:
             # --- Escape valve ---
@@ -142,7 +235,9 @@ class HypothesisGenerator:
                         edge.source, edge.target, edge.lag, regime
                     )
                     if stability >= ESCAPE_VALVE_MIN_STABILITY:
-                        hyp = self._score_chain([edge], snapshot.version_id, regime)
+                        hyp = self._score_chain([edge], snapshot, regime, current_state, params=params)
+                        if not hyp.chain:
+                            continue
                         hyp.is_escape_valve = True
                         escape_hyps.append((stability, hyp))
 
@@ -155,7 +250,7 @@ class HypothesisGenerator:
                     logger.warning(
                         "HypothesisGenerator: ESCAPE_VALVE | "
                         "runs=%d candidates=%d best_edge=%s->%s "
-                        "stability=%.3f composite=%.4f threshold=%.2f | "
+                        "stability=%.6f composite=%.6f threshold=%.6f | "
                         "firing %d low-confidence hypothesis(es)",
                         n_runs, len(hypotheses),
                         best_edge.source, best_edge.target,
@@ -176,25 +271,59 @@ class HypothesisGenerator:
         # Score each chain
         hypotheses = []
         for chain in chains:
-            hyp = self._score_chain(chain, snapshot.version_id, regime)
+            hyp = self._score_chain(chain, snapshot, regime, current_state, params=params)
             hypotheses.append(hyp)
+
+        # Direction-accuracy gate: demote chains where the terminal edge (closest
+        # to price_return) has empirically predicted the wrong direction more than
+        # half the time. L2 trust IS the historical direction win rate (updated via
+        # trust_updater.update(outcome_correct=...)). A chain where trust < 0.50
+        # with N ≥ 10 observations means it has been wrong > 50% of the time —
+        # acting on it as a full natural trade is anti-predictive (confirmed by the
+        # 11.4% direction accuracy in empirical analysis).
+        # These chains are demoted to escape_valve=True so they still fire for
+        # learning purposes but are size-capped at 1% of normal capital.
+        # Chains with < MIN_LAYER2_OBS observations are left alone — not enough
+        # data yet to condemn them; the dead-zone guard in twin_simulator will
+        # handle them via zero EV.
+        L2_DIRECTION_ACCURACY_FLOOR = 0.50  # below this = empirically anti-predictive
+        L2_MIN_OBS_FOR_GATE = 10            # need at least N obs before condemning
+        for hyp in hypotheses:
+            if hyp.is_escape_valve:
+                continue  # escape valves are already small — don't re-flag
+            if not hyp.chain:
+                continue
+            terminal_edge = hyp.chain[0]  # edge closest to price_return
+            if self._layer2 is not None:
+                l2_info = self._layer2.get_trust(
+                    terminal_edge.source, terminal_edge.target, terminal_edge.lag
+                )
+                trust = l2_info.get("trust", 0.5)
+                n_obs = l2_info.get("n_observations", 0)
+                if n_obs >= L2_MIN_OBS_FOR_GATE and trust < L2_DIRECTION_ACCURACY_FLOOR:
+                    logger.info(
+                        "HypothesisGenerator: direction-accuracy demotion | "
+                        "edge=%s->%s lag=%d | trust=%.4f (N=%d) < floor=%.2f | "
+                        "demoting to escape_valve",
+                        terminal_edge.source, terminal_edge.target, terminal_edge.lag,
+                        trust, n_obs, L2_DIRECTION_ACCURACY_FLOOR,
+                    )
+                    hyp.is_escape_valve = True
 
         # Sort by composite score descending
         hypotheses.sort(key=lambda h: h.composite_score, reverse=True)
 
-        # Return all hypotheses sorted by score
-        
         # Log HOLD warning if even the best is below MIN_TRADE_SCORE
         best = hypotheses[0]
         if best.composite_score < MIN_TRADE_SCORE:
             logger.warning(
                 "HypothesisGenerator: HOLD | reason=weak_top_candidate | "
-                "top_score=%.4f | threshold=%.4f | chain=%s",
+                "top_score=%.6f | threshold=%.6f | chain=%s",
                 best.composite_score, MIN_TRADE_SCORE, best.chain_summary(),
             )
         else:
             logger.info(
-                "HypothesisGenerator: %d hypotheses | best_score=%.4f | chain=%s",
+                "HypothesisGenerator: %d hypotheses | best_score=%.6f | chain=%s",
                 len(hypotheses), best.composite_score, best.chain_summary(),
             )
 
@@ -210,8 +339,12 @@ class HypothesisGenerator:
         target: str,
         max_depth: int,
         regime: str = "unknown",
+        params=None,
     ) -> list[list[CausalEdge]]:
         """Find all validated causal chains ending at target, up to max_depth hops.
+
+        params: MetaParams from get_params_for_trade() — every is_validated() call
+                in this walk uses the same threshold, so the chain is coherent.
 
         Chain ordering convention (backward-compatible with _score_chain):
           chain[0]  = edge directly pointing to price_return  (closest to target)
@@ -227,6 +360,16 @@ class HypothesisGenerator:
         """
         completed: list[list[CausalEdge]] = []
 
+        def _get_l2(edge) -> tuple[float | None, int]:
+            """Fetch L2 trust and observation count for an edge, or (None, 0) if unavailable."""
+            if self._layer2 is None:
+                return None, 0
+            try:
+                r = self._layer2.get_trust(edge.source, edge.target, edge.lag)
+                return r.get("trust"), r.get("n_observations", 0)
+            except Exception:
+                return None, 0
+
         def _walk(
             current_target: str,
             chain_so_far: list[CausalEdge],
@@ -237,8 +380,10 @@ class HypothesisGenerator:
             if depth > max_depth:
                 return
             for edge in snapshot.edges_to_target(current_target):
+                l2_trust, l2_n_obs = _get_l2(edge)
                 if not self._layer1.is_validated(
-                    edge.source, edge.target, edge.lag, regime
+                    edge.source, edge.target, edge.lag, regime, params=params,
+                    l2_trust=l2_trust, l2_n_obs=l2_n_obs,
                 ):
                     logger.debug(
                         "Multi-hop: edge pruned | %s->%s lag=%d | "
@@ -269,14 +414,17 @@ class HypothesisGenerator:
 
         # Seed: all validated 1-hop edges pointing directly at price_return
         for edge in snapshot.edges_to_target(target):
+            l2_trust, l2_n_obs = _get_l2(edge)
             if not self._layer1.is_validated(
-                edge.source, edge.target, edge.lag, regime
+                edge.source, edge.target, edge.lag, regime, params=params,
+                l2_trust=l2_trust, l2_n_obs=l2_n_obs,
             ):
                 score = self._layer1.get_stability_score(
-                    edge.source, edge.target, edge.lag, regime
+                    edge.source, edge.target, edge.lag, regime, params=params
                 )
+
                 logger.debug(
-                    "1-hop pruned | %s->%s lag=%d | stability=%.2f | "
+                    "1-hop pruned | %s->%s lag=%d | stability=%.6f | "
                     "reason=layer1_not_validated",
                     edge.source, edge.target, edge.lag, score,
                 )
@@ -296,10 +444,15 @@ class HypothesisGenerator:
     def _score_chain(
         self,
         chain: list[CausalEdge],
-        graph_version_id: str,
+        snapshot: GraphSnapshot,
         regime: str,
+        current_state: dict[str, float],
+        params=None,
     ) -> CausalHypothesis:
         """Compute composite score for a single causal chain.
+
+        params: MetaParams propagated from generate() — used to pass the same
+                params to get_stability_score() so L1 scores are consistent.
 
         Magnitude uses GEOMETRIC MEAN of edge coefficients, not raw product.
 
@@ -312,69 +465,102 @@ class HypothesisGenerator:
         discount for chain length. Geometric mean prevents a second hidden
         penalty from making multi-hop chains mathematically unreachable.
         """
+        c_key = compute_chain_key(chain)
         n_hops = len(chain)
 
-        # Layer 1 stability: mean stability score across all edges in chain
-        l1_scores = [
-            self._layer1.get_stability_score(e.source, e.target, e.lag, regime)
-            for e in chain
-        ]
-        layer1_score = sum(l1_scores) / len(l1_scores) if l1_scores else 0.0
+        # Register the chain in the L1 tracker to initialize/update its history
+        self._layer1.register_chain(c_key, snapshot)
 
-        # Layer 2 trust: mean trust across edges (default 0.5 — neutral until observed)
-        layer2_score = 0.5
-        layer2_n_obs = 0
+        # Layer 1 chain stability
+        chain_stability = self._layer1.get_chain_stability(c_key)
+        
+        # Layer 2 chain trust
+        chain_trust = 0.5
+        chain_n = 0
         if self._layer2 is not None:
-            l2_results = [
-                self._layer2.get_trust(e.source, e.target, e.lag)
-                for e in chain
-            ]
-            trust_scores = [r["trust"] for r in l2_results]
-            obs_counts = [r["n_observations"] for r in l2_results]
-            layer2_score = sum(trust_scores) / len(trust_scores) if trust_scores else 0.5
-            layer2_n_obs = min(obs_counts)  # use min — chain is only as trusted as weakest link
+            chain_trust, chain_n = self._layer2.get_chain_trust(c_key)
+            
+        # Hard gate — block chains with proven wrong direction history
+        if chain_n >= 5 and chain_trust < 0.40:
+            logger.info("HypothesisGenerator: chain blocked | chain=%s | trust=%.3f n=%d", 
+                        c_key, chain_trust, chain_n)
+            return self._null_hypothesis(snapshot.version_id, "chain_trust_too_low")
 
-            # Down-weight layer2 if insufficient observations
-            if layer2_n_obs < MIN_LAYER2_OBS:
-                # Blend toward neutral (0.5) proportionally
-                weight = layer2_n_obs / MIN_LAYER2_OBS
-                layer2_score = layer2_score * weight + 0.5 * (1 - weight)
-
-        # Chain length penalty: 0.85 per hop AFTER the first.
-        # This is the ONLY length-based confidence discount.
-        length_penalty = CHAIN_LENGTH_PENALTY ** (n_hops - 1)
-
+        # Chain length bonus — multi-hop chains rewarded
+        length_bonus = min(1.0 + (n_hops - 1) * 0.10, 1.30)
+        
         # Effect magnitude: geometric mean of absolute edge coefficients.
-        # Geometric mean = (product)^(1/n_hops), which normalises for chain length
-        # so multi-hop chains aren't exponentially penalised relative to 1-hop.
         raw_product = 1.0
         for e in chain:
             raw_product *= abs(e.coeff)
-        # Geometric mean — stays in (0, 1] for typical PCMCI coefficients
         magnitude = raw_product ** (1.0 / n_hops) if n_hops > 0 else 0.0
         magnitude = min(magnitude, 1.0)
 
-        # Composite score
-        composite = layer1_score * layer2_score * length_penalty * magnitude
+        # Base composite score
+        composite = chain_stability * chain_trust * length_bonus * magnitude
 
-        # Direction: sign of the edge closest to price_return (chain[0] by convention)
-        final_edge = chain[0]
-        direction = "up" if final_edge.coeff > 0 else "down"
+        # --- JOINT STATE CONSISTENCY & ROOT SIGN PROPAGATION ---
+        # 1. Root state sign propagation
+        root_node = chain[-1].source
+        root_val = current_state.get(root_node, 0.0)
+        root_mean = snapshot.feature_means.get(root_node, 0.0)
+        root_std = max(snapshot.feature_stds.get(root_node, 1.0), 1e-6)
+        root_z = (root_val - root_mean) / root_std
+        
+        # Propagate through chain
+        coeff_product = 1.0
+        for edge in chain:
+            coeff_product *= edge.coeff
+            
+        predicted_z = root_z * coeff_product
+        direction = "up" if predicted_z > 0 else "down"
+
+        # 2. Joint state consistency penalty
+        current_expected_sign = 1 if root_z > 0 else -1
+        consistency_penalty = 1.0
+        
+        for edge in reversed(chain):
+            node = edge.target
+            if node == "price_return":
+                continue 
+                
+            current_expected_sign = current_expected_sign * (1 if edge.coeff > 0 else -1)
+            
+            node_val = current_state.get(node, 0.0)
+            node_mean = snapshot.feature_means.get(node, 0.0)
+            node_std = max(snapshot.feature_stds.get(node, 1.0), 1e-6)
+            actual_z = (node_val - node_mean) / node_std
+            
+            contradiction = max(0.0, -current_expected_sign * actual_z)
+            
+            if abs(actual_z) > 0.5 and contradiction > 0:
+                node_penalty = max(0.20, 1.0 - contradiction * 0.5)
+                consistency_penalty *= node_penalty
+        
+        composite *= consistency_penalty
+        
+        logger.info(
+            "HypothesisGenerator: chain_scored | chain=%s | stability=%.3f | trust=%.3f(n=%d) | length_bonus=%.2f | consistency_penalty=%.2f | composite=%.4f",
+            c_key, chain_stability, chain_trust, chain_n, length_bonus, consistency_penalty, composite
+        )
 
         # Time horizon: sum of lags x bar width
         total_lag = sum(e.lag for e in chain)
         time_horizon_s = total_lag * self._bar_width_s
+        
+        c_key = compute_chain_key(chain)
 
         return CausalHypothesis(
-            graph_version_id=graph_version_id,
+            graph_version_id=snapshot.version_id,
             chain=list(chain),
             predicted_direction=direction,
             predicted_magnitude=float(magnitude),
             time_horizon_seconds=time_horizon_s,
-            layer1_score=round(layer1_score, 4),
-            layer2_score=round(layer2_score, 4),
-            layer2_n_obs=layer2_n_obs,
+            layer1_score=round(chain_stability, 4),
+            layer2_score=round(chain_trust, 4),
+            layer2_n_obs=chain_n,
             composite_score=round(composite, 6),
+            chain_key=c_key,
         )
 
     def _null_hypothesis(self, graph_version_id: str, reason: str) -> CausalHypothesis:

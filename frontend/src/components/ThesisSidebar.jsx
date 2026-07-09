@@ -125,7 +125,7 @@ export default function ThesisSidebar({ live, activeDo, trust, state }) {
           border:`1px solid ${ev.fired||ev.armed ? 'var(--escape)' : 'var(--border-light)'}`,
         }}>
           <div style={{fontFamily:'var(--font-mono)',fontSize:'0.68rem',fontWeight:ev.fired||ev.armed?700:400,color:ev.fired||ev.armed?'var(--escape)':'var(--text-secondary)'}}>
-            {ev.fired ? '⚡ FIRED' : ev.armed ? `⚡ ARMED · ${ev.consecutive_holds}/30` : `${ev.consecutive_holds??0}/30 holds · inactive`}
+            {ev.fired ? '⚡ FIRED' : ev.armed ? `⚡ ARMED · ${ev.consecutive_holds}/${ev.threshold??25}` : `${ev.consecutive_holds??0}/${ev.threshold??25} holds · inactive`}
           </div>
         </div>
       </div>

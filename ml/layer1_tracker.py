@@ -23,6 +23,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
+from scipy.stats import beta as beta_dist
+
 from ml.causal_discovery import CausalEdge, GraphSnapshot
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,10 @@ class Layer1Tracker:
 
         # All unique edge keys seen across all runs (for completeness tracking)
         self._all_edge_keys: set[str] = set()
+        
+        # Chain tracking
+        self._chain_history: dict[str, deque[int]] = {}
+        self._all_chain_keys: set[str] = set()
 
         self._ensure_schema()
         self._load_from_db()
@@ -70,19 +76,19 @@ class Layer1Tracker:
     # ------------------------------------------------------------------
 
     def record_run(self, snapshot: GraphSnapshot, regime: str = "unknown") -> None:
-        """Update run history for all known edges given a new GraphSnapshot.
+        """Update run history for all known edges and chains given a new GraphSnapshot.
 
-        Edges present in this run → True appended.
-        Edges known but absent in this run → False appended.
-        New edges seen for first time → history initialised with this one True.
+        Edges/Chains present in this run → True appended.
+        Edges/Chains known but absent in this run → False appended.
+        New edges/chains seen for first time → history initialised with this one True.
         """
-        params = self._optimizer.get_params(regime)
         present_keys: set[str] = set()
         for edge in snapshot.edges:
             key = _edge_key(edge.source, edge.target, edge.lag)
             present_keys.add(key)
             self._all_edge_keys.add(key)
 
+        chain_rows = []
         with self._lock:
             # Record presence/absence for all previously known edges
             for key in list(self._all_edge_keys):
@@ -95,26 +101,106 @@ class Layer1Tracker:
                 self._run_history[key] = deque([True], maxlen=100)
                 self._all_edge_keys.add(key)
 
+            # Update chain history for all currently known chains
+            ts = datetime.now(timezone.utc).isoformat()
+            for chain_key in list(self._all_chain_keys):
+                if chain_key not in self._chain_history:
+                    self._chain_history[chain_key] = deque(maxlen=100)
+                
+                # Check if all edges in the chain are present in the snapshot
+                edges = parse_chain_key(chain_key)
+                all_present = all(
+                    snapshot.has_edge(src, tgt, lag)
+                    for src, tgt, lag in edges
+                )
+                present_int = 1 if all_present else 0
+                self._chain_history[chain_key].append(present_int)
+                chain_rows.append((chain_key, snapshot.version_id, present_int, ts))
+
         # Persist this run's data
         self._persist_run(snapshot, present_keys)
+        
+        # Persist chain runs to DB
+        if chain_rows:
+            try:
+                with sqlite3.connect(self._db_path) as conn:
+                    conn.executemany(
+                        "INSERT INTO layer1_chain_runs (chain_key, graph_version_id, present, timestamp) VALUES (?, ?, ?, ?)",
+                        chain_rows
+                    )
+                    conn.commit()
+            except Exception as exc:
+                logger.error("Layer1: failed to persist chain runs: %s", exc)
 
         n_validated = len(self.get_validated_edges())
         logger.info(
-            "Layer1: run recorded | graph=%s | validated_edges=%d/%d",
-            snapshot.version_id[:8], n_validated, len(self._all_edge_keys),
+            "Layer1: run recorded | graph=%s | validated_edges=%d/%d | chains_tracked=%d",
+            snapshot.version_id[:8], n_validated, len(self._all_edge_keys), len(self._all_chain_keys),
         )
+
+    def register_chain(self, chain_key: str, snapshot: GraphSnapshot) -> None:
+        """Register a new chain if we haven't seen it yet, initializing history with current presence."""
+        with self._lock:
+            if chain_key in self._all_chain_keys:
+                return
+            
+            self._all_chain_keys.add(chain_key)
+            self._chain_history[chain_key] = deque(maxlen=100)
+            
+            # Check presence in the current snapshot
+            edges = parse_chain_key(chain_key)
+            all_present = all(
+                snapshot.has_edge(src, tgt, lag)
+                for src, tgt, lag in edges
+            )
+            present_int = 1 if all_present else 0
+            self._chain_history[chain_key].append(present_int)
+            
+        # Persist to DB
+        try:
+            ts = datetime.now(timezone.utc).isoformat()
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    "INSERT INTO layer1_chain_runs (chain_key, graph_version_id, present, timestamp) VALUES (?, ?, ?, ?)",
+                    (chain_key, snapshot.version_id, present_int, ts)
+                )
+                conn.commit()
+            logger.info("Layer1: registered new chain key | %s | present=%d", chain_key, present_int)
+        except Exception as exc:
+            logger.error("Layer1: failed to persist registered chain: %s", exc)
+
+    def record_chain_run(self, chain_key: str, chain_edges: list[CausalEdge], graph_snapshot: GraphSnapshot) -> None:
+        """Deprecated compatibility stub. Chain updates are handled automatically in record_run and register_chain."""
+        pass
+
+    def get_chain_stability(self, chain_key: str, confidence: float = 0.10) -> float:
+        """Calculate chain stability using Beta posterior lower bound."""
+        with self._lock:
+            history = self._chain_history.get(chain_key, [])
+            if not history:
+                return 0.0
+            history_list = list(history)
+            
+        successes = sum(history_list)
+        failures = len(history_list) - successes
+        # Conservative lower bound — penalises small samples
+        return beta_dist.ppf(confidence, successes + 1, failures + 1)
 
     # ------------------------------------------------------------------
     # Querying validated edges
     # ------------------------------------------------------------------
 
-    def get_validated_edges(self, regime: str = "unknown") -> list[dict]:
+    def get_validated_edges(self, regime: str = "unknown", params=None) -> list[dict]:
         """Return all edges that meet the validation threshold.
 
         Returns list of dicts with keys: source, target, lag, stability_score.
         stability_score = fraction of last k_runs where edge was present.
+
+        params: if supplied (e.g. from get_params_for_trade()), edges are filtered
+                under that threshold. If None, deterministically fetches best params.
         """
-        params = self._optimizer.get_params(regime)
+        if params is None:
+            params = self._optimizer.get_params(regime)
         validated = []
         with self._lock:
             for key, history in self._run_history.items():
@@ -133,24 +219,77 @@ class Layer1Tracker:
                     })
         return validated
 
-    def get_stability_score(self, source: str, target: str, lag: int, regime: str = "unknown") -> float:
-        """Return stability fraction for a specific edge (0.0 if never seen or < min runs)."""
+    def get_stability_score(self, source: str, target: str, lag: int, regime: str = "unknown", params=None) -> float:
+        """Return stability fraction for a specific edge (0.0 if never seen or < min runs).
+
+        params: if supplied, k_runs and min_runs are taken from it. If None,
+                deterministically fetches best params.
+        """
         key = _edge_key(source, target, lag)
-        params = self._optimizer.get_params(regime)
+        if params is None:
+            params = self._optimizer.get_params(regime)
         with self._lock:
             history = self._run_history.get(key)
         if not history:
             return 0.0
-            
+
         recent_history = list(history)[-params.k_runs:]
         if len(recent_history) < params.min_runs:
             return 0.0
         return sum(recent_history) / len(recent_history)
 
-    def is_validated(self, source: str, target: str, lag: int, regime: str = "unknown") -> bool:
-        params = self._optimizer.get_params(regime)
-        return self.get_stability_score(source, target, lag, regime) >= params.threshold
+    def is_validated(
+        self,
+        source: str,
+        target: str,
+        lag: int,
+        regime: str = "unknown",
+        params=None,
+        l2_trust: float | None = None,
+        l2_n_obs: int = 0,
+    ) -> bool:
+        """Return True if edge meets the (optionally trust-discounted) validation threshold.
+
+        params: if supplied (from get_params_for_trade()), uses its threshold so
+                all edges in one cycle are evaluated consistently.
+
+        l2_trust / l2_n_obs: Layer 2 Bayesian posterior and observation count for
+                this specific edge. Edges with proven economic reliability get up to
+                a 0.20 discount on the stability threshold, letting high-quality edges
+                pass the L1 gate even when their structural stability is slightly below
+                the base MetaOptimizer threshold.
+
+                Discount formula: min(0.20, l2_trust * 0.20) if l2_n_obs >= 5.
+                Hard floor: effective_threshold >= 0.40 (prevents any edge from
+                qualifying with <40% stability regardless of trust).
+        """
+        if params is None:
+            params = self._optimizer.get_params(regime)
+
+        # Trust discount: economically proven edges need less structural stability
+        if l2_trust is not None and l2_n_obs >= 5:
+            trust_discount = min(0.20, l2_trust * 0.20)
+        else:
+            trust_discount = 0.0
+        effective_threshold = max(0.40, params.threshold - trust_discount)
+
+        stability = self.get_stability_score(source, target, lag, regime, params=params)
+        validated = stability >= effective_threshold
+
+        if trust_discount > 0 and validated and stability < params.threshold:
+            logger.debug(
+                "Layer1: trust-discounted validation | %s->%s lag=%d | "
+                "stability=%.4f base_thresh=%.4f trust_discount=%.4f effective_thresh=%.4f | "
+                "l2_trust=%.4f l2_n_obs=%d",
+                source, target, lag,
+                stability, params.threshold, trust_discount, effective_threshold,
+                l2_trust, l2_n_obs,
+            )
+
+        return validated
+
     def total_runs_recorded(self) -> int:
+
         """Return the maximum number of runs recorded for any single edge.
         
         Used by HypothesisGenerator escape valve to detect prolonged HOLD.
@@ -223,6 +362,14 @@ class Layer1Tracker:
                     present INTEGER NOT NULL
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS layer1_chain_runs (
+                    chain_key TEXT NOT NULL,
+                    graph_version_id TEXT NOT NULL,
+                    present INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+            """)
             conn.commit()
 
     def _persist_run(self, snapshot: GraphSnapshot, present_keys: set[str]) -> None:
@@ -277,6 +424,25 @@ class Layer1Tracker:
                 "Layer1: loaded history from DB | edges=%d",
                 len(self._run_history),
             )
+            
+            # Load chain history
+            with sqlite3.connect(self._db_path) as conn:
+                chain_rows = conn.execute(
+                    "SELECT chain_key, present FROM layer1_chain_runs ORDER BY rowid ASC"
+                ).fetchall()
+                
+            if chain_rows:
+                chain_history_raw: dict[str, list[int]] = {}
+                for ck, present in chain_rows:
+                    chain_history_raw.setdefault(ck, []).append(int(present))
+                    
+                with self._lock:
+                    for ck, presences in chain_history_raw.items():
+                        recent = presences[-100:]
+                        self._chain_history[ck] = deque(recent, maxlen=100)
+                        self._all_chain_keys.add(ck)
+                logger.info("Layer1: loaded chain history from DB | chains=%d", len(self._chain_history))
+                
         except Exception as exc:
             logger.warning("Layer1: could not load from DB: %s", exc)
 
@@ -292,3 +458,16 @@ def _edge_key(source: str, target: str, lag: int) -> str:
 def _parse_edge_key(key: str) -> tuple[str, str, int]:
     parts = key.split("|")
     return parts[0], parts[1], int(parts[2])
+
+
+def parse_chain_key(chain_key: str) -> list[tuple[str, str, int]]:
+    """Convert a chain key string back into constituent edges (source, target, lag)."""
+    parts = chain_key.split("->")
+    edges = []
+    for i in range(0, len(parts) - 2, 2):
+        source = parts[i]
+        lag_str = parts[i+1] # "(lag=1)"
+        target = parts[i+2]
+        lag = int(lag_str.replace("(lag=", "").replace(")", ""))
+        edges.append((source, target, lag))
+    return edges
